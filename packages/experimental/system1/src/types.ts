@@ -105,6 +105,8 @@ export type System1FallbackReason =
   | 'timeout'
   | 'backend-error'
   | 'disabled'
+  /** The caller's signal aborted (user interrupt, turn cancelled): says nothing about backend health. */
+  | 'cancelled'
 
 /**
  * The service's verdict for one question: a typed value when the gate passed,
@@ -238,6 +240,17 @@ export interface System1RuntimeConfig {
   readonly pruneDropThreshold: number
   /** Max history rewrites per agent task. */
   readonly maxPrunePerTask: number
+  /**
+   * Extra questions per turn and per task reserved for critical kinds
+   * (loop-check, request-retry, retry-judgment), so late-turn loop and
+   * failure handling never starve behind early-turn triage. Default 4.
+   */
+  readonly criticalReserve?: number
+  /**
+   * Point each question in a mixed-context Jev batch at its own state slice
+   * (`Use only the fields under state["<id>"]`). Default true.
+   */
+  readonly jevScopeInstructions?: boolean
 }
 
 /** Triage verdict for one proposed agent step. */

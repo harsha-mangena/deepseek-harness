@@ -127,7 +127,7 @@ async function boot(system1Config: Record<string, unknown>): Promise<Context> {
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'
-      ? ['  config:', ...Object.entries(system1Config).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
+      ? ['  config:', ...Object.entries({ actuation: 'blocking', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
       : [],
   ]).join('\n') + '\n')
 

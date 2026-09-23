@@ -13,7 +13,7 @@
  *
  * Wire format verified against TypeSafe's getting-started guide
  * (endpoint `https://api.typesafe.ai/v1/systemone`, model alias
- * `jev-latest`); field-level drift still surfaces as a backend error and the
+ * pinned `jev-1.13.0` by default); field-level drift still surfaces as a backend error and the
  * service falls back safely.
  *
  * @module @deepseek-ai/dsh-experimental-system1
@@ -173,18 +173,37 @@ export class JevBackend implements System1Backend {
     }
 
     const wireQuestions: Record<string, JevWireQuestion> = {}
-    const state: Record<string, unknown> = {}
     const ids: string[] = []
+    const contexts = questions.map(question =>
+      // The state leaves the process for the Jev API: scrub secret-shaped
+      // values at this single outbound boundary so every call site is
+      // covered. Opt-out via `redactState: false` for air-gapped proxies.
+      this.config.redactState ? redactSecrets(question.context) : question.context)
+    // Jev answers every question against ONE shared state. When the batch's
+    // questions share a context (or there is only one question), send it
+    // flat: no indirection, no irrelevant sibling state. Otherwise namespace
+    // the state per question id AND point each question at its own slice —
+    // Jev is documented to be weak at indirection and at large irrelevant
+    // state ("context rot"), so bare field names under a namespaced state
+    // let one question read another's data.
+    const shared = contexts.every(context => stableJson(context) === stableJson(contexts[0]))
+    let state: unknown
+    if (shared) {
+      state = contexts[0] ?? {}
+    } else {
+      const namespaced: Record<string, unknown> = {}
+      questions.forEach((_, index) => { namespaced[`${questions[index]?.kind}#${index}`] = contexts[index] })
+      state = namespaced
+    }
     questions.forEach((question, index) => {
       // Question ids are unique within the batch; kinds are unique per
       // decision point, the index suffix is belt-and-braces.
       const id = `${question.kind}#${index}`
       ids.push(id)
-      wireQuestions[id] = toWireQuestion(question)
-      // The state leaves the process for the Jev API: scrub secret-shaped
-      // values at this single outbound boundary so every call site is
-      // covered. Opt-out via `redactState: false` for air-gapped proxies.
-      state[id] = this.config.redactState ? redactSecrets(question.context) : question.context
+      const wire = toWireQuestion(question)
+      wireQuestions[id] = shared || this.config.jevScopeInstructions === false
+        ? wire
+        : { ...wire, instructions: `Use only the fields under state["${id}"]. ${wire.instructions}` }
     })
 
     const response = await fetch(this.config.jevEndpoint, {
@@ -217,9 +236,35 @@ export class JevBackend implements System1Backend {
     })
   }
 
+  /**
+   * Open the TLS connection before the first real judgment: a cold
+   * handshake otherwise lands on the first (often latency-critical) batch.
+   * Best effort — never throws, and a missing key simply skips the warm-up.
+   */
+  async warm(signal: AbortSignal): Promise<void> {
+    const apiKey = process.env[this.config.jevApiKeyEnv]
+    if (apiKey === undefined || apiKey === '') return
+    try {
+      const url = new URL(this.config.jevEndpoint)
+      url.pathname = url.pathname.replace(/\/systemone\/?$/, '/models')
+      const response = await fetch(url, { headers: { authorization: `Bearer ${apiKey}` }, signal })
+      await response.body?.cancel()
+    } catch {
+      // Warm-up is an optimization only.
+    }
+  }
+
   async dispose(): Promise<void> {
     // Stateless HTTP client; nothing held.
   }
+}
+
+/** Key-order-independent JSON used to detect questions that share a context. */
+function stableJson(value: unknown): string {
+  return JSON.stringify(value, (_key, inner: unknown) =>
+    inner !== null && typeof inner === 'object' && !Array.isArray(inner)
+      ? Object.fromEntries(Object.entries(inner as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+      : inner)
 }
 
 /** Sequential fallback, exported for tests. */

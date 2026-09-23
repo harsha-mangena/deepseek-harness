@@ -26,6 +26,13 @@ import type {
   System1Trace,
 } from './types.ts'
 
+/**
+ * Question kinds that may use the critical reserve: they guard against the
+ * failure modes that appear late in a turn (loops, failed tools, failed
+ * model requests), after early-turn questions have spent the budget.
+ */
+export const CRITICAL_KINDS: ReadonlySet<System1Question['kind']> = new Set(['loop-check', 'request-retry', 'retry-judgment'])
+
 /** Budget scope: one agent turn or one whole agent task. */
 export type BudgetScope = 'turn' | 'task'
 
@@ -109,6 +116,8 @@ export class System1Service {
   private readonly taskUsed = new Map<string, number>()
   private consecutiveFailures = 0
   private circuitOpenedAt: number | null = null
+  private halfOpen = false
+  private probeInFlight = false
   private readonly traces: System1Trace[] = []
   private readonly traceListeners = new Set<TraceListener>()
 
@@ -181,12 +190,34 @@ export class System1Service {
     this.notifyTrace(updated)
   }
 
+  /**
+   * Circuit state. Closed → open after `failureThreshold` consecutive
+   * failures; open → half-open once `cooldownMs` elapses. Half-open admits
+   * exactly one probe batch: success closes the circuit, failure reopens it
+   * immediately instead of re-counting from zero.
+   */
   private circuitOpen(): boolean {
     if (this.circuitOpenedAt === null) return false
     if (Date.now() - this.circuitOpenedAt < this.config.cooldownMs) return true
+    if (this.probeInFlight) return true
     this.circuitOpenedAt = null
-    this.consecutiveFailures = 0
+    this.halfOpen = true
     return false
+  }
+
+  /** Record one backend failure against the circuit. */
+  private noteFailure(): void {
+    this.consecutiveFailures += 1
+    if (this.halfOpen || this.consecutiveFailures >= this.config.failureThreshold) {
+      this.circuitOpenedAt = Date.now()
+    }
+    this.halfOpen = false
+  }
+
+  /** Record one healthy backend batch. */
+  private noteSuccess(): void {
+    this.consecutiveFailures = 0
+    this.halfOpen = false
   }
 
   private recordTrace(
@@ -311,6 +342,9 @@ export class System1Service {
     if (!this.config.enabled) {
       return questions.map(question => this.fallback<T>(question, 'disabled', agentId))
     }
+    if (signal.aborted) {
+      return questions.map(question => this.fallback<T>(question, 'cancelled', agentId))
+    }
     if (this.circuitOpen()) {
       return questions.map(question => this.fallback<T>(question, 'backend-error', agentId, 'circuit open'))
     }
@@ -321,11 +355,16 @@ export class System1Service {
     // each turn stays under its own. Counters are per agent, so agents
     // never starve each other. `scope` selects the primary budget for the
     // gate; the task budget additionally binds as a universal ceiling.
-    const primaryUsed = scope === 'turn'
-      ? this.turnUsed.get(agentId) ?? 0
-      : this.taskUsed.get(agentId) ?? 0
+    //
+    // Critical kinds (loop-check, request-retry, retry-judgment) may dip
+    // into `criticalReserve` extra questions: loops and failures happen
+    // late in a turn, exactly when early triage has spent the budget.
+    //
+    // Budget is reserved synchronously, before the await, so concurrent
+    // batches (stream prefetch, pre-execute, post-execute) cannot all read
+    // the same counter and overspend. Failed batches refund their reserve.
+    const reserve = this.config.criticalReserve ?? 4
     const primaryBudget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
-    const taskUsed = this.taskUsed.get(agentId) ?? 0
     const askable: Array<{ index: number; question: System1Question; validate: (answer: unknown) => T | null }> = []
     const decisions = new Array<System1Decision<T> | undefined>(questions.length)
     questions.forEach((question, index) => {
@@ -334,15 +373,23 @@ export class System1Service {
         decisions[index] = this.fallback<T>(question, 'backend-error', agentId, 'missing validator')
         return
       }
-      if (primaryUsed + askable.length >= primaryBudget ||
-          taskUsed + askable.length >= this.config.budgetPerTask) {
+      const extra = CRITICAL_KINDS.has(question.kind) ? reserve : 0
+      const primaryUsed = scope === 'turn'
+        ? this.turnUsed.get(agentId) ?? 0
+        : this.taskUsed.get(agentId) ?? 0
+      const taskUsed = this.taskUsed.get(agentId) ?? 0
+      if (primaryUsed >= primaryBudget + extra || taskUsed >= this.config.budgetPerTask + extra) {
         decisions[index] = this.fallback<T>(question, 'budget-exceeded', agentId)
         return
       }
+      this.spend(agentId, 1)
       askable.push({ index, question, validate })
     })
+    this.capBudgets()
 
     if (askable.length > 0) {
+      const probe = this.halfOpen
+      if (probe) this.probeInFlight = true
       let judgments: System1Judgment[]
       try {
         judgments = await withAbortTimeout(
@@ -351,6 +398,16 @@ export class System1Service {
           signal,
         )
       } catch (error: unknown) {
+        this.spend(agentId, -askable.length)
+        if (probe) this.probeInFlight = false
+        // A caller abort (user interrupt, cancelled turn, disposed plugin)
+        // says nothing about backend health: never count it as a failure.
+        if (signal.aborted) {
+          askable.forEach(({ index, question }) => {
+            decisions[index] = this.fallback<T>(question, 'cancelled', agentId)
+          })
+          return decisions as Array<System1Decision<T>>
+        }
         const message = error instanceof Error ? error.message : String(error)
         const reason: System1FallbackReason = message.includes('timed out') ? 'timeout' : 'backend-error'
         // A rate-limit response is a pacing signal, not backend unhealth: it
@@ -359,18 +416,14 @@ export class System1Service {
         // backend marks such errors with `transient: true`.
         const transient = typeof error === 'object' && error !== null
           && (error as { transient?: unknown }).transient === true
-        if (!transient) {
-          this.consecutiveFailures += 1
-          if (this.consecutiveFailures >= this.config.failureThreshold) {
-            this.circuitOpenedAt = Date.now()
-          }
-        }
+        if (!transient) this.noteFailure()
         const note = transient ? `${message} (transient pacing signal; circuit untouched)` : message
         askable.forEach(({ index, question }) => {
           decisions[index] = this.fallback<T>(question, reason, agentId, note)
         })
         return decisions as Array<System1Decision<T>>
       }
+      if (probe) this.probeInFlight = false
       let dropped = 0
       askable.forEach(({ index, question, validate }, batchIndex) => {
         const judgment = judgments[batchIndex]
@@ -379,27 +432,25 @@ export class System1Service {
           decisions[index] = this.fallback<T>(question, 'backend-error', agentId, 'backend dropped a question')
           return
         }
-        // Every answered question spends from both budgets (see the gate
-        // above): the per-turn counter refreshes each turn, the per-task
-        // counter only on a new task.
-        this.turnUsed.set(agentId, (this.turnUsed.get(agentId) ?? 0) + 1)
-        this.taskUsed.set(agentId, (this.taskUsed.get(agentId) ?? 0) + 1)
         decisions[index] = this.gate(question, judgment, validate, agentId)
       })
-      this.capBudgets()
+      // Dropped questions were never answered: refund their reserve.
+      if (dropped > 0) this.spend(agentId, -dropped)
       // A backend that answers short violates its contract (one judgment per
       // question, in order): count it as a failure for circuit purposes even
       // when the rest of the batch succeeded.
-      if (dropped > 0) {
-        this.consecutiveFailures += 1
-        if (this.consecutiveFailures >= this.config.failureThreshold) {
-          this.circuitOpenedAt = Date.now()
-        }
-      } else {
-        this.consecutiveFailures = 0
-      }
+      if (dropped > 0) this.noteFailure()
+      else this.noteSuccess()
     }
     return decisions as Array<System1Decision<T>>
+  }
+
+  /** Adjust both budget counters for one agent (negative refunds). */
+  private spend(agentId: string, count: number): void {
+    const turn = Math.max(0, (this.turnUsed.get(agentId) ?? 0) + count)
+    const task = Math.max(0, (this.taskUsed.get(agentId) ?? 0) + count)
+    this.turnUsed.set(agentId, turn)
+    this.taskUsed.set(agentId, task)
   }
 
   /**

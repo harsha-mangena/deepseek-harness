@@ -24,6 +24,8 @@ export interface System1Backend {
   decide(question: System1Question, signal: AbortSignal): Promise<System1Judgment>
   /** Answer many questions in one backend round-trip when supported. */
   decideMany(questions: readonly System1Question[], signal: AbortSignal): Promise<System1Judgment[]>
+  /** Optional connection warm-up before the first judgment. Never throws. */
+  warm?(signal: AbortSignal): Promise<void>
   /** Release any held resources (sidecar processes, sockets). Never throws. */
   dispose(): Promise<void>
 }

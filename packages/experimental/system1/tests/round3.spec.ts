@@ -259,7 +259,7 @@ async function boot(system1Config: Record<string, unknown>): Promise<Context> {
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'
-      ? ['  config:', ...Object.entries(system1Config).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
+      ? ['  config:', ...Object.entries({ actuation: 'blocking', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
       : [],
   ]).join('\n') + '\n')
 
@@ -511,7 +511,7 @@ it('D3: shadow mode delegates first and only observes', async () => {
 
 it('B1: an inbox insert while idle refreshes the exhausted task budget', async () => {
   // The post-execute batch is turn-scoped; the reset refreshes both scopes.
-  const context = await boot({ backend: 'jev', mode: 'enforce', budgetPerTurn: 2 })
+  const context = await boot({ backend: 'jev', mode: 'enforce', budgetPerTurn: 2, criticalReserve: 0 })
   await failedToolCall(context, 'budget-agent', 1)
   await failedToolCall(context, 'budget-agent', 2)
   expect(askedKinds.filter(kind => kind === 'retry-judgment')).toHaveLength(2)
@@ -528,7 +528,7 @@ it('B1: an inbox insert while idle refreshes the exhausted task budget', async (
 })
 
 it('B1: an inbox insert while running is steering and does not reset', async () => {
-  const context = await boot({ backend: 'jev', mode: 'enforce', budgetPerTurn: 2 })
+  const context = await boot({ backend: 'jev', mode: 'enforce', budgetPerTurn: 2, criticalReserve: 0 })
   context.emit('agent/status', { agent: agentRef(context, 'steer-agent'), status: 'running' })
   await failedToolCall(context, 'steer-agent', 1)
   await failedToolCall(context, 'steer-agent', 2)

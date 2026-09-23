@@ -97,7 +97,7 @@ describe('JevBackend wire format', () => {
     expect(body.model).toBe('jev-latest')
     expect(body.questions['triage#0']).toMatchObject({
       type: 'choice',
-      instructions: 'How much reasoning does this agent step need?',
+      instructions: 'Use only the fields under state["triage#0"]. How much reasoning does this agent step need?',
       criteria: { trivial: 'no reasoning needed', complex: 'full reasoning' },
     })
     expect(body.questions['loop-check#1']).toMatchObject({ type: 'noul' })

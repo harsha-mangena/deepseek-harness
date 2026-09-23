@@ -104,6 +104,16 @@ import {
   type ObservedToolCall,
 } from './gates.ts'
 import { System1Service } from './service.ts'
+import { JudgmentBoard } from './board.ts'
+import {
+  compileToolPatterns,
+  DEFAULT_RISKY_TOOL_PATTERNS,
+  HintLedger,
+  isFreshStep,
+  isRiskyTool,
+  PendingQueue,
+  RouteLedger,
+} from './policy.ts'
 import { appendDecisionActedEvent, appendDecisionEvent } from './telemetry.ts'
 import {
   buildDelegationAdvisory,
@@ -284,6 +294,32 @@ export interface Config {
   pruneDropThreshold: number
   /** Max history rewrites per agent task; further droppable results only warn. */
   maxPrunePerTask: number
+  /**
+   * How enforce mode actuates. `async` (default): judgments never block the
+   * critical path except where a deadline says so — routing waits at most
+   * `routeDeadlineMs`, risky tool calls at most `toolGateDeadlineMs`, large
+   * result triage at most `resultTriageDeadlineMs`; loop/retry/injection/
+   * subagent judgments are posted and delivered at the next pre-step
+   * (before the next model request, so the model sees them at the same
+   * point). `blocking`: the original judge-first behavior on every seam.
+   */
+  actuation: 'async' | 'blocking'
+  /** Max wait for the turn's triage verdict before the first request (async). */
+  routeDeadlineMs: number
+  /** Max wait at pre-step for pending post-execute judgments (async). */
+  drainDeadlineMs: number
+  /** Max wait for a risky tool call's tool-choice judgment (async). */
+  toolGateDeadlineMs: number
+  /** Max wait for a large result's triage before the result reaches the model (async). */
+  resultTriageDeadlineMs: number
+  /** Regex sources (case-insensitive) naming tools worth a blocking tool-choice gate (async). */
+  riskyTools: string[]
+  /** Extra per-turn/per-task questions reserved for loop-check, request-retry, and retry-judgment. */
+  criticalReserve: number
+  /** Scope mixed-context Jev batches with per-question state pointers. */
+  jevScopeInstructions: boolean
+  /** Open the Jev connection at plugin start so the first judgment skips the TLS handshake. */
+  warmup: boolean
 }
 
 /** Runtime schema for {@link Config}. */
@@ -334,6 +370,15 @@ export const Config: z<Config> = z.object({
   pruneMinChars: z.natural().default(4000),
   pruneDropThreshold: z.percent().default(0.2),
   maxPrunePerTask: z.natural().default(10),
+  actuation: z.union(['async', 'blocking'] as const).default('async'),
+  routeDeadlineMs: z.natural().default(250),
+  drainDeadlineMs: z.natural().default(300),
+  toolGateDeadlineMs: z.natural().default(400),
+  resultTriageDeadlineMs: z.natural().default(600),
+  riskyTools: z.array(z.string()).default([...DEFAULT_RISKY_TOOL_PATTERNS]),
+  criticalReserve: z.natural().default(4),
+  jevScopeInstructions: z.boolean().default(true),
+  warmup: z.boolean().default(true),
 })
 
 type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
@@ -392,6 +437,8 @@ function toRuntimeConfig(config: Config): System1RuntimeConfig {
     pruneMinChars: config.pruneMinChars,
     pruneDropThreshold: config.pruneDropThreshold,
     maxPrunePerTask: config.maxPrunePerTask,
+    criticalReserve: config.criticalReserve,
+    jevScopeInstructions: config.jevScopeInstructions,
   }
 }
 
@@ -545,6 +592,10 @@ export function apply(ctx: Context, config: Config): void {
   const agents = createAgentState()
   const lifetime = new AbortController()
   const enforce = config.mode === 'enforce'
+  if (enforce && config.actuation === 'async' && config.warmup && backend.warm !== undefined) {
+    /* v8 ignore next -- defensive: warm never rejects */
+    void backend.warm(lifetime.signal).catch(() => undefined)
+  }
   // Durable telemetry: every trace lands as one `system1/decision` session
   // event on the owning agent's log — including shadow observations and
   // fallbacks, so the log is an unbiased calibration source — and a later
@@ -1019,7 +1070,11 @@ export function apply(ctx: Context, config: Config): void {
    * empty when the session is absent.
    */
   function noteStepState(payload: PreStepPayload): void {
-    stepPreviews.set(payload.agent.id, previewMessages(payload.messages).join('\n'))
+    // Async mode keeps the turn's last real input: empty continuation steps
+    // would otherwise blank the context tool-choice judgments rely on.
+    if (!(asyncAct && payload.messages.length === 0)) {
+      stepPreviews.set(payload.agent.id, previewMessages(payload.messages).join('\n'))
+    }
     capMap(stepPreviews, 128)
     if (payload.step !== 1) return
     const derive = (payload.agent as { session?: { deriveMessages?: () => unknown[] } }).session?.deriveMessages
@@ -1147,6 +1202,8 @@ export function apply(ctx: Context, config: Config): void {
     // No name yet (args-only delta) or a delegation (the orchestrator layer
     // owns spawns): nothing worth prefetching.
     if (toolName === undefined || toolName === SPAWN_TOOL_NAME) return
+    // Async mode only gates risky tools, so only those are worth a prefetch.
+    if (asyncAct && !isRiskyTool(toolName, riskyPatterns)) return
     const agentId = payload.agent.id
     let agentPrefetch = prefetches.get(agentId)
     if (agentPrefetch === undefined) {
@@ -1842,7 +1899,472 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Async actuation (enforce + `actuation: 'async'`, the default).
+  //
+  // The blocking enforce path above awaits a Jev round-trip on every seam:
+  // pre-step, pre-execute, and post-execute. At a measured ~1.7 s mean Jev
+  // latency that roughly doubles a short turn — System 1 must never cost
+  // more than it saves. The async path keeps the same judgments and the
+  // same guidance, but moves every wait off the critical path:
+  //
+  // - Turn triage is asked once per turn (speculatively at inbox insert,
+  //   overlapping the wake) and waited for at most `routeDeadlineMs`.
+  // - Routing is sticky per turn (upgrade-only) so the DeepSeek prefix cache
+  //   survives; a late verdict can still land at `agent/request` via peek.
+  // - Only risky tool calls wait for a tool-choice judgment, and at most
+  //   `toolGateDeadlineMs`; everything else dispatches immediately.
+  // - Post-execute judgments (loop, retry, injection, subagent, delegation)
+  //   are posted to the board and delivered at the next pre-step — which is
+  //   still before the next model request, so the model sees them at the
+  //   same point in its trajectory. Only large-result triage waits (bounded),
+  //   because the content must be replaced before the model reads it.
+  // ---------------------------------------------------------------------
+
+  const asyncAct = enforce && config.actuation === 'async'
+  const board = new JudgmentBoard()
+  const routes = new RouteLedger()
+  const hintLedger = new HintLedger()
+  const pendingPost = new PendingQueue()
+  const riskyPatterns = compileToolPatterns(config.riskyTools)
+
+  /** A turn-level judgment: triage verdict plus delegability, with traces. */
+  interface TurnJudgment {
+    verdict: TriageVerdict | null
+    triageTrace: string
+    delegate: boolean
+    delegationTrace: string
+  }
+
+  /** One piece of guidance produced by a posted judgment, delivered at drain time. */
+  interface PostedHint {
+    text: string
+    traceIds: string[]
+    escalate: boolean
+  }
+
+  /** Board keys, one namespace per agent so a new task can clear them wholesale. */
+  const turnKey = (agentId: string): string => `${agentId}:turn-judgment`
+  const postKey = (agentId: string, callId: string): string => `${agentId}:post:${callId}`
+
+  /** Resolve `promise`, or null once `deadlineMs` passes or `signal` aborts. Never rejects. */
+  async function withDeadline<T>(promise: Promise<T | null>, deadlineMs: number, signal: AbortSignal): Promise<T | null> {
+    if (deadlineMs <= 0 || signal.aborted) return null
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let onAbort: (() => void) | undefined
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => { resolve(null) }, deadlineMs)
+      onAbort = () => { resolve(null) }
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      return await Promise.race([promise.catch(() => null), late])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /** Ask the turn-level batch (triage + delegability). Never rejects. */
+  async function judgeTurn(agentId: string, messages: readonly unknown[]): Promise<TurnJudgment | null> {
+    const decisions = await service.askMany(
+      [buildTriageQuestion(messages), buildDelegationQuestion(messages)],
+      [validateTriage, validateDelegation] as Array<(answer: unknown) => unknown>,
+      'turn',
+      lifetime.signal,
+      agentId,
+    )
+    const triage = decisions[0]
+    const delegation = decisions[1]
+    if (triage === undefined || delegation === undefined) return null
+    return {
+      verdict: triage.value === 'trivial' || triage.value === 'standard' || triage.value === 'complex' ? triage.value : null,
+      triageTrace: triage.trace.id,
+      delegate: delegation.value === true,
+      delegationTrace: delegation.trace.id,
+    }
+  }
+
+  /** Adopt a settled turn judgment into the sticky route ledger. */
+  function adoptTurnJudgment(agentId: string, turn: number, judged: TurnJudgment | null): TurnJudgment | null {
+    board.delete(turnKey(agentId))
+    if (judged === null || judged.verdict === null) return judged
+    routes.offer(agentId, turn, judged.verdict, judged.triageTrace)
+    return judged
+  }
+
+  /** Forget every async-actuation record for an agent (new task). */
+  function resetAsyncState(agentId: string): void {
+    routes.reset(agentId)
+    hintLedger.reset(agentId)
+    pendingPost.reset(agentId)
+    board.clear(`${agentId}:`)
+  }
+
+  /**
+   * Deliver settled post-execute judgments. Waits at most `deadlineMs` for
+   * the pending ones (all in parallel); still-pending judgments carry over
+   * to the next step and are consumed there without waiting.
+   */
+  async function drainPosted(
+    agentId: string,
+    turn: number,
+    deadlineMs: number,
+    signal: AbortSignal,
+  ): Promise<{ messages: UserMessage[]; escalate: boolean }> {
+    const keys = pendingPost.list(agentId)
+    if (keys.length === 0) return { messages: [], escalate: false }
+    const taken = await Promise.all(keys.map(key => board.take<PostedHint[]>(key, deadlineMs, signal)))
+    const stillPending: string[] = []
+    const messages: UserMessage[] = []
+    let escalate = false
+    taken.forEach((outcome, index) => {
+      const key = keys[index] as string
+      if (outcome.status === 'late') {
+        stillPending.push(key)
+        return
+      }
+      board.delete(key)
+      if (outcome.status !== 'ready' || outcome.value === null) return
+      for (const hint of outcome.value) {
+        if (!hintLedger.admit(agentId, turn, hint.text)) continue
+        messages.push(guidance(hint.text))
+        hint.traceIds.forEach((traceId) => { service.markActed(traceId) })
+        if (hint.escalate) escalate = true
+      }
+    })
+    pendingPost.retain(agentId, stillPending)
+    return { messages, escalate }
+  }
+
+  /**
+   * Async pre-step. Critical-path cost: at most `routeDeadlineMs` on fresh
+   * steps (overlapping downstream pre-step handlers) plus at most
+   * `drainDeadlineMs` when post-execute judgments are still in flight.
+   * Continuation steps with nothing pending add no latency at all.
+   */
+  async function actStep(payload: PreStepPayload, next: PreStepNext): Promise<PreStepDecision> {
+    const agentId = payload.agent.id
+    const failureSignal = agents.consumeEscalation(agentId)
+    trackTurn(agentId, payload.turn)
+    trackSession(payload.agent)
+    noteStepState(payload)
+    // Bounded STOP: only asks Jev when the deterministic detector already
+    // sees a 5+ identical streak, so the common path never waits here.
+    if (await stopCheck(agentId, payload.signal)) {
+      ctx.logger.warn(`system1: stopping hopeless turn for agent ${agentId} (stuck trajectory)`)
+      return { kind: 'reject' }
+    }
+    if (payload.step === 1 && config.preselect) {
+      const pending = preselectTasks.get(agentId)
+      if (pending !== undefined) {
+        preselectTasks.delete(agentId)
+        await pending
+      }
+    }
+    await maybePruneHistory(payload.agent, payload.signal)
+
+    const fresh = isFreshStep(payload.step, payload.messages.length)
+    const key = turnKey(agentId)
+    // Step 1 of a task normally finds the speculative judgment posted at
+    // inbox insert; steering claims and inbox-less turns ask here.
+    if (fresh && !(payload.step === 1 && board.has(key)) && payload.messages.length > 0) {
+      board.post(key, judgeTurn(agentId, payload.messages))
+    }
+    const [decision, turnOutcome] = await Promise.all([
+      next(),
+      fresh && board.has(key)
+        ? board.take<TurnJudgment>(key, config.routeDeadlineMs, payload.signal)
+        : Promise.resolve(null),
+    ])
+    if (decision.kind === 'reject' || (payload.step === 1 && decision.messages.length === 0)) return decision
+
+    const extra: UserMessage[] = []
+    let judged: TurnJudgment | null = null
+    if (turnOutcome !== null && turnOutcome.status === 'ready') {
+      judged = adoptTurnJudgment(agentId, payload.turn, turnOutcome.value)
+    }
+    if (judged !== null && judged.delegate && teamToolsSeen.has(agentId)
+      && hintLedger.admit(agentId, payload.turn, 'delegation-hint')) {
+      service.markActed(judged.delegationTrace)
+      extra.push(guidance(buildDelegationHint()))
+    }
+
+    const drained = await drainPosted(agentId, payload.turn, config.drainDeadlineMs, payload.signal)
+    const escalate = failureSignal || drained.escalate
+    if (escalate) routes.escalate(agentId, payload.turn)
+    const route = routes.get(agentId, payload.turn)
+    // The strategy hint goes out once per verdict per turn — on the fresh
+    // step that set it, or when a failure signal escalated it — never on
+    // every continuation step.
+    if (route !== null && (fresh || escalate)
+      && hintLedger.admit(agentId, payload.turn, `strategy:${route.verdict}:${escalate ? 'esc' : 'base'}`)) {
+      if (route.traceId !== null) service.markActed(route.traceId)
+      extra.push(guidance(buildStrategyHint(route.verdict, escalate)))
+    }
+    extra.push(...drained.messages)
+    if (extra.length === 0) return decision
+    return { ...decision, messages: [...decision.messages, ...extra] }
+  }
+
+  /** Apply one verdict's `modelRoute` override; null when it changes nothing. */
+  function routedConfig(current: LlmCallConfig, verdict: TriageVerdict): LlmCallConfig | null {
+    const override = config.modelRoute[verdict]
+    if (override === undefined) return null
+    const routed: LlmCallConfig = {
+      ...current,
+      ...(override.provider !== undefined ? { provider: override.provider } : {}),
+      ...(override.model !== undefined ? { model: override.model } : {}),
+      ...(override.reasoningEffort !== undefined
+        ? { reasoningEffort: ReasoningEffortId(override.reasoningEffort) }
+        : {}),
+    }
+    if (
+      routed.provider === current.provider
+      && routed.model === current.model
+      && routed.reasoningEffort === current.reasoningEffort
+    ) return null
+    return routed
+  }
+
+  /**
+   * Async routing: sticky per turn. A verdict that missed the pre-step
+   * deadline but settled since is adopted here via peek (no wait).
+   */
+  function actRoute(agentId: string, turn: number, current: LlmCallConfig): LlmCallConfig | null {
+    if (routes.get(agentId, turn) === null) {
+      const peeked = board.peek<TurnJudgment>(turnKey(agentId))
+      if (peeked.status === 'ready') adoptTurnJudgment(agentId, turn, peeked.value)
+    }
+    const route = routes.get(agentId, turn)
+    if (route === null) return null
+    const routed = routedConfig(current, route.verdict)
+    if (routed === null) return null
+    if (hintLedger.admit(agentId, turn, `route:${route.verdict}`)) {
+      if (route.traceId !== null) service.markActed(route.traceId)
+      ctx.logger.info(`system1: routing agent ${agentId} turn ${turn} to ${routed.provider}/${routed.model} (triage: ${route.verdict})`)
+    }
+    return routed
+  }
+
+  /**
+   * Async judge-before-act: only risky tools wait, and at most
+   * `toolGateDeadlineMs`. The prefetch started while the call streamed is
+   * reused, so the wait is usually shorter than a full round-trip.
+   */
+  async function actToolChoice(exec: ToolExecution, next: PreExecuteNext): Promise<PreToolDecision> {
+    if (exec.name === SPAWN_TOOL_NAME || !isRiskyTool(exec.name, riskyPatterns)) return await next()
+    const judged = await withDeadline(askToolChoice(exec, lifetime.signal), config.toolGateDeadlineMs, exec.signal)
+    if (judged === null) return await next()
+    service.markActed(judged.traceId)
+    const reason = buildToolDenyReason(exec.name, judged.confidence)
+    ctx.logger.warn(`system1: denying tool call "${exec.name}" (${reason.slice(0, 160)})`)
+    return { kind: 'deny', reason }
+  }
+
+  /**
+   * Turn a settled post-execute batch into deliverable hints. Pure with
+   * respect to the loop (no injection here): the drain decides delivery.
+   */
+  function interpretPosted(
+    decisions: ReadonlyArray<System1Decision<unknown>>,
+    kinds: readonly System1QuestionKind[],
+    entry: ObservedToolCall,
+    repetitions: number,
+    spawn: SpawnArgs | null,
+    agentId: string,
+  ): PostedHint[] {
+    const hints: PostedHint[] = []
+    const delegationScores: number[] = []
+    const delegationTraces: string[] = []
+    decisions.forEach((judged, index) => {
+      const kind = kinds[index]
+      if (judged.value === null || kind === undefined) return
+      const traceIds = [judged.trace.id]
+      if (kind === 'delegation-triage' && typeof judged.value === 'number') {
+        delegationScores.push(judged.value)
+        delegationTraces.push(judged.trace.id)
+      } else if (kind === 'loop-check' && typeof judged.value === 'number' && judged.value >= config.loopStuckThreshold) {
+        if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#stuck:${judged.value.toFixed(2)}`)) {
+          hints.push({ text: buildLoopNudge(entry.name, repetitions, judged.value, 'interrupt'), traceIds, escalate: true })
+        }
+      } else if (kind === 'retry-judgment' && typeof judged.value === 'string') {
+        hints.push({ text: buildRetryHint(judged.value as RetryVerdict, entry.name), traceIds, escalate: true })
+      } else if (kind === 'result-triage' && (judged.value === 'error_actionable' || judged.value === 'error_transient')) {
+        hints.push({
+          text: `System 1: the ${entry.name} result reports a failure that looks ${
+            judged.value === 'error_actionable' ? 'actionable' : 'transient'
+          } — address it before continuing.`,
+          traceIds,
+          escalate: false,
+        })
+      } else if (kind === 'injection-screen' && typeof judged.value === 'number' && judged.value >= config.injectionThreshold) {
+        ctx.logger.warn(`system1: possible prompt injection in ${entry.name} result (p=${judged.value.toFixed(2)})`)
+        hints.push({ text: buildInjectionWarning(entry.name, judged.value), traceIds, escalate: false })
+      } else if (kind === 'subagent-accept' && spawn !== null) {
+        if (judged.value === 'fails') {
+          hints.push({ text: buildSubagentReworkHint(spawn.name, judged.judgment?.confidence ?? 0), traceIds, escalate: true })
+        } else if (judged.value === 'partial') {
+          hints.push({
+            text: `System 1: the ${spawn.name} teammate's output looks partially complete — verify the missing part before relying on it.`,
+            traceIds,
+            escalate: false,
+          })
+        }
+      }
+    })
+    if (spawn !== null && delegationScores.length === 3) {
+      const [novelty, toolRisk, irreversibility] = delegationScores as [number, number, number]
+      const oversight = computeDelegationOversight({ novelty, toolRisk, irreversibility }, config.delegationWeights)
+      const advisory = buildDelegationAdvisory(spawn.name, oversight)
+      delegationStateFor(agentId).noteScores(entry.argsKey, {
+        scores: { novelty, toolRisk, irreversibility },
+        oversight,
+        advisory,
+      })
+      if (advisory !== null) hints.push({ text: advisory, traceIds: delegationTraces, escalate: false })
+    }
+    return hints
+  }
+
+  /**
+   * Async post-execute. Deterministic guidance (loop streaks, duplicate
+   * spawns, cached advisories) is attached immediately — it costs nothing.
+   * Large-result triage waits at most `resultTriageDeadlineMs` because a
+   * replacement must land before the model reads the result. Every other
+   * judgment is posted to the board and delivered at the next pre-step.
+   */
+  async function actToolCall(
+    exec: ToolExecution,
+    result: ToolExecutionResult,
+    next: PostExecuteNext,
+  ): Promise<PostToolDecision> {
+    const agentId = exec.agent?.id ?? 'unknown-agent'
+    const entry: ObservedToolCall = {
+      name: exec.name,
+      argsKey: argsKeyOf(exec.arguments),
+      isError: result.isError,
+      at: Date.now(),
+    }
+    const history = agents.note(agentId)
+    history.push(entry)
+    while (history.length > 12) history.shift()
+    noteResultToolName(agentId, exec.callId, exec.name)
+
+    const contexts: UserMessage[] = []
+    const { spawn, duplicateWarning } = result.isError
+      ? { spawn: null as SpawnArgs | null, duplicateWarning: null as string | null }
+      : recordDelegation(exec)
+    if (duplicateWarning !== null) {
+      ctx.logger.warn(`system1: ${duplicateWarning}`)
+      contexts.push(guidance(duplicateWarning))
+    }
+    const loop = detectLoop(history)
+    if (loop.looping) {
+      if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#${loop.repetitions}`)) {
+        contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, null, loop.suggestion)))
+        agents.noteEscalation(agentId)
+      }
+      if (spawn !== null) {
+        const cached = delegationStateFor(agentId).takeScores(entry.argsKey)
+        if (cached !== null && cached.advisory !== null) contexts.push(guidance(cached.advisory))
+      }
+      return withContexts(await next(), contexts)
+    }
+
+    const questions: System1Question[] = []
+    const validators: Array<(answer: unknown) => unknown> = []
+    const kinds: System1QuestionKind[] = []
+    if (loop.repetitions >= 2) {
+      questions.push(buildLoopQuestion(history))
+      validators.push(validateLoopAnswer)
+      kinds.push('loop-check')
+    }
+    if (result.isError) {
+      questions.push(buildRetryQuestion(entry.name, entry.argsKey, result.error.message))
+      validators.push(validateRetry)
+      kinds.push('retry-judgment')
+    }
+    if (spawn !== null) {
+      const cached = delegationStateFor(agentId).takeScores(entry.argsKey)
+      if (cached === null) {
+        for (const scoreQuestion of buildDelegationScoreQuestions(spawn.name, spawn.description, spawn.prompt)) {
+          questions.push(scoreQuestion)
+          validators.push(validateDelegationScore)
+          kinds.push('delegation-triage')
+        }
+      } else if (cached.advisory !== null) {
+        contexts.push(guidance(cached.advisory))
+      }
+    }
+    const resultQuestions = buildResultQuestions(exec, result, spawn)
+    let triageIndex = -1
+    resultQuestions.questions.forEach((question, index) => {
+      const kind = resultQuestions.kinds[index] as System1QuestionKind
+      if (kind === 'result-triage') {
+        triageIndex = index
+        return
+      }
+      questions.push(question)
+      validators.push(resultQuestions.validators[index] as (answer: unknown) => unknown)
+      kinds.push(kind)
+    })
+
+    // Everything but large-result triage: post and move on.
+    if (questions.length > 0) {
+      const key = postKey(agentId, String(exec.callId))
+      const repetitions = loop.repetitions
+      board.post(key, service.askMany(questions, validators, 'turn', lifetime.signal, agentId)
+        .then(decisions => interpretPosted(decisions, kinds, entry, repetitions, spawn, agentId)))
+      pendingPost.push(agentId, key)
+    }
+
+    // Large-result triage: bounded wait, because a replacement only helps
+    // before the model reads the result.
+    let replacement: ContentBlock[] | null = null
+    if (triageIndex >= 0) {
+      const triageQuestion = resultQuestions.questions[triageIndex] as System1Question
+      const triageValidator = resultQuestions.validators[triageIndex] as (answer: unknown) => unknown
+      const asked = service.askMany([triageQuestion], [triageValidator], 'turn', lifetime.signal, agentId)
+        .then(decisions => decisions[0] ?? null)
+      const judged = await withDeadline(asked, config.resultTriageDeadlineMs, exec.signal)
+      if (judged !== null && typeof judged.value === 'string') {
+        const verdict = judged.value as ResultTriageVerdict
+        if (verdict === 'noisy_keep_head' || verdict === 'irrelevant') {
+          const head = resultQuestions.resultText.slice(0, config.triageHeadChars)
+          replacement = [{ type: 'text', text: `${head}${buildPruneMarker(entry.name, resultQuestions.resultText.length)}` }]
+          ctx.logger.warn(`system1: result triage dropped ${resultQuestions.resultText.length} chars from ${entry.name} (${verdict})`)
+          service.markActed(judged.trace.id)
+        } else if (verdict === 'error_actionable' || verdict === 'error_transient') {
+          contexts.push(guidance(`System 1: the ${entry.name} result reports a failure that looks ${
+            verdict === 'error_actionable' ? 'actionable' : 'transient'
+          } — address it before continuing.`))
+          service.markActed(judged.trace.id)
+        }
+      } else if (judged === null) {
+        // Late: the content can no longer be replaced, but an error verdict
+        // is still worth delivering at the next pre-step.
+        const key = postKey(agentId, `${String(exec.callId)}:triage`)
+        board.post(key, asked.then(late => (late === null ? [] : interpretPosted([late], ['result-triage'], entry, 0, null, agentId))))
+        pendingPost.push(agentId, key)
+      }
+    }
+
+    const withGuidance = withContexts(await next(), contexts)
+    if (replacement !== null && withGuidance.kind === 'accept') {
+      // Rebuild the accept explicitly: a replacement carries content, and
+      // content and a structured `value` are mutually exclusive.
+      return {
+        kind: 'accept',
+        content: replacement,
+        ...(withGuidance.additionalContexts === undefined ? {} : { additionalContexts: withGuidance.additionalContexts }),
+      }
+    }
+    return withGuidance
+  }
+
   const disposeTriage = ctx.on('agent/pre-step', async (payload, next) => {
+    if (asyncAct) return await actStep(payload, next)
     if (enforce) return await enforceStep(payload, next)
     const decision = await next()
     // Observation runs after delegation and never feeds back into the decision.
@@ -1854,6 +2376,7 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   const disposeTools = ctx.on('tools/post-execute', async (exec, result, next) => {
+    if (asyncAct) return await actToolCall(exec, result, next)
     if (enforce) return await enforceToolCall(exec, result, next)
     const decision = await next()
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
@@ -1868,6 +2391,7 @@ export function apply(ctx: Context, config: Config): void {
    * warns the operator).
    */
   const disposePreExecute = ctx.on('tools/pre-execute', async (exec, next) => {
+    if (asyncAct) return await actToolChoice(exec, next)
     if (enforce) return await judgeToolChoice(exec, next)
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
     void observeToolChoice(exec).catch(() => undefined)
@@ -1883,6 +2407,13 @@ export function apply(ctx: Context, config: Config): void {
     // Drop stale prefetches: a streamed call that never reached pre-execute
     // (aborted turn, rejected step) must not leak into the next turn.
     prefetches.delete(payload.agent.id)
+    if (asyncAct) {
+      // Judgments still in flight when the turn ends would land as stale
+      // guidance on the next turn: drop them (their traces still record).
+      board.delete(turnKey(payload.agent.id))
+      for (const key of pendingPost.list(payload.agent.id)) board.delete(key)
+      pendingPost.reset(payload.agent.id)
+    }
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
     void observeFinalAnswer(payload.agent, payload.turn).catch(() => undefined)
   })
@@ -1911,6 +2442,7 @@ export function apply(ctx: Context, config: Config): void {
   const disposeRequest = ctx.on('agent/request', async (payload, next) => {
     const current = await next()
     if (!enforce) return current
+    if (asyncAct) return actRoute(payload.agent.id, payload.turn, current) ?? current
     return routeModel(payload.agent.id, payload.turn, payload.step, current) ?? current
   })
 
@@ -1936,6 +2468,14 @@ export function apply(ctx: Context, config: Config): void {
    */
   const disposeInbox = ctx.on('agent/inbox/inserted', (payload) => {
     const newTask = resetTaskOnFreshUserMessage(payload.agent.id)
+    // Speculative turn triage: the judgment starts at insert time, so its
+    // round-trip overlaps the agent's wake and pre-step instead of adding
+    // to it. Only for idle inserts — running inserts are steering, claimed
+    // by a later pre-step that triages them itself.
+    if (newTask && asyncAct) {
+      resetAsyncState(payload.agent.id)
+      board.post(turnKey(payload.agent.id), judgeTurn(payload.agent.id, [payload.message]))
+    }
     // Session-start preselection begins at the task's first message so the
     // Jev round-trip overlaps the wake; the first pre-step awaits it before
     // the request is built, so the restriction lands in time either way.
