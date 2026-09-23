@@ -27,8 +27,15 @@ import type {
   System1RuntimeConfig,
 } from '../types.ts'
 
-/** Thrown when Jev rate-limits the caller (HTTP 429). */
+/**
+ * Thrown when Jev rate-limits the caller (HTTP 429). Marked `transient`:
+ * the service treats this as a pacing signal (fall back for this batch,
+ * retry naturally next turn) rather than backend unhealth, so it does not
+ * trip the circuit breaker.
+ */
 export class JevRateLimitError extends Error {
+  /** Pacing signal: not backend unhealth; safe to retry next batch. */
+  readonly transient = true
   constructor(readonly retryAfterMs: number | null) {
     super(
       `system1: jev rate limited (HTTP 429)${
@@ -79,10 +86,21 @@ function clamp01(value: unknown): number {
 }
 
 /**
+ * Half-width of the noul abstention band around 0.5. TypeSafe documents that
+ * noul returns only a probability with *no separate confidence* — so a
+ * probability this close to even *is* the abstention signal, and a decided
+ * noul is thresholded directly on its probability (e.g. `loopStuckThreshold`)
+ * instead of manufacturing a confidence and gating that. The old
+ * `max(p, 1-p)` pseudo-confidence mixed "probability of stuck" with
+ * "confidence in the judgment" and is gone.
+ */
+const NOUL_ABSTAIN_BAND = 0.1
+
+/**
  * Map one Jev wire answer to a {@link System1Judgment}. For `noul` the answer
- * is the probability itself and confidence is `max(p, 1 - p)`, so wishy-washy
- * probabilities near 0.5 fail the service's confidence gate. A missing or
- * non-numeric `noul` abstains instead of degrading to a confident zero.
+ * is the probability itself; wishy-washy probabilities near 0.5 abstain
+ * instead of degrading to a low-confidence guess. A missing or non-numeric
+ * `noul` abstains instead of degrading to a confident zero.
  */
 function toJudgment(
   question: System1Question,
@@ -106,13 +124,20 @@ function toJudgment(
       return { ...base, answer: raw.score ?? null, confidence: clamp01(raw.confidence) }
     case 'noul': {
       // A missing or non-numeric noul is a non-answer: abstain. Treating it
-      // as p=0 would manufacture a fully-confident "not stuck" judgment
-      // (confidence would be max(0, 1) = 1) that sails through the gate.
+      // as p=0 would manufacture a fully-confident "not stuck" judgment.
       if (typeof raw.noul !== 'number' || !Number.isFinite(raw.noul)) {
         return { ...base, answer: null, confidence: 0, abstained: true }
       }
       const p = clamp01(raw.noul)
-      return { ...base, answer: p, confidence: Math.max(p, 1 - p) }
+      const distance = Math.abs(p - 0.5)
+      if (distance < NOUL_ABSTAIN_BAND) {
+        // No lean at all: abstain, don't hand a coin flip to the gate.
+        return { ...base, answer: p, confidence: 0, abstained: true }
+      }
+      // Decided: noul has no separate confidence (TypeSafe docs), so the
+      // probability is thresholded directly by the caller
+      // (`loopStuckThreshold` on the value) instead of inventing one.
+      return { ...base, answer: p, confidence: 1 }
     }
   }
 }

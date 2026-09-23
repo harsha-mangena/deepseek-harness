@@ -272,18 +272,29 @@ it('consults Jev on real turns without changing or delaying loop behavior', asyn
 
   // Shadow observations reached Jev on the real wire format...
   await vi.waitFor(() => {
-    expect(jevCalls).toHaveLength(2)
+    expect(jevCalls).toHaveLength(3)
   })
   for (const call of jevCalls) {
     expect(call.url).toBe('https://api.typesafe.ai/v1/systemone')
-    expect(Object.keys(call.questions)).toHaveLength(1)
-    expect(call.questions['triage#0']).toMatchObject({ type: 'choice' })
   }
+  // The two pre-step batches ask triage and step delegability together; the
+  // delegation *hint* is only injected once team tooling has been seen.
+  const batches = jevCalls.filter(call => askedKinds(call).includes('triage'))
+  expect(batches).toHaveLength(2)
+  for (const call of batches) {
+    expect(Object.keys(call.questions)).toHaveLength(2)
+    expect(call.questions['triage#0']).toMatchObject({ type: 'choice' })
+    expect(call.questions['delegation#1']).toMatchObject({ type: 'choice' })
+  }
+  // ...plus the tool-choice observation for the probe_tool call, asked
+  // without delaying the dispatch.
+  const toolChoices = jevCalls.filter(call => askedKinds(call).includes('tool-choice'))
+  expect(toolChoices).toHaveLength(1)
+  expect(Object.keys(toolChoices[0]!.questions)).toEqual(['tool-choice#0'])
   // ...without the turn ever waiting for them: the turn finished while the
   // 500ms observations were still in flight.
   await vi.waitFor(() => {
-    expect(jevCalls[0]!.resolvedAt).toBeGreaterThan(0)
-    expect(jevCalls[1]!.resolvedAt).toBeGreaterThan(0)
+    for (const call of jevCalls) expect(call.resolvedAt).toBeGreaterThan(0)
   })
   expect(turnDoneAt).toBeLessThan(jevCalls[0]!.resolvedAt)
 }, 30000)

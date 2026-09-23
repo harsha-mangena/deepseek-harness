@@ -27,7 +27,42 @@
  * @module @deepseek-ai/dsh-experimental-system1
  */
 
-import type { System1Question, TriageVerdict } from './types.ts'
+import { buildDelegationScoreQuestions, validateDelegationScore } from './gates.ts'
+import type {
+  DelegationScores,
+  DelegationWeights,
+  OversightJudgment,
+} from './types.ts'
+
+/** Default weights for the delegation composite (relative; normalized in code). */
+export const DEFAULT_DELEGATION_WEIGHTS: DelegationWeights = {
+  novelty: 0.4,
+  toolRisk: 0.35,
+  irreversibility: 0.25,
+}
+
+/**
+ * Combine atomic delegation scores into an oversight judgment — TypeSafe's
+ * composite-scoring pattern: normalize the weights so they need not sum to
+ * 1, weight each 0..3 score into 0..1, and tier the result. Higher weight on
+ * novelty because an exploring teammate is the main oversight risk; weight
+ * changes shift policy without a prompt rewrite.
+ */
+export function computeDelegationOversight(
+  scores: DelegationScores,
+  weights: DelegationWeights = DEFAULT_DELEGATION_WEIGHTS,
+): OversightJudgment {
+  const total = weights.novelty + weights.toolRisk + weights.irreversibility
+  if (!(total > 0)) throw new Error('system1: delegation weights must be positive')
+  const maxLevel = 3 // DELEGATION_LEVELS - 1: score answers run 0..3
+  const score = (
+    weights.novelty * (scores.novelty / maxLevel) +
+    weights.toolRisk * (scores.toolRisk / maxLevel) +
+    weights.irreversibility * (scores.irreversibility / maxLevel)
+  ) / total
+  const level = score < 0.35 ? 'low' : score < 0.65 ? 'standard' : 'high'
+  return { level, score, scores }
+}
 
 /** Tool name the Lead calls to delegate; the orchestrator hook key. */
 export const SPAWN_TOOL_NAME = 'spawn_teammate'
@@ -146,51 +181,39 @@ export function extractSpawnArgs(args: unknown): SpawnArgs | null {
 }
 
 /**
- * Build a triage question over a delegation: how much reasoning does the
- * delegated subtask deserve? Uses the same verdict vocabulary as step
- * triage (`trivial`/`standard`/`complex`) so the verdict reuses the
- * atom/chain/tree-of-thoughts strategy hints — the teammate, being an
- * agent, receives the matching hint on its first pre-step.
+ * Build the delegation triage questions: three atomic Score questions —
+ * novelty, tool risk, irreversibility — evaluated in parallel and combined
+ * with weights into an oversight judgment ({@link computeDelegationOversight}).
+ * A single Choice hiding several judgments is a documented anti-pattern;
+ * atomic scores keep each judgment one-dimensional and let weight changes
+ * shift policy without a prompt rewrite. The questions are built in
+ * gates.ts, where the other builders live; this re-export keeps the
+ * orchestrator surface in one place.
  */
-export function buildDelegationTriageQuestion(
-  name: string,
-  description: string,
-  prompt: string,
-): System1Question {
-  return {
-    kind: 'delegation-triage',
-    primitive: 'choice',
-    prompt: 'How much reasoning does this delegated subtask need?',
-    context: {
-      delegation: {
-        name: name.slice(0, 120),
-        description: description.slice(0, 500),
-      },
-      promptPreview: prompt.slice(0, 1000),
-    },
-    options: {
-      trivial: 'Routine subtask; the teammate can execute it directly with minimal deliberation',
-      standard: 'Normal subtask; the teammate should proceed with default step-by-step reasoning',
-      complex: 'Demanding subtask; the teammate needs full reasoning — atomic sub-steps and alternative approaches',
-    },
-  }
-}
+export const buildDelegationTriageQuestions = buildDelegationScoreQuestions
 
 /**
- * Lead-facing advisory for a confident delegation triage. Returns null for
- * `trivial`: a routine delegation needs no commentary, so the Lead's
- * context stays clean. `standard`/`complex` advisories name the strategy
- * the teammate will receive and suggest proportionate oversight.
+ * Validate one raw delegation score into a 0..3 position (see
+ * {@link validateDelegationScore}). Out-of-range answers fail validation
+ * rather than clamping: a miscalibrated score must not silently become a
+ * confident one.
  */
-export function buildDelegationAdvisory(name: string, verdict: TriageVerdict): string | null {
-  switch (verdict) {
-    case 'trivial':
-      return null
-    case 'standard':
-      return `[System 1 delegation triage: standard] Teammate "${name}" takes on a standard subtask. It will receive a chain-of-thoughts strategy hint (normal step-by-step reasoning) on its first step; normal oversight applies.`
-    case 'complex':
-      return `[System 1 delegation triage: complex] Teammate "${name}" takes on a complex subtask. It will receive a tree-of-thoughts strategy hint (atomic sub-steps, 2–3 candidate approaches before committing) on its first step. Consider asking it to lay out its candidate approaches before it commits, and check its early output before stacking dependent work on it.`
+export const validateDelegationTriage = validateDelegationScore
+
+/**
+ * Lead-facing advisory for a delegation oversight judgment. Returns null for
+ * `low` oversight: a routine delegation needs no commentary, so the Lead's
+ * context stays clean. Standard/high advisories restate the driving scores
+ * so the Lead can see *why* the tier was assigned.
+ */
+export function buildDelegationAdvisory(name: string, oversight: OversightJudgment): string | null {
+  if (oversight.level === 'low') return null
+  const { novelty, toolRisk, irreversibility } = oversight.scores
+  const scored = `novelty ${novelty.toFixed(1)}/3, tool risk ${toolRisk.toFixed(1)}/3, irreversibility ${irreversibility.toFixed(1)}/3`
+  if (oversight.level === 'standard') {
+    return `[System 1 delegation: standard oversight] Teammate "${name}" takes a moderately demanding subtask (${scored}). It will receive a grounded chain-of-thought strategy hint on its first step; normal oversight applies.`
   }
+  return `[System 1 delegation: high oversight] Teammate "${name}" takes a demanding subtask (${scored}). It will receive an atomic-decomposition strategy hint on its first step. Ask it to lay out its plan before committing, and check its early output before stacking dependent work on it.`
 }
 
 /** Lead-facing warning when a spawn duplicates a recent teammate's purpose. */

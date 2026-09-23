@@ -177,11 +177,18 @@ export class System1Service {
     }
   }
 
+  /**
+   * The confidence gate. Threshold precedence: per-kind config override
+   * (`thresholds`), the question's own `threshold` (its builder knows the
+   * stakes — TypeSafe: "a confidence threshold is not one number"), then the
+   * global `confidenceThreshold`.
+   */
   private gate<T>(
     question: System1Question,
     judgment: System1Judgment,
     validate: (answer: unknown) => T | null,
   ): System1Decision<T> {
+    const threshold = this.config.thresholds[question.kind] ?? question.threshold ?? this.config.confidenceThreshold
     const confidence = clampConfidence(judgment.confidence)
     if (judgment.abstained) {
       return {
@@ -191,12 +198,12 @@ export class System1Service {
         trace: this.recordTrace(question, judgment, 'abstain', false),
       }
     }
-    if (confidence < this.config.confidenceThreshold) {
+    if (confidence < threshold) {
       return {
         judgment,
         value: null,
         fallback: 'low-confidence',
-        trace: this.recordTrace(question, judgment, 'low-confidence', false),
+        trace: this.recordTrace(question, judgment, 'low-confidence', false, `confidence ${confidence.toFixed(2)} below gate ${threshold.toFixed(2)}`),
       }
     }
     const validated = safeValidate(validate, judgment.answer)
@@ -275,14 +282,23 @@ export class System1Service {
           signal,
         )
       } catch (error: unknown) {
-        this.consecutiveFailures += 1
-        if (this.consecutiveFailures >= this.config.failureThreshold) {
-          this.circuitOpenedAt = Date.now()
-        }
         const message = error instanceof Error ? error.message : String(error)
         const reason: System1FallbackReason = message.includes('timed out') ? 'timeout' : 'backend-error'
+        // A rate-limit response is a pacing signal, not backend unhealth: it
+        // falls back for this batch without touching the circuit breaker —
+        // the next batch simply tries again, which is the backoff. The Jev
+        // backend marks such errors with `transient: true`.
+        const transient = typeof error === 'object' && error !== null
+          && (error as { transient?: unknown }).transient === true
+        if (!transient) {
+          this.consecutiveFailures += 1
+          if (this.consecutiveFailures >= this.config.failureThreshold) {
+            this.circuitOpenedAt = Date.now()
+          }
+        }
+        const note = transient ? `${message} (transient pacing signal; circuit untouched)` : message
         askable.forEach(({ index, question }) => {
-          decisions[index] = this.fallback<T>(question, reason, message)
+          decisions[index] = this.fallback<T>(question, reason, note)
         })
         return decisions as Array<System1Decision<T>>
       }

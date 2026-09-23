@@ -1,19 +1,23 @@
 /**
- * Unit tests for the orchestrator module: delegation triage question
- * building, advisory copy, duplicate-purpose detection, and the bounded
- * spawn registry. No network, no composition — pure functions and state.
+ * Unit tests for the orchestrator module: the delegation composite
+ * (novelty/tool-risk/irreversibility scores → oversight judgment), advisory
+ * copy, duplicate-purpose detection, and the bounded spawn registry. No
+ * network, no composition — pure functions and state.
  */
 
 import { describe, expect, it, vi } from 'vitest'
 import {
   buildDelegationAdvisory,
-  buildDelegationTriageQuestion,
+  buildDelegationTriageQuestions,
   buildDuplicateWarning,
+  computeDelegationOversight,
   createDelegationState,
+  DEFAULT_DELEGATION_WEIGHTS,
   DUPLICATE_SIMILARITY,
   extractSpawnArgs,
   MAX_SPAWNS,
   SPAWN_TOOL_NAME,
+  validateDelegationTriage,
 } from '../src/orchestrator.ts'
 
 describe('extractSpawnArgs', () => {
@@ -32,42 +36,108 @@ describe('extractSpawnArgs', () => {
   })
 })
 
-describe('buildDelegationTriageQuestion', () => {
-  it('builds a choice question reusing the triage verdict vocabulary', () => {
-    const question = buildDelegationTriageQuestion(
+describe('buildDelegationTriageQuestions', () => {
+  it('builds three atomic score questions', () => {
+    const questions = buildDelegationTriageQuestions(
       'reviewer',
       'Review the pull request for bugs and style issues.',
       'You are the reviewer. Read the diff and report findings.',
     )
-    expect(question.kind).toBe('delegation-triage')
-    expect(question.primitive).toBe('choice')
-    expect(Object.keys(question.options ?? {})).toEqual(['trivial', 'standard', 'complex'])
-    expect(question.context['delegation']).toMatchObject({ name: 'reviewer' })
+    expect(questions).toHaveLength(3)
+    for (const question of questions) {
+      expect(question.kind).toBe('delegation-triage')
+      expect(question.primitive).toBe('score')
+      expect(question.levels).toHaveLength(4)
+    }
+    expect(questions[0]?.context['delegation']).toMatchObject({ name: 'reviewer' })
   })
 
   it('never throws on hostile input', () => {
-    expect(() => buildDelegationTriageQuestion('', '', '')).not.toThrow()
+    expect(() => buildDelegationTriageQuestions('', '', '')).not.toThrow()
+  })
+
+  it('re-exports the score validator', () => {
+    expect(validateDelegationTriage(2)).toBe(2)
+    expect(validateDelegationTriage(5)).toBeNull()
+  })
+})
+
+describe('computeDelegationOversight', () => {
+  it('tiers a low composite as low oversight', () => {
+    const oversight = computeDelegationOversight({ novelty: 0.3, toolRisk: 0.2, irreversibility: 0.4 })
+    expect(oversight.level).toBe('low')
+    expect(oversight.score).toBeLessThan(0.35)
+  })
+
+  it('tiers a moderate composite as standard oversight', () => {
+    const oversight = computeDelegationOversight({ novelty: 1.6, toolRisk: 1.5, irreversibility: 1.4 })
+    expect(oversight.level).toBe('standard')
+    expect(oversight.score).toBeGreaterThanOrEqual(0.35)
+    expect(oversight.score).toBeLessThan(0.65)
+  })
+
+  it('tiers a demanding composite as high oversight', () => {
+    const oversight = computeDelegationOversight({ novelty: 2.8, toolRisk: 2.6, irreversibility: 2.9 })
+    expect(oversight.level).toBe('high')
+    expect(oversight.score).toBeGreaterThanOrEqual(0.65)
+  })
+
+  it('normalizes weights that do not sum to 1', () => {
+    const doubled = {
+      novelty: DEFAULT_DELEGATION_WEIGHTS.novelty * 2,
+      toolRisk: DEFAULT_DELEGATION_WEIGHTS.toolRisk * 2,
+      irreversibility: DEFAULT_DELEGATION_WEIGHTS.irreversibility * 2,
+    }
+    const scores = { novelty: 2, toolRisk: 1, irreversibility: 3 }
+    expect(computeDelegationOversight(scores, doubled).score)
+      .toBeCloseTo(computeDelegationOversight(scores).score, 10)
+  })
+
+  it('weights novelty highest by default', () => {
+    // Novelty alone at max pushes the composite above the standard line;
+    // irreversibility alone at max does not reach high.
+    const noveltyDriven = computeDelegationOversight({ novelty: 3, toolRisk: 0, irreversibility: 0 })
+    const irreversibleDriven = computeDelegationOversight({ novelty: 0, toolRisk: 0, irreversibility: 3 })
+    expect(noveltyDriven.score).toBeGreaterThan(irreversibleDriven.score)
+  })
+
+  it('rejects non-positive total weight', () => {
+    expect(() => computeDelegationOversight(
+      { novelty: 1, toolRisk: 1, irreversibility: 1 },
+      { novelty: 0, toolRisk: 0, irreversibility: 0 },
+    )).toThrow()
   })
 })
 
 describe('buildDelegationAdvisory', () => {
-  it('stays silent on trivial delegations', () => {
-    expect(buildDelegationAdvisory('helper', 'trivial')).toBeNull()
+  const low = computeDelegationOversight({ novelty: 0.3, toolRisk: 0.2, irreversibility: 0.4 })
+  const standard = computeDelegationOversight({ novelty: 1.6, toolRisk: 1.5, irreversibility: 1.4 })
+  const high = computeDelegationOversight({ novelty: 2.8, toolRisk: 2.6, irreversibility: 2.9 })
+
+  it('stays silent on low oversight', () => {
+    expect(buildDelegationAdvisory('helper', low)).toBeNull()
   })
 
-  it('names the chain-of-thoughts strategy for standard subtasks', () => {
-    const advisory = buildDelegationAdvisory('researcher', 'standard')
-    expect(advisory).toContain('[System 1 delegation triage: standard]')
+  it('names the grounded chain strategy for standard oversight', () => {
+    const advisory = buildDelegationAdvisory('researcher', standard)
+    expect(advisory).toContain('[System 1 delegation: standard oversight]')
     expect(advisory).toContain('"researcher"')
-    expect(advisory).toContain('chain-of-thoughts')
+    expect(advisory).toContain('chain-of-thought')
   })
 
-  it('names the tree-of-thoughts strategy and oversight for complex subtasks', () => {
-    const advisory = buildDelegationAdvisory('architect', 'complex')
-    expect(advisory).toContain('[System 1 delegation triage: complex]')
+  it('names atomic decomposition and oversight for high oversight', () => {
+    const advisory = buildDelegationAdvisory('architect', high)
+    expect(advisory).toContain('[System 1 delegation: high oversight]')
     expect(advisory).toContain('"architect"')
-    expect(advisory).toContain('tree-of-thoughts')
-    expect(advisory).toContain('2–3 candidate approaches')
+    expect(advisory).toContain('atomic-decomposition')
+    expect(advisory).toContain('check its early output')
+  })
+
+  it('restates the driving scores so the Lead sees the why', () => {
+    const advisory = buildDelegationAdvisory('architect', high)
+    expect(advisory).toContain('novelty 2.8/3')
+    expect(advisory).toContain('tool risk 2.6/3')
+    expect(advisory).toContain('irreversibility 2.9/3')
   })
 })
 

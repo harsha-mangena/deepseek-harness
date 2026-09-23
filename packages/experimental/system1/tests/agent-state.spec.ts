@@ -61,3 +61,30 @@ describe('nudge state', () => {
     expect(agents.lastNudgeKey.has('a1')).toBe(false)
   })
 })
+
+describe('escalation state', () => {
+  it('notes and consumes an escalation exactly once', () => {
+    const agents = createAgentState()
+    expect(agents.consumeEscalation('a1')).toBe(false)
+    agents.noteEscalation('a1')
+    expect(agents.consumeEscalation('a1')).toBe(true)
+    expect(agents.consumeEscalation('a1')).toBe(false)
+  })
+
+  it('clears escalations on task reset', () => {
+    const agents = createAgentState()
+    agents.note('a1')
+    agents.noteEscalation('a1')
+    agents.resetTask('a1')
+    expect(agents.consumeEscalation('a1')).toBe(false)
+  })
+
+  it('evicts escalations with the oldest agent', () => {
+    const agents = createAgentState(2)
+    agents.note('a1')
+    agents.noteEscalation('a1')
+    agents.note('a2')
+    agents.note('a3')
+    expect(agents.escalations.has('a1')).toBe(false)
+  })
+})

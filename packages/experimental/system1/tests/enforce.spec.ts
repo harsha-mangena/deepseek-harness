@@ -2,16 +2,19 @@
  * Enforce-mode composition tests for the System 1 plugin.
  *
  * In `enforce` mode Jev's judgments actuate: triage selects a
- * reasoning-strategy hint (atom/chain/tree of thoughts) injected before the
- * step, loop-check injects a nudge when the agent looks stuck, and
- * retry-judgment advises on failed tool calls. Every test boots the real
- * Loader composition with a stubbed Jev `fetch` and dispatches the real
- * waterfalls, proving:
+ * reasoning-strategy hint (direct answer, grounded chain, or atom-of-thoughts
+ * decomposition) injected before the step, loop-check injects a nudge when
+ * the agent looks stuck, retry-judgment advises on failed tool calls, and a
+ * failure signal escalates the *next* step's reasoning one level. Every test
+ * boots the real Loader composition with a stubbed Jev `fetch` and dispatches
+ * the real waterfalls, proving:
  *
  * - judgments are awaited BEFORE delegation (judge-first, not observe-after);
+ * - the pre-step batch runs concurrently with downstream pre-step work;
  * - any fallback (low confidence, abstention, backend error, timeout)
  *   resolves to "no injection" with existing behavior untouched;
  * - loop nudges are bounded per task and per episode;
+ * - failure signals escalate the next step exactly once;
  * - shadow mode never injects.
  */
 
@@ -41,6 +44,7 @@ type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
 let jevTriage: string
 let jevNoul: number | null
 let jevRetry: string
+let jevDelegate: string
 let jevConfidence: number
 let jevFail: boolean
 
@@ -49,7 +53,11 @@ function answerFor(id: string, type: string): Record<string, unknown> {
   if (type === 'noul') {
     return jevNoul === null ? { confidence: jevConfidence } : { noul: jevNoul, confidence: jevConfidence }
   }
-  const choice = kind === 'triage' ? jevTriage : kind === 'retry-judgment' ? jevRetry : 'retry'
+  let choice: string
+  if (kind === 'triage') choice = jevTriage
+  else if (kind === 'retry-judgment') choice = jevRetry
+  else if (kind === 'delegation') choice = jevDelegate
+  else choice = 'retry'
   return { choice, confidence: jevConfidence }
 }
 
@@ -57,6 +65,7 @@ beforeEach(() => {
   jevTriage = 'complex'
   jevNoul = 0.12
   jevRetry = 'give-up'
+  jevDelegate = 'keep'
   jevConfidence = 0.9
   jevFail = false
   vi.stubEnv('TYPESAFE_API_KEY', 'test-key')
@@ -183,8 +192,8 @@ it('injects a strategy hint for a complex triage verdict', async () => {
   const hints = hintTexts(decision.messages)
   expect(hints).toHaveLength(1)
   expect(hints[0]).toContain('[System 1 triage: complex]')
-  expect(hints[0]).toContain('atomic sub-steps')
-  expect(hints[0]).toContain('2–3 alternative')
+  expect(hints[0]).toContain('atomic sub-questions')
+  expect(hints[0]).toContain('observation that would decide it')
 })
 
 it('injects a direct-answer hint for a trivial triage verdict', async () => {
@@ -198,7 +207,7 @@ it('injects a direct-answer hint for a trivial triage verdict', async () => {
   const hints = hintTexts(decision.messages)
   expect(hints).toHaveLength(1)
   expect(hints[0]).toContain('[System 1 triage: trivial]')
-  expect(hints[0]).toContain('minimal deliberation')
+  expect(hints[0]).toContain('Answer directly')
 })
 
 it('injects nothing on a low-confidence triage fallback', async () => {
@@ -253,6 +262,86 @@ it('injects the hint on an empty later step (tool continuation)', async () => {
   // model because the loop appends decision messages to the session.
   expect(decision.messages).toHaveLength(1)
   expect(hintTexts(decision.messages)[0]).toContain('[System 1 triage: trivial]')
+})
+
+it('escalates the next step one reasoning level after an acted-upon failure', async () => {
+  jevTriage = 'trivial'
+  jevRetry = 'give-up'
+  const context = await boot({ backend: 'jev', mode: 'enforce' })
+  const agentId = 'enforce-escalate'
+  // A failed call: the retry hint injects, arming the escalation.
+  const toolDecision = await context.waterfall(
+    'tools/post-execute', toolExec(context, agentId, { x: 1 }), toolResult(true), acceptNext,
+  )
+  expect(toolDecision.kind).toBe('accept')
+  expect(contextTexts(toolDecision).some(text => text.includes('[System 1 retry-judgment]'))).toBe(true)
+  // Next step: triage says trivial, but the escalation bumps it to standard.
+  const payload = preStepPayload(context, agentId)
+  const stepDecision = await context.waterfall(
+    'agent/pre-step', payload,
+    (): Promise<PreStepDecision> => Promise.resolve({ kind: 'enter', messages: payload.messages }),
+  )
+  expect(stepDecision.kind).toBe('enter')
+  if (stepDecision.kind !== 'enter') return
+  const hints = hintTexts(stepDecision.messages)
+  expect(hints).toHaveLength(1)
+  expect(hints[0]).toContain('[System 1 triage: standard]')
+  expect(hints[0]).toContain('[System 1 escalation]')
+  // The escalation is consumed once: the following step is trivial again.
+  const payload2 = preStepPayload(context, agentId)
+  const stepDecision2 = await context.waterfall(
+    'agent/pre-step', payload2,
+    (): Promise<PreStepDecision> => Promise.resolve({ kind: 'enter', messages: payload2.messages }),
+  )
+  expect(stepDecision2.kind).toBe('enter')
+  if (stepDecision2.kind !== 'enter') return
+  const hints2 = hintTexts(stepDecision2.messages)
+  expect(hints2).toHaveLength(1)
+  expect(hints2[0]).toContain('[System 1 triage: trivial]')
+  expect(hints2[0]).not.toContain('[System 1 escalation]')
+})
+
+it('injects a delegation hint once team tooling has been seen', async () => {
+  jevTriage = 'standard'
+  jevDelegate = 'delegate'
+  const context = await boot({ backend: 'jev', mode: 'enforce' })
+  const agentId = 'enforce-delegate'
+  // A spawn_teammate call marks the session as team-capable...
+  const spawnExec: ToolExecution = {
+    agent: { id: agentId, sessionId: liveSession(context, agentId) },
+    name: 'spawn_teammate',
+    arguments: { name: 'helper', description: 'do a subtask', prompt: 'You are helper. do a subtask.' },
+    signal: new AbortController().signal,
+  } as unknown as ToolExecution
+  await context.waterfall('tools/post-execute', spawnExec, toolResult(false), acceptNext)
+  // ...so the next pre-step carries both the triage and delegation hints.
+  const payload = preStepPayload(context, agentId)
+  const decision = await context.waterfall(
+    'agent/pre-step', payload,
+    (): Promise<PreStepDecision> => Promise.resolve({ kind: 'enter', messages: payload.messages }),
+  )
+  expect(decision.kind).toBe('enter')
+  if (decision.kind !== 'enter') return
+  const hints = hintTexts(decision.messages)
+  expect(hints).toHaveLength(2)
+  expect(hints[0]).toContain('[System 1 triage: standard]')
+  expect(hints[1]).toContain('[System 1 delegation]')
+})
+
+it('withholds the delegation hint when no team tooling has been seen', async () => {
+  jevTriage = 'standard'
+  jevDelegate = 'delegate'
+  const context = await boot({ backend: 'jev', mode: 'enforce' })
+  const payload = preStepPayload(context, 'enforce-no-team')
+  const decision = await context.waterfall(
+    'agent/pre-step', payload,
+    (): Promise<PreStepDecision> => Promise.resolve({ kind: 'enter', messages: payload.messages }),
+  )
+  expect(decision.kind).toBe('enter')
+  if (decision.kind !== 'enter') return
+  const hints = hintTexts(decision.messages)
+  expect(hints).toHaveLength(1)
+  expect(hints[0]).toContain('[System 1 triage: standard]')
 })
 
 it('nudges via additionalContexts on a deterministic loop', async () => {

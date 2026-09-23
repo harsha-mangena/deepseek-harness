@@ -15,12 +15,14 @@ function testConfig(overrides: Partial<System1RuntimeConfig> = {}): System1Runti
     mode: 'shadow',
     enabled: true,
     confidenceThreshold: 0.7,
+    thresholds: {},
     budgetPerTurn: 4,
     budgetPerTask: 12,
     timeoutMs: 150,
     failureThreshold: 3,
     cooldownMs: 30_000,
     traceBufferSize: 200,
+    delegationWeights: { novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 },
     jevApiKeyEnv: 'TYPESAFE_API_KEY',
     jevEndpoint: 'https://api.typesafe.ai/v1/systemone',
     jevModel: 'jev-latest',
@@ -102,6 +104,85 @@ describe('System1Service', () => {
       return a as string
     })
     expect(decision.fallback).toBe('low-confidence')
+  })
+
+  it('prefers the question-level threshold over the global one', async () => {
+    // The question declares a 0.6 gate (cheap reversible hint); the global
+    // threshold is 0.7, so 0.65 passes here.
+    const cheapQuestion: System1Question = { ...question, threshold: 0.6 }
+    const service = new System1Service(
+      scriptedBackend([single('retry', 0.65)]),
+      testConfig(),
+    )
+    const decision = await service.ask(cheapQuestion, 'turn', new AbortController().signal, a => a as string)
+    expect(decision.fallback).toBeNull()
+    expect(decision.value).toBe('retry')
+  })
+
+  it('prefers the per-kind config override over the question threshold', async () => {
+    // Config says retry-judgment gates at 0.9; the question's own 0.6 loses.
+    const retryQuestion: System1Question = { ...question, kind: 'retry-judgment', threshold: 0.6 }
+    const service = new System1Service(
+      scriptedBackend([single('retry', 0.8)]),
+      testConfig({ thresholds: { 'retry-judgment': 0.9 } }),
+    )
+    const decision = await service.ask(retryQuestion, 'turn', new AbortController().signal, a => a as string)
+    expect(decision.fallback).toBe('low-confidence')
+  })
+
+  it('does not trip the circuit breaker on transient pacing errors', async () => {
+    const transient = Object.assign(new Error('system1: jev rate limited (HTTP 429)'), { transient: true })
+    let calls = 0
+    const backend: System1Backend = {
+      kind: 'none',
+      async decide(q: System1Question, signal: AbortSignal): Promise<System1Judgment> {
+        return (await this.decideMany([q], signal))[0] as System1Judgment
+      },
+      async decideMany(): Promise<System1Judgment[]> {
+        calls += 1
+        throw transient
+      },
+      async dispose(): Promise<void> {},
+    }
+    const service = new System1Service(backend, testConfig({ failureThreshold: 1 }))
+    const signal = new AbortController().signal
+    const validate = (a: unknown): string => a as string
+    // Even with failureThreshold 1, three transient failures must not open
+    // the circuit: the next batch still reaches the backend.
+    for (let i = 0; i < 3; i += 1) {
+      const decision = await service.ask(question, 'turn', signal, validate)
+      expect(decision.fallback).toBe('backend-error')
+    }
+    expect(calls).toBe(3)
+  })
+
+  it('trips the circuit breaker on repeated non-transient errors', async () => {
+    let calls = 0
+    const backend: System1Backend = {
+      kind: 'none',
+      async decide(q: System1Question, signal: AbortSignal): Promise<System1Judgment> {
+        return (await this.decideMany([q], signal))[0] as System1Judgment
+      },
+      async decideMany(): Promise<System1Judgment[]> {
+        calls += 1
+        throw new Error('boom')
+      },
+      async dispose(): Promise<void> {},
+    }
+    const service = new System1Service(backend, testConfig({ failureThreshold: 2 }))
+    const signal = new AbortController().signal
+    const validate = (a: unknown): string => a as string
+    // Two failures reach the backend; the third ask finds the circuit open
+    // and never calls the backend again.
+    const first = await service.ask(question, 'turn', signal, validate)
+    expect(first.fallback).toBe('backend-error')
+    expect(first.trace.note).not.toContain('circuit open')
+    const second = await service.ask(question, 'turn', signal, validate)
+    expect(second.trace.note).not.toContain('circuit open')
+    const third = await service.ask(question, 'turn', signal, validate)
+    expect(third.fallback).toBe('backend-error')
+    expect(third.trace.note).toContain('circuit open')
+    expect(calls).toBe(2)
   })
 
   it('falls back when the answer fails validation', async () => {

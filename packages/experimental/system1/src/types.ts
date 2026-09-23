@@ -23,12 +23,12 @@ export type JevPrimitive = 'choice' | 'score' | 'noul'
 /** The question areas System 1 can be asked about. */
 export type System1QuestionKind =
   | 'triage'
-  | 'tool-shortlist'
+  | 'tool-choice'
   | 'loop-check'
   | 'retry-judgment'
+  | 'final-answer'
   | 'delegation'
   | 'delegation-triage'
-  | 'plausibility'
 
 /**
  * One typed question for a System 1 backend, expressed in Jev's native
@@ -54,6 +54,15 @@ export interface System1Question {
   readonly options?: Readonly<Record<string, string>>
   /** Score rubric: 2-10 ordered level descriptions. */
   readonly levels?: readonly string[]
+  /**
+   * Risk-scaled gate for this question: the minimum confidence for the
+   * judgment to actuate. TypeSafe's guidance is that "a confidence threshold
+   * is not one number" — different actions gate at different levels
+   * depending on the consequences of getting it wrong — so each builder
+   * declares the stakes of its own question here. Falls back to the
+   * `thresholds` config override, then `confidenceThreshold`.
+   */
+  readonly threshold?: number
 }
 
 /**
@@ -121,6 +130,14 @@ export interface System1RuntimeConfig {
   readonly enabled: boolean
   /** Minimum confidence for a judgment to pass the gate. */
   readonly confidenceThreshold: number
+  /**
+   * Per-question-kind threshold overrides. TypeSafe's confidence guidance:
+   * "a confidence threshold is not one number" — a cheap reversible hint
+   * (retry) gates lower than oversight advice (delegation). A kind not
+   * listed here falls back to the question's own `threshold`, then
+   * `confidenceThreshold`.
+   */
+  readonly thresholds: Partial<Record<System1QuestionKind, number>>
   /** Max System 1 questions per agent turn (each question costs tokens). */
   readonly budgetPerTurn: number
   /** Max System 1 questions per agent task. */
@@ -133,6 +150,8 @@ export interface System1RuntimeConfig {
   readonly cooldownMs: number
   /** Max traces kept in the in-memory ring buffer. */
   readonly traceBufferSize: number
+  /** Relative weights for the delegation composite scores (novelty/tool-risk/irreversibility). */
+  readonly delegationWeights: DelegationWeights
   /** Environment variable holding the Jev API key (the key itself is never stored). */
   readonly jevApiKeyEnv: string
   /** Jev System One endpoint URL. */
@@ -149,13 +168,61 @@ export interface System1RuntimeConfig {
   readonly loopStuckThreshold: number
   /** Max loop nudges injected per agent task; further stuck episodes only warn. */
   readonly maxLoopNudgesPerTask: number
+  /**
+   * Stuck probability at or above which a hopeless trajectory ends the turn
+   * (0..1). Stricter than `loopStuckThreshold`: the STOP fires only when the
+   * deterministic detector also sees a long identical streak, so a high bar
+   * here means "Jev is nearly certain the agent is stuck, not polling".
+   */
+  readonly stopStuckThreshold: number
 }
 
 /** Triage verdict for one proposed agent step. */
 export type TriageVerdict = 'trivial' | 'standard' | 'complex'
 
 /** Retry verdict for a failed tool call. */
-export type RetryVerdict = 'retry' | 'retry-different' | 'give-up'
+export type RetryVerdict = 'retry' | 'retry-different' | 'replan' | 'give-up'
+
+/**
+ * Tool-choice verdict for one proposed tool call. `wrong-tool` means the
+ * call is clearly mistaken for the step's apparent goal — not merely
+ * suboptimal — and in enforce mode denies the dispatch so the agent can
+ * self-correct instead of spending a round-trip on a useless call.
+ */
+export type ToolChoiceVerdict = 'proceed' | 'wrong-tool'
+
+/**
+ * Final-answer verdict for a finished turn. `inadequate` means the agent's
+ * closing answer clearly fails to address the user's request (or the agent
+ * gave up). Observe-only: the turn is already over, so there is no veto —
+ * assist mode warns the operator.
+ */
+export type FinalAnswerVerdict = 'adequate' | 'inadequate'
+
+/** Oversight tier for a delegated subtask, from composite delegation scores. */
+export type OversightLevel = 'low' | 'standard' | 'high'
+
+/** Atomic delegation scores (each 0..3 on a four-level rubric), combined with weights in code. */
+export interface DelegationScores {
+  readonly novelty: number
+  readonly toolRisk: number
+  readonly irreversibility: number
+}
+
+/** Relative weights for the delegation composite; normalized in code so they need not sum to 1. */
+export interface DelegationWeights {
+  readonly novelty: number
+  readonly toolRisk: number
+  readonly irreversibility: number
+}
+
+/** Combined oversight judgment for one delegation. */
+export interface OversightJudgment {
+  readonly level: OversightLevel
+  /** Normalized weighted composite score in 0..1. */
+  readonly score: number
+  readonly scores: DelegationScores
+}
 
 /** Loop-check verdict for recent tool-call history. */
 export interface LoopCheckVerdict {

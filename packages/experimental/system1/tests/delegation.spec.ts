@@ -2,19 +2,20 @@
  * Delegation (orchestrator-level) composition tests for the System 1 plugin.
  *
  * Judge-before-delegate: when the Lead calls `spawn_teammate`, the plugin
- * triages the delegated subtask and advises the Lead through
- * `additionalContexts` on the spawn result — a strategy advisory for
- * standard/complex subtasks (the teammate itself gets the matching
- * atom/chain/tree-of-thoughts hint on its first pre-step via the
- * agent-level hook) and a deterministic warning for duplicate-purpose
- * spawns. Every test boots the real Loader composition with a stubbed Jev
- * `fetch` and dispatches the real `tools/post-execute` waterfall, proving:
+ * judges the delegated subtask with three atomic scores (novelty, tool
+ * risk, irreversibility), combines them with weights into an oversight
+ * judgment, and advises the Lead through `additionalContexts` on the spawn
+ * result — standard/high oversight advisories (the teammate itself gets the
+ * matching strategy hint on its first pre-step via the agent-level hook) and
+ * a deterministic warning for duplicate-purpose spawns. Every test boots
+ * the real Loader composition with a stubbed Jev `fetch` and dispatches
+ * the real `tools/post-execute` waterfall, proving:
  *
- * - confident triage verdicts produce advisories; trivial stays silent;
+ * - confident score composites produce advisories; low oversight stays silent;
  * - any fallback (low confidence, backend error) resolves to "no injection";
- * - duplicate-purpose spawns warn even when the triage is trivial;
+ * - duplicate-purpose spawns warn even when the scores are low;
  * - failed spawns and malformed args fall back to normal handling;
- * - shadow mode traces the triage but never injects.
+ * - shadow mode traces the composite but never injects.
  */
 
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
@@ -37,20 +38,25 @@ import type { PostToolDecision, ToolExecution, ToolExecutionResult } from '@deep
 import * as System1Plugin from '../src/index.ts'
 
 /** Stub controls, reset before each test. */
-let jevTriage: string
+let jevScores: [number, number, number]
 let jevConfidence: number
 let jevFail: boolean
 let askedKinds: string[]
 
-function answerFor(id: string): Record<string, unknown> {
+function answerFor(id: string, type: string): Record<string, unknown> {
   const kind = id.split('#')[0]
   askedKinds.push(kind ?? id)
-  const choice = kind === 'triage' || kind === 'delegation-triage' ? jevTriage : 'retry'
-  return { choice, confidence: jevConfidence }
+  if (type === 'score') {
+    // The three delegation scores go out in builder order: novelty,
+    // tool-risk, irreversibility; the just-pushed entry makes `seen` 0-based.
+    const seen = askedKinds.filter(k => k === 'delegation-triage').length - 1
+    return { score: jevScores[seen % 3] ?? 0, confidence: jevConfidence }
+  }
+  return { choice: 'retry', confidence: jevConfidence }
 }
 
 beforeEach(() => {
-  jevTriage = 'complex'
+  jevScores = [2.8, 2.6, 2.9] // default: high oversight composite
   jevConfidence = 0.9
   jevFail = false
   askedKinds = []
@@ -62,8 +68,8 @@ beforeEach(() => {
       questions: Record<string, { type: string }>
     }
     const answers: Record<string, Record<string, unknown>> = {}
-    for (const id of Object.keys(body.questions)) {
-      answers[id] = answerFor(id)
+    for (const [id, question] of Object.entries(body.questions)) {
+      answers[id] = answerFor(id, question.type)
     }
     return new Response(JSON.stringify({ model: 'jev-test-1.0', answers }), {
       status: 200,
@@ -178,39 +184,40 @@ async function spawn(
   ) as PostToolDecision
 }
 
-it('injects a delegation advisory for a complex subtask', async () => {
-  jevTriage = 'complex'
+it('injects a high-oversight advisory for a demanding subtask', async () => {
+  jevScores = [2.8, 2.6, 2.9] // composite ~0.92 → high
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   const decision = await spawn(context, 'lead-1', 'architect', 'Design the new billing pipeline end to end')
-  expect(askedKinds).toContain('delegation-triage')
+  // Three atomic scores in one batch, not one choice.
+  expect(askedKinds.filter(kind => kind === 'delegation-triage')).toHaveLength(3)
   const texts = contextTexts(decision)
   expect(texts).toHaveLength(1)
-  expect(texts[0]).toContain('[System 1 delegation triage: complex]')
+  expect(texts[0]).toContain('[System 1 delegation: high oversight]')
   expect(texts[0]).toContain('"architect"')
-  expect(texts[0]).toContain('tree-of-thoughts')
+  expect(texts[0]).toContain('atomic-decomposition')
 })
 
-it('injects a chain-of-thoughts advisory for a standard subtask', async () => {
-  jevTriage = 'standard'
+it('injects a standard-oversight advisory for a moderate subtask', async () => {
+  jevScores = [1.6, 1.5, 1.4] // composite ~0.51 → standard
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   const decision = await spawn(context, 'lead-2', 'researcher', 'Summarize the API docs for the payments endpoint')
   const texts = contextTexts(decision)
   expect(texts).toHaveLength(1)
-  expect(texts[0]).toContain('[System 1 delegation triage: standard]')
-  expect(texts[0]).toContain('chain-of-thoughts')
+  expect(texts[0]).toContain('[System 1 delegation: standard oversight]')
+  expect(texts[0]).toContain('chain-of-thought')
 })
 
-it('stays silent on a trivial delegation', async () => {
-  jevTriage = 'trivial'
+it('stays silent on a low-oversight delegation', async () => {
+  jevScores = [0.3, 0.2, 0.4] // composite ~0.10 → low
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   const decision = await spawn(context, 'lead-3', 'helper', 'Echo the build status back')
-  // The triage was still asked and traced; nothing worth telling the Lead.
-  expect(askedKinds).toContain('delegation-triage')
+  // The composite was still asked and traced; nothing worth telling the Lead.
+  expect(askedKinds.filter(kind => kind === 'delegation-triage')).toHaveLength(3)
   expect(contextTexts(decision)).toHaveLength(0)
 })
 
-it('injects nothing on a low-confidence delegation triage', async () => {
-  jevConfidence = 0.5 // below the 0.7 threshold: gate falls back
+it('injects nothing on low-confidence delegation scores', async () => {
+  jevConfidence = 0.5 // below the 0.6 score threshold: gate falls back
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   const decision = await spawn(context, 'lead-4', 'architect', 'Design the new billing pipeline end to end')
   expect(askedKinds).toContain('delegation-triage')
@@ -225,8 +232,8 @@ it('passes the spawn through untouched when the backend is down', async () => {
   expect(contextTexts(decision)).toHaveLength(0)
 })
 
-it('warns on a duplicate-purpose spawn even when the triage is trivial', async () => {
-  jevTriage = 'trivial' // isolate the deterministic warning from the advisory
+it('warns on a duplicate-purpose spawn even when the scores are low', async () => {
+  jevScores = [0.3, 0.2, 0.4] // low oversight: isolate the deterministic warning from the advisory
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   const first = await spawn(context, 'lead-6', 'code-reviewer', 'Review pull request code for bugs and style')
   expect(contextTexts(first)).toHaveLength(0)
@@ -239,7 +246,7 @@ it('warns on a duplicate-purpose spawn even when the triage is trivial', async (
 })
 
 it('does not warn for distinct purposes', async () => {
-  jevTriage = 'trivial'
+  jevScores = [0.3, 0.2, 0.4]
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   await spawn(context, 'lead-7', 'code-reviewer', 'Review pull request code for bugs and style')
   const second = await spawn(context, 'lead-7', 'db-migrator', 'Write postgres migration scripts for billing')
@@ -276,14 +283,14 @@ it('falls back to normal handling for malformed spawn arguments', async () => {
   expect(contextTexts(decision)).toHaveLength(0)
 })
 
-it('shadow mode asks the delegation triage but never injects', async () => {
-  jevTriage = 'complex'
+it('shadow mode asks the delegation composite but never injects', async () => {
+  jevScores = [2.8, 2.6, 2.9]
   const context = await boot({ backend: 'jev', mode: 'shadow' })
   const decision = await spawn(context, 'lead-10', 'architect', 'Design the new billing pipeline end to end')
   // Shadow observations are fire-and-forget; give the observation a beat to
   // run before asserting (and before disposal in afterEach).
   await new Promise(resolve => setTimeout(resolve, 250))
-  expect(askedKinds).toContain('delegation-triage')
+  expect(askedKinds.filter(kind => kind === 'delegation-triage')).toHaveLength(3)
   expect(contextTexts(decision)).toHaveLength(0)
 })
 

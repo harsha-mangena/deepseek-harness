@@ -10,10 +10,14 @@ Reasoning-model calls are expensive. Many loop decisions are small and typed ("i
 
 ## How it works
 
-The plugin observes two documented waterfall extension points and always delegates first:
+The plugin observes four documented extension points:
 
-- `agent/pre-step` → builds a **triage** `choice` question from the incoming messages.
-- `tools/post-execute` → tracks recent tool calls per agent, runs a **deterministic** loop check in code, and — only for ambiguous patterns — asks **loop-check** (`noul`) and **retry-judgment** (`choice`) questions.
+- `agent/pre-step` → asks **triage** (`choice`) and step **delegability** (`choice`) in one batch, from the incoming messages.
+- `tools/pre-execute` → asks **tool-choice** (`choice`): should this call proceed, or is it clearly the wrong tool for the step's apparent goal?
+- `tools/post-execute` → tracks recent tool calls per agent, runs a **deterministic** loop check in code, and — only for ambiguous patterns — asks **loop-check** (`noul`) and **retry-judgment** (`choice`).
+- `agent/turn-stopping` → asks **final-answer** (`choice`): does the closing answer address the request? Observe-only — the turn is already over, so there is no veto.
+
+Shadow/assist listeners always delegate first (`next()`) and observe afterwards, so a slow or failing backend can never change or delay loop behavior. Enforce listeners judge first (bounded by the service timeout; the service never rejects) and inject guidance, then delegate.
 
 Efficiency is structural, not aspirational:
 
@@ -28,26 +32,34 @@ Efficiency is structural, not aspirational:
 `System1Service` runs every question through the same gates:
 
 1. **Disabled** → fallback when the plugin is off.
-2. **Circuit** → fallback while the backend is failing repeatedly (HTTP 429s included). A batch that comes back short — fewer judgments than questions — fills the gaps with `backend-error` fallbacks and counts once toward the failure threshold, so a silently dropping backend still trips the breaker.
+2. **Circuit** → fallback while the backend is failing repeatedly. HTTP 429 (rate limit) is marked transient and does *not* count toward the failure threshold — the client backs off via `retry-after` instead. A batch that comes back short — fewer judgments than questions — fills the gaps with `backend-error` fallbacks and counts once toward the failure threshold, so a silently dropping backend still trips the breaker.
 3. **Budget** → fallback when the per-turn/per-task question budget is spent.
 4. **Backend** → timeout converts to a fallback; errors never throw.
 5. **Abstention** → the backend may decline to answer. A `noul` judgment that is missing, non-numeric, or non-finite is also an abstention — it never degrades into a fully-confident "not stuck" answer.
-6. **Confidence** → judgments below `confidenceThreshold` are dropped. For `noul` answers the confidence is `max(p, 1-p)`, so fence-sitting probabilities near 0.5 fail the gate.
+6. **Confidence** → judgments below the applicable threshold are dropped. Thresholds are risk-scaled per question kind: a kind listed in `thresholds` wins, then the question's own threshold, then `confidenceThreshold`. Denying a tool dispatch (tool-choice, 0.85) gates higher than advisory hints (retry-judgment, 0.6); shaping reasoning (triage, 0.7) sits between. For `noul` answers the semantics are abstain-in-band: probabilities within ±0.1 of 0.5 abstain with confidence 0 (never a confident "not stuck"), decided probabilities carry confidence 1, and action code thresholds the probability directly.
 7. **Validation** → the raw answer must parse into the expected typed shape. A throwing validator is contained: it produces a `backend-error` fallback instead of rejecting the batch.
 
 Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay and tuning. The trace records the versioned `model` id Jev reports (e.g. `jev-1.13.0`), so threshold tuning can be pinned to a model version.
 
 ### Backends
 
-- **Jev** (default): TypeSafe's hosted System One model. Bring your own key via the environment variable named by `jevApiKeyEnv` (default `TYPESAFE_API_KEY`, the official SDK convention); the key itself is never stored in config or memory. Endpoint defaults to `https://api.typesafe.ai/v1/systemone`, model to `jev-latest`.
+- **Jev** (default): TypeSafe's hosted System One model. Bring your own key via the environment variable named by `jevApiKeyEnv` (default `TYPESAFE_API_KEY`, the official SDK convention); the key itself is never stored in config or memory. Endpoint defaults to `https://api.typesafe.ai/v1/systemone`, model to `jev-1.13.0` (pinned: TypeSafe warns aliases move, and the shipped thresholds are tuned against that release — record the versioned model from your traces and re-tune on upgrades).
 - **Laya** (deferred): local fast-thinking sidecar. Kept compiling for a future local-first pass; not the current focus.
 - **none**: always abstains. Every gate falls back; useful for measuring baseline behavior.
 
 ### Modes
 
 - `shadow` (default): trace only. The loop never changes.
-- `assist`: trace plus `warn`-level loop hints — both from the deterministic loop check and from high-probability Jev loop judgments.
-- `enforce`: judgments actuate. Triage injects a reasoning-strategy hint before each step (trivial → direct atomic answer, standard → step-by-step, complex → atomic decomposition with 2–3 alternative approaches), loop-check injects a nudge when the agent looks stuck (bounded per task and per episode), retry-judgment advises on failed tool calls, and delegation triage advises the Lead on teammate spawns (see Orchestrator layer below). Any fallback — abstention, low confidence, timeout, backend error, exhausted budget — injects nothing and the loop continues unchanged.
+- `assist`: trace plus `warn`-level hints — loop hints (deterministic and high-probability Jev judgments), wrong-tool-call warnings from the tool-choice gate, and final-answer warnings when the closing answer clearly misses the request.
+- `enforce`: judgments actuate.
+  - **Triage** injects a reasoning-strategy hint before each step: trivial → direct short answer, no extended deliberation; standard → one grounded chain (one hypothesis, one tool call, verify, at most four steps); complex → atom-of-thoughts decomposition (dependency-ordered atomic sub-questions, discard resolved context). A failure signal (an acted-on retry hint or loop nudge) escalates the *next* step's reasoning one level, consumed once.
+  - **Tool-choice** is judge-before-act: a confident (≥ 0.85) wrong-tool verdict denies the dispatch with a model-facing reason so the agent self-corrects instead of spending a round-trip on a useless call. Anything else continues the waterfall untouched.
+  - **Loop-check** injects a nudge when the agent looks stuck (bounded per task and per episode); **retry-judgment** advises on failed tool calls (`retry`, `retry-different`, `replan`, or `give-up`).
+  - **Bounded STOP**: a hopeless trajectory — 5+ identical calls in a row *plus* Jev's stuck probability at/above `stopStuckThreshold` — ends the turn via pre-step `reject` instead of burning more tokens. Legitimate repetition (polling, retries) with a low stuck probability keeps going.
+  - **Delegation triage** advises the Lead on teammate spawns (see Orchestrator layer below).
+  - The final-answer check stays observe-only in every mode.
+
+  Any fallback — abstention, low confidence, timeout, backend error, exhausted budget — injects nothing (and denies nothing) and the loop continues unchanged.
 
 ### Orchestrator layer: judge-before-delegate
 
@@ -67,17 +79,20 @@ All tunables are Schemastery-validated with safe defaults:
 | `enabled` | `true` | Master switch |
 | `backend` | `'jev'` | `'jev' \| 'laya' \| 'none'` |
 | `mode` | `'shadow'` | `'shadow' \| 'assist' \| 'enforce'` |
-| `confidenceThreshold` | `0.7` | Minimum judgment confidence (0..1) |
-| `budgetPerTurn` / `budgetPerTask` | `4` / `12` | Max System 1 questions |
+| `confidenceThreshold` | `0.7` | Minimum judgment confidence (0..1); overridden per kind by `thresholds` |
+| `thresholds` | `{}` | Per-question-kind confidence overrides, e.g. `{ 'tool-choice': 0.9 }`. Precedence: per-kind override → question's own threshold → `confidenceThreshold` |
+| `budgetPerTurn` / `budgetPerTask` | `8` / `16` | Max System 1 questions |
 | `timeoutMs` | `1200` | Per-batch backend timeout (Jev answers in 70–500ms). `0` disables the timeout (not recommended for network backends) |
-| `failureThreshold` / `cooldownMs` | `3` / `30000` | Circuit breaker |
+| `failureThreshold` / `cooldownMs` | `3` / `30000` | Circuit breaker (HTTP 429s are transient and do not count) |
 | `traceBufferSize` | `200` | In-memory trace ring buffer |
 | `jevApiKeyEnv` | `'TYPESAFE_API_KEY'` | Env var naming the Jev key |
 | `jevEndpoint` | `'https://api.typesafe.ai/v1/systemone'` | Jev endpoint |
-| `jevModel` | `'jev-latest'` | Model alias; pin (e.g. `jev-1.13.0`) once thresholds are tuned |
+| `jevModel` | `'jev-1.13.0'` | Pinned model version; TypeSafe warns aliases move |
 | `layaEndpoint` / `layaAutoStart` / `layaCommand` | see `src/index.ts` | Laya sidecar wiring (deferred) |
 | `loopStuckThreshold` | `0.7` | Stuck probability at/above which a loop-check nudges (enforce) |
 | `maxLoopNudgesPerTask` | `2` | Max loop nudges injected per agent task (enforce) |
+| `stopStuckThreshold` | `0.9` | Stuck probability at/above which a hopeless trajectory ends the turn (enforce). Stricter than `loopStuckThreshold`: the STOP also requires a 5+ identical-call streak |
+| `delegationWeights` | `{ novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 }` | Relative weights for the delegation composite (normalized in code; individual weights may be zero, the total must be positive) |
 
 ### Getting a Jev key
 
@@ -87,19 +102,20 @@ Jev is in early access behind a waitlist: sign up at typesafe.ai, create a key a
 export TYPESAFE_API_KEY=<your key>
 ```
 
-Pin `jevModel` to the versioned id from your traces once you tune `confidenceThreshold`, because `jev-latest` moves and answers change under you.
+`jevModel` ships pinned to the versioned release the thresholds were tuned against. If you upgrade it, record the versioned model id from your traces and re-tune — aliases move and answers change under you.
 
 ## Known Limitations
 
 - **Live verification done (2026-09-23).** The wire format was exercised against the real `POST /v1/systemone` API: 6/6 direct judgments sensible (triage trivial/standard, loop stuck-p 0.86 on x4-identical history vs 0.15 healthy, retry→retry on timeout, give-up on bad args), plus real-model E2E benchmarks with/without Jev. See `~/workspace/system1-jev-validation-results.md`.
 - **Laya sidecar shape is provisional and deferred.** The `/health` + `POST /decide` contract in `src/sidecar.ts` is unverified; Laya is not the current focus.
-- **Tool shortlist is not wired.** Hierarchical tool selection needs the tool-catalog access point identified; only triage, loop-check, and retry-judgment run in this change.
+- **Tool shortlist is not wired.** Hierarchical tool selection needs a tool-catalog seam the harness does not expose (verified against the tools package source); the dead `tool-shortlist` question kind was removed rather than left as a stub.
+- **Plan viability is not judged.** Plan mode is user-interactive (propose → human review → approve); there is no machine-judgment seam for plan viability, so none is invented.
 - **No session events.** Traces live in a per-plugin in-memory ring buffer and do not survive restarts. Durable `system1/*` session events are deferred (they carry persistence/versioning requirements).
 - **Budgets are guardrails, not accounting.** Per-agent turn tracking resets on observed turn changes; concurrent agents share the service counters.
 
 ## Deferred Work
 
-- Wiring the tool-shortlist gate into request preparation.
+- Wiring the tool-shortlist gate into request preparation (blocked: no tool-catalog seam in the harness).
 - Secure Vault settings UI for the Jev API key (currently env-var only).
 - Durable trace persistence and a shadow-replay benchmark harness.
 - Laya local-first pass: verify the sidecar contract, supervisor policy (restarts, resource limits).

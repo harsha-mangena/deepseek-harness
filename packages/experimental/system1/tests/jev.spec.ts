@@ -16,12 +16,14 @@ function testConfig(overrides: Partial<System1RuntimeConfig> = {}): System1Runti
     mode: 'shadow',
     enabled: true,
     confidenceThreshold: 0.7,
+    thresholds: {},
     budgetPerTurn: 4,
     budgetPerTask: 12,
     timeoutMs: 1200,
     failureThreshold: 3,
     cooldownMs: 30_000,
     traceBufferSize: 200,
+    delegationWeights: { novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 },
     jevApiKeyEnv: KEY_ENV,
     jevEndpoint: 'https://api.typesafe.ai/v1/systemone',
     jevModel: 'jev-latest',
@@ -117,7 +119,7 @@ describe('JevBackend wire format', () => {
     expect(judgment?.abstained).toBe(false)
   })
 
-  it('maps noul probabilities to answer + certainty confidence', async () => {
+  it('maps a decided noul to its probability with full confidence', async () => {
     process.env[KEY_ENV] = 'test-key'
     stubFetch(() => jsonResponse({
       model: 'jev-1.13.0',
@@ -126,7 +128,34 @@ describe('JevBackend wire format', () => {
     const backend = new JevBackend(testConfig())
     const [judgment] = await backend.decideMany([loopCheck], new AbortController().signal)
     expect(judgment?.answer).toBe(0.85)
-    expect(judgment?.confidence).toBe(0.85)
+    // noul has no separate confidence (TypeSafe docs): a decided probability
+    // is thresholded directly by the caller, so no confidence is invented.
+    expect(judgment?.confidence).toBe(1)
+    expect(judgment?.abstained).toBe(false)
+  })
+
+  it('abstains on a near-even noul instead of judging a coin flip', async () => {
+    process.env[KEY_ENV] = 'test-key'
+    stubFetch(() => jsonResponse({
+      model: 'jev-1.13.0',
+      answers: { 'loop-check#0': { noul: 0.55 } },
+    }))
+    const backend = new JevBackend(testConfig())
+    const [judgment] = await backend.decideMany([loopCheck], new AbortController().signal)
+    expect(judgment?.answer).toBe(0.55)
+    expect(judgment?.abstained).toBe(true)
+    expect(judgment?.confidence).toBe(0)
+  })
+
+  it('does not abstain just outside the band', async () => {
+    process.env[KEY_ENV] = 'test-key'
+    stubFetch(() => jsonResponse({
+      model: 'jev-1.13.0',
+      answers: { 'loop-check#0': { noul: 0.61 } },
+    }))
+    const backend = new JevBackend(testConfig())
+    const [judgment] = await backend.decideMany([loopCheck], new AbortController().signal)
+    expect(judgment?.abstained).toBe(false)
   })
 
   it('abstains on a missing noul instead of judging a confident zero', async () => {
@@ -173,6 +202,16 @@ describe('JevBackend wire format', () => {
       .then(() => null, (e: unknown) => e)
     expect(error).toBeInstanceOf(JevRateLimitError)
     expect((error as JevRateLimitError).retryAfterMs).toBe(2000)
+  })
+
+  it('marks rate-limit errors transient so the service skips the circuit breaker', async () => {
+    process.env[KEY_ENV] = 'test-key'
+    stubFetch(() => jsonResponse({ error: 'slow down' }, 429))
+    const backend = new JevBackend(testConfig())
+    const error = await backend
+      .decideMany([triage], new AbortController().signal)
+      .then(() => null, (e: unknown) => e)
+    expect((error as { transient?: unknown }).transient).toBe(true)
   })
 
   it('throws on other HTTP errors', async () => {
