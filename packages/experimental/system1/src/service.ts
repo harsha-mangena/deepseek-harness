@@ -254,7 +254,8 @@ export class System1Service {
    *
    * @param questions - the typed questions for the backend, in order.
    * @param validators - one answer validator per question, in the same order.
-   * @param scope - which budget each question counts against.
+   * @param scope - primary budget for the gate (`'turn'` or `'task'`);
+   *   every question additionally counts against the per-task ceiling.
    * @param signal - caller cancellation; also bounds the backend call.
    * @param agentId - the agent the questions belong to; budgets are
    * partitioned per agent. Defaults to a shared bucket; production call
@@ -276,19 +277,26 @@ export class System1Service {
     }
 
     // Budget counts questions, not batches: each question costs tokens.
-    // Counters are per agent, so agents never starve each other.
-    const usedMap = scope === 'turn' ? this.turnUsed : this.taskUsed
-    const budget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
+    // Every question consumes from BOTH the per-turn and the per-task
+    // budget, so a long task cannot outspend its task ceiling even when
+    // each turn stays under its own. Counters are per agent, so agents
+    // never starve each other. `scope` selects the primary budget for the
+    // gate; the task budget additionally binds as a universal ceiling.
+    const primaryUsed = scope === 'turn'
+      ? this.turnUsed.get(agentId) ?? 0
+      : this.taskUsed.get(agentId) ?? 0
+    const primaryBudget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
+    const taskUsed = this.taskUsed.get(agentId) ?? 0
     const askable: Array<{ index: number; question: System1Question; validate: (answer: unknown) => T | null }> = []
     const decisions = new Array<System1Decision<T> | undefined>(questions.length)
     questions.forEach((question, index) => {
-      const used = usedMap.get(agentId) ?? 0
       const validate = validators[index]
       if (validate === undefined) {
         decisions[index] = this.fallback<T>(question, 'backend-error', 'missing validator')
         return
       }
-      if (used + askable.length >= budget) {
+      if (primaryUsed + askable.length >= primaryBudget ||
+          taskUsed + askable.length >= this.config.budgetPerTask) {
         decisions[index] = this.fallback<T>(question, 'budget-exceeded')
         return
       }
@@ -332,7 +340,11 @@ export class System1Service {
           decisions[index] = this.fallback<T>(question, 'backend-error', 'backend dropped a question')
           return
         }
-        usedMap.set(agentId, (usedMap.get(agentId) ?? 0) + 1)
+        // Every answered question spends from both budgets (see the gate
+        // above): the per-turn counter refreshes each turn, the per-task
+        // counter only on a new task.
+        this.turnUsed.set(agentId, (this.turnUsed.get(agentId) ?? 0) + 1)
+        this.taskUsed.set(agentId, (this.taskUsed.get(agentId) ?? 0) + 1)
         decisions[index] = this.gate(question, judgment, validate)
       })
       this.capBudgets()

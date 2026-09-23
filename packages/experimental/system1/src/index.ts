@@ -98,7 +98,7 @@ import {
   extractSpawnArgs,
   SPAWN_TOOL_NAME,
 } from './orchestrator.ts'
-import type { SpawnArgs } from './orchestrator.ts'
+import type { DelegationScoreCache, SpawnArgs } from './orchestrator.ts'
 import type {
   DelegationWeights,
   ModelRouteOverride,
@@ -937,6 +937,17 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.warn(
         `system1: possible tool loop for agent ${agentId}: "${entry.name}" repeated ${loop.repetitions}x (suggestion: ${loop.suggestion})`,
       )
+      // A looping delegation still receives its Jev scoring/advisory: the
+      // identical spawn was scored before the loop was detected, so reuse
+      // the cached composite instead of spending another backend round-trip
+      // on byte-identical questions. The duplicate warning above already
+      // named the overlap; this adds the oversight advisory.
+      if (spawn !== null) {
+        const cached = delegationStateFor(agentId).takeScores(entry.argsKey)
+        if (cached !== null && cached.advisory !== null) {
+          contexts.push(guidance(cached.advisory))
+        }
+      }
       const decision = await next()
       return withContexts(decision, contexts)
     }
@@ -958,13 +969,19 @@ export function apply(ctx: Context, config: Config): void {
     // (novelty/tool-risk/irreversibility) joins the batch — Jev evaluates
     // questions in parallel, so it costs barely more than the loop/retry
     // questions alone. Deterministic recording happened above, before the
-    // loop branch, so the candidate never matches itself.
+    // loop branch, so the candidate never matches itself. An identical spawn
+    // scored earlier reuses its cached composite: the questions would be
+    // byte-identical, so re-asking spends budget for no new information.
+    let cachedDelegation: DelegationScoreCache | null = null
     if (spawn !== null) {
-      const scoreQuestions = buildDelegationScoreQuestions(spawn.name, spawn.description, spawn.prompt)
-      for (const scoreQuestion of scoreQuestions) {
-        questions.push(scoreQuestion)
-        validators.push(validateDelegationScore)
-        kinds.push('delegation-triage')
+      cachedDelegation = delegationStateFor(agentId).takeScores(entry.argsKey)
+      if (cachedDelegation === null) {
+        const scoreQuestions = buildDelegationScoreQuestions(spawn.name, spawn.description, spawn.prompt)
+        for (const scoreQuestion of scoreQuestions) {
+          questions.push(scoreQuestion)
+          validators.push(validateDelegationScore)
+          kinds.push('delegation-triage')
+        }
       }
     }
     const decisions = questions.length > 0
@@ -1009,11 +1026,22 @@ export function apply(ctx: Context, config: Config): void {
       const [novelty, toolRisk, irreversibility] = delegationScores as [number, number, number]
       const oversight = computeDelegationOversight({ novelty, toolRisk, irreversibility }, config.delegationWeights)
       const advisory = buildDelegationAdvisory(spawn.name, oversight)
+      // Cache the composite under the canonical args key: a repeated
+      // identical spawn (including a looping one) reuses the advisory
+      // instead of re-asking Jev the same questions.
+      delegationStateFor(agentId).noteScores(entry.argsKey, {
+        scores: { novelty, toolRisk, irreversibility },
+        oversight,
+        advisory,
+      })
       if (advisory !== null) {
         ctx.logger.warn(`system1: ${advisory}`)
         contexts.push(guidance(advisory))
         delegationScoreTraces.forEach((traced) => { service.markActed(traced.trace.id) })
       }
+    } else if (cachedDelegation !== null && cachedDelegation.advisory !== null) {
+      // Identical spawn scored earlier: reuse its advisory, no new questions.
+      contexts.push(guidance(cachedDelegation.advisory))
     }
     return withContexts(decision, contexts)
   }

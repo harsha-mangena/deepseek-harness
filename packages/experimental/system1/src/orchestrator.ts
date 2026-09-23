@@ -109,6 +109,19 @@ export interface DelegationRecord {
 }
 
 /**
+ * A Jev-scored delegation composite, cached so an identical spawn reuses
+ * the advisory instead of spending another backend round-trip on
+ * byte-identical questions. The scores are Jev's; the reuse only skips the
+ * redundant re-ask.
+ */
+export interface DelegationScoreCache {
+  readonly scores: DelegationScores
+  readonly oversight: OversightJudgment
+  /** Null when the oversight tier needs no commentary (low). */
+  readonly advisory: string | null
+}
+
+/**
  * Bounded registry of recent teammate spawns. Duplicate detection compares
  * a new delegation against spawns inside the time window; the registry
  * never grows past `maxSpawns`, so long sessions cannot leak memory. It is
@@ -130,8 +143,18 @@ export function createDelegationState(
   findDuplicate(name: string, description: string): DelegationRecord | null
   /** Current registry size; exported for tests. */
   size(): number
+  /**
+   * Cache the Jev-scored composite for a spawn's canonical args key, so a
+   * repeated identical delegation — including a looping one, which returns
+   * before the scoring batch is built — still receives the advisory without
+   * a redundant backend round-trip. Bounded like the registry.
+   */
+  noteScores(argsKey: string, cached: DelegationScoreCache): void
+  /** Reuse the cached composite for identical args, or null when unscored. */
+  takeScores(argsKey: string): DelegationScoreCache | null
 } {
   const spawns: DelegationRecord[] = []
+  const scoreCache = new Map<string, DelegationScoreCache>()
   return {
     noteSpawn(name: string, description: string): void {
       spawns.push({ name, description, at: Date.now() })
@@ -154,6 +177,17 @@ export function createDelegationState(
     },
     size(): number {
       return spawns.length
+    },
+    noteScores(argsKey: string, cached: DelegationScoreCache): void {
+      scoreCache.set(argsKey, cached)
+      while (scoreCache.size > Math.max(1, maxSpawns)) {
+        const oldest = scoreCache.keys().next().value
+        if (oldest === undefined) break
+        scoreCache.delete(oldest)
+      }
+    },
+    takeScores(argsKey: string): DelegationScoreCache | null {
+      return scoreCache.get(argsKey) ?? null
     },
   }
 }

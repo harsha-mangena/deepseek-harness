@@ -47,11 +47,18 @@ let jevRetry: string
 let jevDelegate: string
 let jevConfidence: number
 let jevFail: boolean
+/** Score answers for delegation-triage questions; null answers without a score. */
+let jevScore: number | null
+/** Question kinds per Jev batch, in call order; reset before each test. */
+let fetchBatches: string[][]
 
 function answerFor(id: string, type: string): Record<string, unknown> {
   const kind = id.split('#')[0]
   if (type === 'noul') {
     return jevNoul === null ? { confidence: jevConfidence } : { noul: jevNoul, confidence: jevConfidence }
+  }
+  if (type === 'score') {
+    return jevScore === null ? { confidence: jevConfidence } : { score: jevScore, confidence: jevConfidence }
   }
   let choice: string
   if (kind === 'triage') choice = jevTriage
@@ -68,6 +75,8 @@ beforeEach(() => {
   jevDelegate = 'keep'
   jevConfidence = 0.9
   jevFail = false
+  jevScore = null
+  fetchBatches = []
   vi.stubEnv('TYPESAFE_API_KEY', 'test-key')
   vi.stubGlobal('fetch', async (url: string, init: RequestInit): Promise<Response> => {
     if (jevFail) throw new Error('backend down')
@@ -76,9 +85,12 @@ beforeEach(() => {
       questions: Record<string, { type: string }>
     }
     const answers: Record<string, Record<string, unknown>> = {}
+    const kinds: string[] = []
     for (const [id, question] of Object.entries(body.questions)) {
+      kinds.push(id.split('#')[0] ?? id)
       answers[id] = answerFor(id, question.type)
     }
+    fetchBatches.push(kinds)
     return new Response(JSON.stringify({ model: 'jev-test-1.0', answers }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -357,6 +369,39 @@ it('nudges via additionalContexts on a deterministic loop', async () => {
   expect(texts).toHaveLength(1)
   expect(texts[0]).toContain('[System 1 loop-check]')
   expect(texts[0]).toContain('"probe_tool" ×3')
+})
+
+it('reuses the delegation advisory on a looping spawn without re-asking Jev', async () => {
+  jevScore = 2.5 // high scores → 'high' oversight → the advisory is non-null
+  jevNoul = 0.1 // low stuck probability: no Jev loop nudges to confuse the assertion
+  const context = await boot({ backend: 'jev', mode: 'enforce' })
+  const agentId = 'enforce-loop-delegation'
+  const spawnExec: ToolExecution = {
+    agent: { id: agentId, sessionId: liveSession(context, agentId) },
+    name: 'spawn_teammate',
+    arguments: { name: 'worker', description: 'index the data files', prompt: 'index all data files' },
+    signal: new AbortController().signal,
+  } as unknown as ToolExecution
+  // First spawn: Jev scores the delegation, the advisory injects.
+  const first = await context.waterfall('tools/post-execute', spawnExec, toolResult(false), acceptNext)
+  expect(first.kind).toBe('accept')
+  expect(contextTexts(first).some(text => text.includes('[System 1 delegation: high oversight]'))).toBe(true)
+  // Second identical spawn: duplicate-purpose warning, advisory reused from the cache.
+  const second = await context.waterfall('tools/post-execute', spawnExec, toolResult(false), acceptNext)
+  const secondTexts = contextTexts(second)
+  expect(secondTexts.some(text => text.includes('overlaps with'))).toBe(true)
+  expect(secondTexts.some(text => text.includes('[System 1 delegation: high oversight]'))).toBe(true)
+  // Third identical spawn: deterministic loop. The loop branch returns before
+  // the scoring batch is built, but the Lead still receives Jev's advisory —
+  // reused from the identical spawn scored above, never re-asked.
+  const third = await context.waterfall('tools/post-execute', spawnExec, toolResult(false), acceptNext)
+  expect(third.kind).toBe('accept')
+  const thirdTexts = contextTexts(third)
+  expect(thirdTexts.some(text => text.includes('overlaps with'))).toBe(true)
+  expect(thirdTexts.some(text => text.includes('[System 1 loop-check]'))).toBe(true)
+  expect(thirdTexts.some(text => text.includes('[System 1 delegation: high oversight]'))).toBe(true)
+  // The delegation composite went out exactly once: the repeats reused it.
+  expect(fetchBatches.filter(kinds => kinds.includes('delegation-triage'))).toHaveLength(1)
 })
 
 it('nudges when Jev judges the agent stuck', async () => {

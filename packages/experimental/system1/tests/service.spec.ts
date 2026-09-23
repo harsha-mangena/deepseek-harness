@@ -220,6 +220,22 @@ describe('System1Service', () => {
     expect((await service.ask(question, 'turn', signal, validate)).fallback).toBeNull()
   })
 
+  it('enforces the per-task budget as a ceiling over turn-scoped questions', async () => {
+    const service = new System1Service(
+      scriptedBackend([single('trivial', 0.9)]),
+      testConfig({ budgetPerTurn: 10, budgetPerTask: 2 }),
+    )
+    const signal = new AbortController().signal
+    const validate = (a: unknown): string => a as string
+    expect((await service.ask(question, 'turn', signal, validate)).fallback).toBeNull()
+    expect((await service.ask(question, 'turn', signal, validate)).fallback).toBeNull()
+    // The turn budget (10) still has room; the task ceiling (2) binds.
+    expect((await service.ask(question, 'turn', signal, validate)).fallback).toBe('budget-exceeded')
+    // A new task refreshes the ceiling.
+    service.resetTask()
+    expect((await service.ask(question, 'turn', signal, validate)).fallback).toBeNull()
+  })
+
   it('converts backend errors into fallbacks and opens the circuit', async () => {
     const failing: System1Backend = {
       kind: 'none',

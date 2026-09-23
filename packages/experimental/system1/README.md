@@ -72,8 +72,8 @@ Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay
 
 When the agent-team packages are installed, the Lead can delegate via the `spawn_teammate` tool. System 1 judges the delegation itself — an orchestration concern the per-step hooks cannot see:
 
-- **Delegation triage** (one Jev `delegation-triage` question per spawn, joining the post-execute batch): `complex`/`standard` verdicts advise the Lead through `additionalContexts` — which strategy the subtask deserves (the teammate, being an agent, receives the matching atom/chain/tree-of-thoughts hint on its own first step) and proportionate oversight. `trivial` stays silent; the Lead's context stays clean.
-- **Duplicate-purpose detection** (deterministic, no model call): a bounded registry of recent spawns flags same-name or similar-purpose teammates (Jaccard ≥ 0.5 within 30 minutes) so the Lead can interrupt or merge before two teammates burn tokens on the same work. Registry writes and duplicate warnings run before the loop early-return, so a repeated `spawn_teammate` cannot dodge bookkeeping by looking like a loop.
+- **Delegation triage** (one Jev `delegation-triage` question per spawn, joining the post-execute batch): `complex`/`standard` verdicts advise the Lead through `additionalContexts` — which strategy the subtask deserves (the teammate, being an agent, receives the matching atom/chain/tree-of-thoughts hint on its own first step) and proportionate oversight. `trivial` stays silent; the Lead's context stays clean. The scored composite is cached per agent under the spawn's canonical args key: an identical repeat reuses the advisory instead of re-asking Jev byte-identical questions.
+- **Duplicate-purpose detection** (deterministic, no model call): a bounded registry of recent spawns flags same-name or similar-purpose teammates (Jaccard ≥ 0.5 within 30 minutes) so the Lead can interrupt or merge before two teammates burn tokens on the same work. Registry writes and duplicate warnings run before the loop early-return, so a repeated `spawn_teammate` cannot dodge bookkeeping by looking like a loop — and a looping spawn still receives the cached delegation advisory, so it never skips Jev oversight either.
 
 Shadow traces the triage; assist warns; enforce injects. The branch only fires for `spawn_teammate`, so without the agent-team packages it is inert — no config flag needed. Delegations are never denied: the plugin advises, the Lead decides.
 
@@ -88,7 +88,7 @@ All tunables are Schemastery-validated with safe defaults:
 | `mode` | `'shadow'` | `'shadow' \| 'assist' \| 'enforce'` |
 | `confidenceThreshold` | `0.7` | Minimum judgment confidence (0..1); overridden per kind by `thresholds` |
 | `thresholds` | `{}` | Per-question-kind confidence overrides, e.g. `{ 'tool-choice': 0.9 }`. Precedence: per-kind override → question's own threshold → `confidenceThreshold` |
-| `budgetPerTurn` / `budgetPerTask` | `8` / `16` | Max System 1 questions |
+| `budgetPerTurn` / `budgetPerTask` | `8` / `16` | Max System 1 questions per turn / per task; every question counts against both budgets |
 | `timeoutMs` | `1200` | Per-batch backend timeout (Jev answers in 70–500ms). `0` disables the timeout (not recommended for network backends) |
 | `failureThreshold` / `cooldownMs` | `3` / `30000` | Circuit breaker (HTTP 429s are transient and do not count) |
 | `traceBufferSize` | `200` | In-memory trace ring buffer |
