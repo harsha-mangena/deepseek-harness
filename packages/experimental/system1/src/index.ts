@@ -49,7 +49,7 @@
 
 import type { Context, Events } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { createUserMessage, ReasoningEffortId, type LlmCallConfig, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId, type ContentBlock, type LlmCallConfig, type ToolResultMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type {
   PostToolDecision,
   PreToolDecision,
@@ -57,6 +57,7 @@ import type {
   ToolExecutionResult,
 } from '@deepseek-ai/dsh-tools'
 import type { System1Backend } from './backend.ts'
+import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { JevBackend } from './backends/jev.ts'
 import { LayaBackend, type BackendLogger } from './backends/laya.ts'
 import { NullBackend } from './backends/null.ts'
@@ -66,12 +67,20 @@ import {
   buildDelegationQuestion,
   buildDelegationScoreQuestions,
   buildFinalAnswerQuestion,
+  buildInjectionScreenQuestion,
+  buildInjectionWarning,
   buildLoopNudge,
   buildLoopQuestion,
+  buildPreselectQuestion,
+  buildPruneMarker,
+  buildPruneQuestion,
   buildRequestRetryQuestion,
+  buildResultTriageQuestion,
   buildRetryHint,
   buildRetryQuestion,
   buildStrategyHint,
+  buildSubagentAcceptQuestion,
+  buildSubagentReworkHint,
   buildToolChoiceQuestion,
   buildToolDenyReason,
   buildTriageQuestion,
@@ -82,14 +91,20 @@ import {
   validateDelegation,
   validateDelegationScore,
   validateFinalAnswer,
+  validateInjectionScreen,
   validateLoopAnswer,
+  validatePreselect,
+  validatePrune,
   validateRequestRetry,
+  validateResultTriage,
   validateRetry,
+  validateSubagentAccept,
   validateToolChoice,
   validateTriage,
   type ObservedToolCall,
 } from './gates.ts'
 import { System1Service } from './service.ts'
+import { appendDecisionActedEvent, appendDecisionEvent } from './telemetry.ts'
 import {
   buildDelegationAdvisory,
   buildDuplicateWarning,
@@ -102,7 +117,9 @@ import type { DelegationScoreCache, SpawnArgs } from './orchestrator.ts'
 import type {
   DelegationWeights,
   ModelRouteOverride,
+  ResultTriageVerdict,
   RetryVerdict,
+  SubagentAcceptVerdict,
   System1BackendKind,
   System1Decision,
   System1Mode,
@@ -198,6 +215,75 @@ export interface Config {
    * cannot loop forever; the adapter's own retry policy is unaffected.
    */
   maxRequestRetries: number
+  /**
+   * Redact secret-shaped values (keys, tokens, passwords, credentials)
+   * from the state sent to the Jev backend. Default true — the harness
+   * state can carry API keys and session material the judge never needs.
+   */
+  redactState: boolean
+  /**
+   * Start the risk/tool-choice judgment while the tool call is still
+   * streaming, so `tools/pre-execute` can reuse it instead of awaiting a
+   * fresh Jev round trip. Default true; bounded per-turn cache.
+   */
+  prefetchToolChoice: boolean
+  /**
+   * Ask Jev at session start which MCP servers the task plausibly needs and
+   * deny the rest with `tools.restrict()`. Default false: the judgment is
+   * heuristic, so preselection stays opt-in and fail-open.
+   */
+  preselect: boolean
+  /**
+   * Jev need-probability below which a preselected MCP server is denied
+   * (0..1). Conservative default: only near-certainly-unneeded servers go.
+   */
+  preselectDenyThreshold: number
+  /**
+   * Minimum distinct MCP servers before preselection runs. With fewer
+   * servers the restriction buys nothing, so the gate stays inert.
+   */
+  preselectMinServers: number
+  /**
+   * Tool-result character size at or above which the post-execute triage
+   * gate runs. Smaller results pass through untriaged.
+   */
+  triageMinChars: number
+  /**
+   * Characters of a noisy result's head kept when Jev says
+   * `noisy_keep_head`. The tail is replaced by a marker citing the
+   * shadowed event so replay can recover it.
+   */
+  triageHeadChars: number
+  /** Screen untrusted tool results for prompt injection. Default true. */
+  injectionScreen: boolean
+  /**
+   * Injection probability at or above which an untrusted result is flagged
+   * (0..1). High default: only confident detections steer the agent.
+   */
+  injectionThreshold: number
+  /** Check subagent outputs against their delegated task. Default true. */
+  subagentAccept: boolean
+  /**
+   * Pressure-gated pruning of past tool results (compaction). Default
+   * false: rewriting history is the riskiest actuation here, so it stays
+   * opt-in and only runs under token pressure.
+   */
+  compactionPrune: boolean
+  /**
+   * Token-meter pressure at or above which the prune gate runs (0..1).
+   * The meter service must be mounted; without it the gate stays inert.
+   */
+  prunePressureThreshold: number
+  /** Tool-result character size at or above which a result is prune-eligible. */
+  pruneMinChars: number
+  /**
+   * Jev still-needed probability below which a prune-eligible result is
+   * replaced by a marker (0..1). Conservative: only near-certainly-stale
+   * results are rewritten.
+   */
+  pruneDropThreshold: number
+  /** Max history rewrites per agent task; further droppable results only warn. */
+  maxPrunePerTask: number
 }
 
 /** Runtime schema for {@link Config}. */
@@ -233,6 +319,21 @@ export const Config: z<Config> = z.object({
     reasoningEffort: z.union([z.string().min(1), z.const(undefined)]),
   })).default({}),
   maxRequestRetries: z.natural().default(1),
+  redactState: z.boolean().default(true),
+  prefetchToolChoice: z.boolean().default(true),
+  preselect: z.boolean().default(false),
+  preselectDenyThreshold: z.percent().default(0.15),
+  preselectMinServers: z.natural().min(2).default(3),
+  triageMinChars: z.natural().default(4000),
+  triageHeadChars: z.natural().default(2000),
+  injectionScreen: z.boolean().default(true),
+  injectionThreshold: z.percent().default(0.8),
+  subagentAccept: z.boolean().default(true),
+  compactionPrune: z.boolean().default(false),
+  prunePressureThreshold: z.percent().default(0.7),
+  pruneMinChars: z.natural().default(4000),
+  pruneDropThreshold: z.percent().default(0.2),
+  maxPrunePerTask: z.natural().default(10),
 })
 
 type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
@@ -243,6 +344,13 @@ type PostExecuteNext = Parameters<Events['tools/post-execute']>[2]
 type RequestErrorPayload = Parameters<Events['agent/request-error']>[0]
 type RequestErrorNext = Parameters<Events['agent/request-error']>[1]
 type RequestErrorAction = Awaited<ReturnType<RequestErrorNext>>
+/**
+ * The outcome of one tool-choice judgment: a confident wrong-tool verdict
+ * with its confidence and trace, or null when the call should proceed.
+ * Shared by the synchronous `tools/pre-execute` path and the speculative
+ * stream-time prefetch, which produces exactly this shape.
+ */
+type ToolChoiceOutcome = { verdict: ToolChoiceVerdict; confidence: number; traceId: string } | null
 
 function toRuntimeConfig(config: Config): System1RuntimeConfig {
   return {
@@ -269,6 +377,21 @@ function toRuntimeConfig(config: Config): System1RuntimeConfig {
     delegationWeights: config.delegationWeights,
     modelRoute: config.modelRoute,
     maxRequestRetries: config.maxRequestRetries,
+    redactState: config.redactState,
+    prefetchToolChoice: config.prefetchToolChoice,
+    preselect: config.preselect,
+    preselectDenyThreshold: config.preselectDenyThreshold,
+    preselectMinServers: config.preselectMinServers,
+    triageMinChars: config.triageMinChars,
+    triageHeadChars: config.triageHeadChars,
+    injectionScreen: config.injectionScreen,
+    injectionThreshold: config.injectionThreshold,
+    subagentAccept: config.subagentAccept,
+    compactionPrune: config.compactionPrune,
+    prunePressureThreshold: config.prunePressureThreshold,
+    pruneMinChars: config.pruneMinChars,
+    pruneDropThreshold: config.pruneDropThreshold,
+    maxPrunePerTask: config.maxPrunePerTask,
   }
 }
 
@@ -422,6 +545,30 @@ export function apply(ctx: Context, config: Config): void {
   const agents = createAgentState()
   const lifetime = new AbortController()
   const enforce = config.mode === 'enforce'
+  // Durable telemetry: every trace lands as one `system1/decision` session
+  // event on the owning agent's log — including shadow observations and
+  // fallbacks, so the log is an unbiased calibration source — and a later
+  // `markActed` lands a separate `system1/decision-acted` event keyed by
+  // trace id. The in-memory ring is for live debugging, the log is for
+  // replay. The listener never throws (the service swallows listener
+  // errors) and appends are best-effort, so telemetry can never break the
+  // decision path.
+  const telemetrySeen = new Set<string>()
+  const telemetryActed = new Set<string>()
+  const disposeTelemetry = service.onTrace((trace) => {
+    const session = agentSessions.get(trace.agentId)
+    if (session === undefined) return
+    if (!telemetrySeen.has(trace.id)) {
+      telemetrySeen.add(trace.id)
+      if (trace.acted) telemetryActed.add(trace.id)
+      appendDecisionEvent(session, trace)
+      return
+    }
+    if (trace.acted && !telemetryActed.has(trace.id)) {
+      telemetryActed.add(trace.id)
+      appendDecisionActedEvent(session, trace.id)
+    }
+  })
   /**
    * Orchestrator-level delegation memory, per agent: recent `spawn_teammate`
    * calls for duplicate-purpose detection. Only consulted for that tool,
@@ -459,6 +606,184 @@ export function apply(ctx: Context, config: Config): void {
    * from this offset. Entries are consumed at `agent/turn-stopping`.
    */
   const turnStarts = new Map<string, number>()
+  /**
+   * Agent sessions for durable telemetry: `system1/decision` events are
+   * appended to the acting agent's log. Updated on every pre-step and
+   * tool execution; bounded like the other per-agent maps.
+   */
+  const agentSessions = new Map<string, Session>()
+  /**
+   * In-flight speculative tool-choice judgments per agent, keyed by the
+   * streaming tool-call id. Started on `agent/assistant-stream`
+   * tool-call-delta chunks in enforce mode; consumed (not re-asked) by
+   * `tools/pre-execute`. Bounded per agent; stale entries are dropped at
+   * turn end.
+   */
+  const prefetches = new Map<string, Map<string, { toolName: string; promise: Promise<ToolChoiceOutcome> }>>()
+  /**
+   * Active preselect restriction disposers per agent. A new task lifts the
+   * previous task's restriction before judging the new one, so a denied
+   * server from an old task can never shadow a new task that needs it.
+   */
+  const preselectDisposers = new Map<string, () => void>()
+  /**
+   * In-flight preselect judgments per agent, started at inbox insert (the
+   * task's first message) so the Jev round-trip overlaps the wake; the
+   * first pre-step awaits it before the request is built.
+   */
+  const preselectTasks = new Map<string, Promise<void>>()
+  /**
+   * History rewrites per agent task (pressure-gated prune). Reset with the
+   * other per-task state; further droppable results only warn.
+   */
+  const pruneCounts = new Map<string, number>()
+  /**
+   * Surface seqs already prune-judged this task per agent. A pressure spike
+   * spans many steps; without this the same large results would be
+   * re-asked every step for no new information.
+   */
+  const pruneJudged = new Map<string, Set<number>>()
+  /**
+   * Tool name by call id per agent, for naming prune candidates found by
+   * scanning the session surface. The session itself is the source of the
+   * result text; this map only recovers the name the `tool/result` event
+   * does not carry.
+   */
+  const resultToolNames = new Map<string, Map<string, string>>()
+
+  /** Remember a tool name for a later prune-candidate scan. */
+  function noteResultToolName(agentId: string, callId: string, toolName: string): void {
+    let names = resultToolNames.get(agentId)
+    if (names === undefined) {
+      names = new Map()
+      resultToolNames.set(agentId, names)
+      capMap(resultToolNames, MAX_TRACKED_AGENTS)
+    }
+    names.set(callId, toolName)
+    capMap(names, 64)
+  }
+
+  /**
+   * Current context pressure as a ratio (0..1+), or null when it cannot be
+   * measured. The token count comes from the optional token-meter service
+   * (`ctx.get`, absent when not mounted); capacity is the session's latest
+   * advertised context window. Null reads as "no pressure" — the prune
+   * judgment stays inert rather than guessing.
+   */
+  function contextPressure(agent: { session?: Session }): number | null {
+    if (agent.session === undefined) return null
+    let meter: { measure: (session: Session) => { totalTokens: number } } | undefined
+    try {
+      meter = ctx.get('tokenMeter') as
+        | { measure: (session: Session) => { totalTokens: number } }
+        | undefined
+    } catch {
+      return null
+    }
+    if (meter === undefined) return null
+    let totalTokens: number
+    try {
+      totalTokens = meter.measure(agent.session).totalTokens
+    } catch {
+      return null
+    }
+    const contextWindow = agent.session.requestContext()?.contextWindow
+    if (contextWindow === undefined || contextWindow <= 0) return null
+    return totalTokens / contextWindow
+  }
+
+  /** A large tool result on the session surface, eligible for a prune judgment. */
+  interface PruneCandidate {
+    seq: number
+    event: Extract<SessionEvent, { type: 'tool/result' }>
+    toolName: string
+    text: string
+  }
+
+  /**
+   * Large tool results on the session surface, oldest first, bounded to a
+   * handful per pass so one pressure spike cannot spend the whole task
+   * budget. Never throws; a session that cannot be scanned yields nothing.
+   */
+  function findPruneCandidates(agentId: string, session: Session): PruneCandidate[] {
+    const candidates: PruneCandidate[] = []
+    const names = resultToolNames.get(agentId)
+    try {
+      for (const seq of session.surface.nodes) {
+        // oxlint-disable-next-line typescript/no-deprecated -- same existing-history read as the tool-result pruner.
+        const event = session.eventAt(seq)
+        if (event?.type !== 'tool/result') continue
+        // Same direct cast the tool-result pruner uses: a tool/result event
+        // derives a tool-role message carrying the call id.
+        const message = session.deriveEventMessage(event) as ToolResultMessage | null
+        if (message === null) continue
+        const text = extractResultText(message.content)
+        if (text.length < config.pruneMinChars) continue
+        const toolName = names?.get(message.toolCallId) || 'unknown-tool'
+        candidates.push({ seq, event, toolName, text })
+        if (candidates.length >= 5) break
+      }
+    } catch {
+      return []
+    }
+    return candidates
+  }
+
+  /**
+   * Pressure-gated history prune: when context pressure is high, ask Jev
+   * which large tool results are safe to drop. A confident drop on any
+   * candidate gates one pass of the existing tool-result pruner service,
+   * which owns the replay-safe rewrite protocol (Jev gates WHETHER to
+   * prune; the pruner owns WHAT and HOW). Enforce actuates; assist warns;
+   * shadow only traces. Bounded per task (`maxPrunePerTask`); never
+   * rejects, never throws — without the pruner mounted the pass is
+   * skipped, not reimplemented.
+   */
+  async function maybePruneHistory(
+    agent: { id: string; session?: Session },
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!enforce || !config.compactionPrune) return
+    const agentId = agent.id
+    if (agent.session === undefined) return
+    if ((pruneCounts.get(agentId) ?? 0) >= config.maxPrunePerTask) return
+    const pressure = contextPressure(agent)
+    if (pressure === null || pressure < config.prunePressureThreshold) return
+    const candidates = findPruneCandidates(agentId, agent.session)
+      .filter(candidate => !pruneJudged.get(agentId)?.has(candidate.seq))
+    if (candidates.length === 0) return
+    const judged = pruneJudged.get(agentId) ?? new Set<number>()
+    for (const candidate of candidates) judged.add(candidate.seq)
+    pruneJudged.set(agentId, judged)
+    capMap(pruneJudged, 128)
+    const questions = candidates.map(candidate =>
+      buildPruneQuestion(candidate.toolName, candidate.text.slice(0, config.pruneMinChars)),
+    )
+    const decisions = await service.askMany(
+      questions,
+      questions.map(() => validatePrune),
+      'task',
+      signal,
+      agentId,
+    )
+    // The prune question asks "still needed?": a confident drop means Jev
+    // believes the result is NOT needed (p at or below the drop bar).
+    // Anything else — including fallbacks — keeps the results untouched.
+    const drops = decisions.filter(decision => typeof decision.value === 'number' && decision.value <= config.pruneDropThreshold)
+    if (drops.length === 0) return
+    const pruner = ctx.get('toolResultPruner') as { pruneSession(session: Session): unknown } | undefined
+    if (pruner === undefined) {
+      ctx.logger.warn('system1: prune gated by Jev but the tool-result pruner is not mounted; skipping')
+      return
+    }
+    for (const drop of drops) service.markActed(drop.trace.id)
+    pruner.pruneSession(agent.session)
+    pruneCounts.set(agentId, (pruneCounts.get(agentId) ?? 0) + 1)
+    capMap(pruneCounts, 128)
+    ctx.logger.warn(
+      `system1: pruned tool results under pressure ${pressure.toFixed(2)} (${drops.length} Jev-confirmed droppable)`,
+    )
+  }
 
   /** Cap a map at `cap` entries, evicting the oldest first. */
   function capMap(map: Map<string, unknown>, cap: number): void {
@@ -467,6 +792,13 @@ export function apply(ctx: Context, config: Config): void {
       if (oldest === undefined) break
       map.delete(oldest)
     }
+  }
+
+  /** Remember the agent's session for durable decision telemetry. */
+  function trackSession(agent: { id: string; session?: Session }): void {
+    if (agent.session === undefined) return
+    agentSessions.set(agent.id, agent.session)
+    capMap(agentSessions, 128)
   }
 
   /**
@@ -516,10 +848,146 @@ export function apply(ctx: Context, config: Config): void {
    * agent silently degrades to budget-exhausted fallbacks after its first
    * task. Inserts while running are steering, not new tasks.
    */
-  function resetTaskOnFreshUserMessage(agentId: string): void {
-    if (agentStatus.get(agentId) === 'running') return
+  function resetTaskOnFreshUserMessage(agentId: string): boolean {
+    if (agentStatus.get(agentId) === 'running') return false
     service.resetTask(agentId)
     agents.resetTask(agentId)
+    pruneCounts.delete(agentId)
+    pruneJudged.delete(agentId)
+    return true
+  }
+
+  /**
+   * Group tool schemas by MCP server. MCP tools are named
+   * `mcp__<server>__<tool>`; anything else (built-in tools) is left
+   * untouched by preselection. Returns server → {toolNames, descriptions}.
+   */
+  function groupMcpServers(
+    schemas: ReadonlyArray<{ name?: unknown; description?: unknown }>,
+  ): Map<string, { toolNames: string[]; descriptions: string[] }> {
+    const servers = new Map<string, { toolNames: string[]; descriptions: string[] }>()
+    for (const schema of schemas) {
+      if (typeof schema.name !== 'string' || !schema.name.startsWith('mcp__')) continue
+      const rest = schema.name.slice('mcp__'.length)
+      const sep = rest.indexOf('__')
+      if (sep <= 0) continue
+      const server = rest.slice(0, sep)
+      let entry = servers.get(server)
+      if (entry === undefined) {
+        entry = { toolNames: [], descriptions: [] }
+        servers.set(server, entry)
+      }
+      entry.toolNames.push(schema.name)
+      entry.descriptions.push(
+        `${schema.name}: ${typeof schema.description === 'string' ? schema.description : ''}`.slice(0, 160),
+      )
+    }
+    return servers
+  }
+
+  /**
+   * Session-start tool preselection (opt-in, enforce only): ask Jev once
+   * per task which MCP servers the task plausibly needs, and deny the
+   * confidently-unneeded ones with `tools.restrict()`. Lifts the previous
+   * task's restriction first, so a denied server from an old task can
+   * never shadow a new task that needs it. Fail-open throughout: any
+   * doubt leaves the tool list untouched. Never rejects.
+   *
+   * @param agent - the agent whose tool list is judged.
+   * @param requestText - the task's first user message, untrusted data.
+   */
+  /** Minimal structural view of an agent needed for tool preselection. */
+  interface PreselectAgent {
+    id: string
+    ctx: {
+      tools: {
+        schemas: () => Array<{ name?: unknown; description?: unknown }>
+        restrict: (filter: { deny: string[] }) => () => void
+      }
+    }
+  }
+
+  async function runPreselect(
+    agent: PreselectAgent,
+    requestText: string,
+  ): Promise<void> {
+    const agentId = agent.id
+    const previous = preselectDisposers.get(agentId)
+    if (previous !== undefined) {
+      preselectDisposers.delete(agentId)
+      try {
+        previous()
+      } catch {
+        // A stale disposer must not break the new task's judgment.
+      }
+    }
+    let servers: Map<string, { toolNames: string[]; descriptions: string[] }>
+    try {
+      servers = groupMcpServers(agent.ctx.tools.schemas())
+    } catch {
+      return
+    }
+    if (servers.size < config.preselectMinServers) return
+    const entries = [...servers.entries()]
+    const questions = entries.map(([server, info]) =>
+      buildPreselectQuestion(server, info.descriptions, requestText),
+    )
+    const decisions = await service.askMany(
+      questions,
+      questions.map(() => validatePreselect),
+      'task',
+      lifetime.signal,
+      agentId,
+    )
+    const deny: string[] = []
+    const actedTraces: string[] = []
+    decisions.forEach((decision, index) => {
+      const need = decision.value
+      if (need === null) return
+      if (need >= config.preselectDenyThreshold) return
+      const entry = entries[index]
+      if (entry === undefined) return
+      deny.push(...entry[1].toolNames)
+      actedTraces.push(decision.trace.id)
+    })
+    if (deny.length === 0) return
+    try {
+      const dispose = agent.ctx.tools.restrict({ deny })
+      preselectDisposers.set(agentId, dispose)
+      capMap(preselectDisposers, MAX_TRACKED_AGENTS)
+      for (const traceId of actedTraces) service.markActed(traceId)
+      ctx.logger.warn(
+        `system1: preselect denied ${deny.length} tool(s) on ${entries.length} MCP server(s) for agent ${agentId}`,
+      )
+    } catch {
+      // Restriction is advisory: a validation failure leaves tools untouched.
+    }
+  }
+
+  /**
+   * Full text of a user message without the 400-char preview cap — the
+   * preselect question wants the task's substance, not a headline.
+   */
+  function fullMessageText(message: unknown): string {
+    if (typeof message !== 'object' || message === null) return String(message)
+    const content = (message as Record<string, unknown>).content
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) {
+      const parts: string[] = []
+      for (const part of content) {
+        if (typeof part === 'string') parts.push(part)
+        else if (typeof part === 'object' && part !== null) {
+          const text = (part as Record<string, unknown>).text
+          if (typeof text === 'string') parts.push(text)
+        }
+      }
+      if (parts.length > 0) return parts.join(' ')
+    }
+    try {
+      return JSON.stringify(message)
+    } catch {
+      return ''
+    }
   }
 
   /** One System 1 guidance message, sourced so the agent knows who is talking. */
@@ -565,30 +1033,18 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
-   * Shared tool-choice judge: one Jev `choice` per proposed tool call —
-   * should this call proceed, or is it clearly the wrong tool for the
-   * step's apparent goal? Skips exact consecutive duplicates (the loop
-   * machinery owns repetition). Returns the verdict with its confidence
-   * and trace id, or null when there is no confident wrong-tool verdict.
-   * Never rejects; budget exhaustion and backend failure read as null.
+   * Run one tool-choice question through the service and interpret the
+   * decision: a confident wrong-tool verdict becomes an outcome, anything
+   * else (proceed, fallback) reads as null. Shared by the synchronous
+   * `tools/pre-execute` path and the speculative stream-time prefetch —
+   * both produce exactly this shape, so the prefetch is a pure latency
+   * optimization, never a semantic difference.
    */
-  async function askToolChoice(
-    exec: ToolExecution,
+  async function runToolChoice(
+    question: System1Question,
+    agentId: string,
     signal: AbortSignal,
-  ): Promise<{ verdict: ToolChoiceVerdict; confidence: number; traceId: string } | null> {
-    const agentId = exec.agent?.id ?? ''
-    const argsKey = argsKeyOf(exec.arguments)
-    const last = lastPreExecute.get(agentId)
-    if (last !== undefined && last.name === exec.name && last.argsKey === argsKey) return null
-    lastPreExecute.set(agentId, { name: exec.name, argsKey })
-    capMap(lastPreExecute, 128)
-    const history = agents.histories.get(agentId) ?? []
-    const question = buildToolChoiceQuestion(
-      exec.name,
-      argsKey,
-      previewToolHistory(history),
-      stepPreviews.get(agentId) ?? '',
-    )
+  ): Promise<ToolChoiceOutcome> {
     const [decision] = await service.askMany([question], [validateToolChoice], 'turn', signal, agentId)
     if (decision === undefined || decision.value === null || decision.value === 'proceed') return null
     return {
@@ -596,6 +1052,154 @@ export function apply(ctx: Context, config: Config): void {
       confidence: decision.judgment?.confidence ?? 0,
       traceId: decision.trace.id,
     }
+  }
+
+  /** Take (and remove) the prefetched judgment for one streaming call id. */
+  function takePrefetch(
+    agentId: string,
+    callId: string,
+    toolName: string,
+  ): Promise<ToolChoiceOutcome> | undefined {
+    const agentPrefetch = prefetches.get(agentId)
+    if (agentPrefetch === undefined) return undefined
+    const entry = agentPrefetch.get(callId)
+    agentPrefetch.delete(callId)
+    if (entry === undefined || entry.toolName !== toolName) return undefined
+    return entry.promise
+  }
+
+  /** Concatenate the text blocks of a tool result for size gating. */
+  function extractResultText(content: ReadonlyArray<unknown>): string {
+    const parts: string[] = []
+    for (const block of content) {
+      if (typeof block === 'object' && block !== null) {
+        const text = (block as { text?: unknown }).text
+        if (typeof text === 'string') parts.push(text)
+      }
+    }
+    return parts.join('\n')
+  }
+
+  /**
+   * Result-layer questions for one completed tool call: result triage
+   * (large successful results), injection screening (untrusted sources),
+   * and subagent-output acceptance (completed spawns). Shared by the
+   * shadow and enforce paths — the mode decides whether a confident
+   * verdict only traces, warns, or rewrites the result. Empty for errors:
+   * the retry judgment owns failures.
+   */
+  function buildResultQuestions(
+    exec: ToolExecution,
+    result: ToolExecutionResult,
+    spawn: SpawnArgs | null,
+  ): { questions: System1Question[]; validators: Array<(answer: unknown) => unknown>; kinds: System1QuestionKind[]; resultText: string } {
+    const questions: System1Question[] = []
+    const validators: Array<(answer: unknown) => unknown> = []
+    const kinds: System1QuestionKind[] = []
+    // Fixtures and some tool results omit `content`; default defensively.
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- content is optional at runtime
+    const resultText = result.isError ? '' : extractResultText(result.content ?? [])
+    if (resultText.length >= config.triageMinChars) {
+      questions.push(
+        buildResultTriageQuestion(exec.name, resultText.slice(0, config.triageHeadChars), resultText.length),
+      )
+      validators.push(validateResultTriage)
+      kinds.push('result-triage')
+    }
+    if (
+      config.injectionScreen
+      && resultText.length > 0
+      && (exec.name.startsWith('mcp__') || resultText.length >= config.triageMinChars)
+    ) {
+      questions.push(buildInjectionScreenQuestion(exec.name, resultText.slice(0, config.triageHeadChars)))
+      validators.push(validateInjectionScreen)
+      kinds.push('injection-screen')
+    }
+    if (spawn !== null && config.subagentAccept && resultText.length > 0) {
+      questions.push(
+        buildSubagentAcceptQuestion(
+          `${spawn.name}: ${spawn.description}`,
+          resultText.slice(0, config.triageHeadChars),
+        ),
+      )
+      validators.push(validateSubagentAccept)
+      kinds.push('subagent-accept')
+    }
+    return { questions, validators, kinds, resultText }
+  }
+  /**
+   * Speculative tool-choice prefetch on `agent/assistant-stream`: start the
+   * risk/tool-choice judgment while the tool call is still streaming, so
+   * `tools/pre-execute` awaits the in-flight judgment instead of a fresh
+   * Jev round trip. Enforce only — shadow/assist never deny, so there is
+   * nothing to save. The stream's tool-call id is the execution's call id
+   * (agent-loop sets `callId` from the tool block id), which is how
+   * pre-execute correlates. The judgment is speculative: it sees the first
+   * args delta, not the final arguments. Never throws; a missed chunk just
+   * means pre-execute asks synchronously.
+   */
+  function prefetchFromStream(payload: Parameters<Events['agent/assistant-stream']>[0]): void {
+    if (!enforce || !config.prefetchToolChoice) return
+    if (payload.frame.type !== 'chunk') return
+    const chunk = payload.frame.chunk
+    if (chunk.type !== 'tool-call-delta') return
+    const toolName = chunk.name
+    // No name yet (args-only delta) or a delegation (the orchestrator layer
+    // owns spawns): nothing worth prefetching.
+    if (toolName === undefined || toolName === SPAWN_TOOL_NAME) return
+    const agentId = payload.agent.id
+    let agentPrefetch = prefetches.get(agentId)
+    if (agentPrefetch === undefined) {
+      agentPrefetch = new Map()
+      prefetches.set(agentId, agentPrefetch)
+      capMap(prefetches, MAX_TRACKED_AGENTS)
+    }
+    if (agentPrefetch.has(chunk.id) || agentPrefetch.size >= 8) return
+    const history = agents.histories.get(agentId) ?? []
+    const question = buildToolChoiceQuestion(
+      toolName,
+      chunk.argumentsDelta.slice(0, 500),
+      previewToolHistory(history),
+      stepPreviews.get(agentId) ?? '',
+    )
+    // Lifetime signal, like the other observations: the judgment is already
+    // paid for, so a settling turn signal must not cancel it mid-flight.
+    agentPrefetch.set(chunk.id, {
+      toolName,
+      promise: runToolChoice(question, agentId, lifetime.signal),
+    })
+  }
+
+  /**
+   * Shared tool-choice judge: one Jev `choice` per proposed tool call —
+   * should this call proceed, or is it clearly the wrong tool for the
+   * step's apparent goal? Skips exact consecutive duplicates (the loop
+   * machinery owns repetition). Returns the verdict with its confidence
+   * and trace id, or null when there is no confident wrong-tool verdict.
+   * Prefers the speculative stream-time judgment when one is in flight for
+   * this call id; otherwise asks synchronously. Never rejects; budget
+   * exhaustion and backend failure read as null.
+   */
+  async function askToolChoice(
+    exec: ToolExecution,
+    signal: AbortSignal,
+  ): Promise<ToolChoiceOutcome> {
+    const agentId = exec.agent?.id ?? ''
+    const argsKey = argsKeyOf(exec.arguments)
+    const last = lastPreExecute.get(agentId)
+    if (last !== undefined && last.name === exec.name && last.argsKey === argsKey) return null
+    lastPreExecute.set(agentId, { name: exec.name, argsKey })
+    capMap(lastPreExecute, 128)
+    const prefetched = takePrefetch(agentId, exec.callId, exec.name)
+    if (prefetched !== undefined) return await prefetched
+    const history = agents.histories.get(agentId) ?? []
+    const question = buildToolChoiceQuestion(
+      exec.name,
+      argsKey,
+      previewToolHistory(history),
+      stepPreviews.get(agentId) ?? '',
+    )
+    return await runToolChoice(question, agentId, signal)
   }
 
   /**
@@ -692,7 +1296,12 @@ export function apply(ctx: Context, config: Config): void {
   /** Classify the incoming step; shadow only, the decision always passes through. */
   async function observeStep(payload: PreStepPayload): Promise<void> {
     trackTurn(payload.agent.id, payload.turn)
+    trackSession(payload.agent)
     noteStepState(payload)
+    // Shadow/assist prune check is fire-and-forget on the plugin lifetime:
+    // it only traces (shadow) or warns (assist), never rewrites.
+    /* v8 ignore next -- defensive: maybePruneHistory never rejects */
+    void maybePruneHistory(payload.agent, lifetime.signal).catch(() => undefined)
     // Triage and delegability travel in one batch — Jev evaluates questions
     // in parallel, so the delegation question costs barely more than triage
     // alone, and the delegability answers accumulate a shadow-mode dataset.
@@ -724,6 +1333,7 @@ export function apply(ctx: Context, config: Config): void {
     // signal is precisely what this step is supposed to consume once.
     const escalated = agents.consumeEscalation(payload.agent.id)
     trackTurn(payload.agent.id, payload.turn)
+    trackSession(payload.agent)
     noteStepState(payload)
     // Bounded STOP first: a hopeless trajectory (long identical-call streak
     // plus Jev nearly certain the agent is stuck) ends here instead of
@@ -732,6 +1342,19 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.warn(`system1: stopping hopeless turn for agent ${payload.agent.id} (stuck trajectory)`)
       return { kind: 'reject' }
     }
+    // Session-start preselection settles before the first request is built:
+    // the restriction must be in place before the loop reads the tool list.
+    // runPreselect never rejects, so awaiting here cannot break the step.
+    if (payload.step === 1 && enforce && config.preselect) {
+      const pending = preselectTasks.get(payload.agent.id)
+      if (pending !== undefined) {
+        preselectTasks.delete(payload.agent.id)
+        await pending
+      }
+    }
+    // Pressure-gated prune runs before the triage batch so the step's own
+    // request — and Jev's triage question — see the pruned context.
+    await maybePruneHistory(payload.agent, payload.signal)
     const questions = [buildTriageQuestion(payload.messages), buildDelegationQuestion(payload.messages)]
     const validators: Array<(answer: unknown) => unknown> = [validateTriage, validateDelegation]
     const judged = service.askMany(questions, validators, 'turn', payload.signal, payload.agent.id)
@@ -787,6 +1410,7 @@ export function apply(ctx: Context, config: Config): void {
     const history = agents.note(agentId)
     history.push(entry)
     while (history.length > 12) history.shift()
+    noteResultToolName(agentId, exec.callId, exec.name)
 
     const loop = detectLoop(history)
 
@@ -816,6 +1440,10 @@ export function apply(ctx: Context, config: Config): void {
       questions.push(buildRetryQuestion(entry.name, entry.argsKey, result.error.message))
       validators.push(validateRetry)
     }
+    // Result-layer questions trace in shadow, warn in assist — never act.
+    const resultQuestions = buildResultQuestions(exec, result, result.isError ? null : extractSpawnArgs(exec.arguments))
+    questions.push(...resultQuestions.questions)
+    validators.push(...resultQuestions.validators)
     if (questions.length === 0) return
 
     const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal, agentId)
@@ -833,6 +1461,23 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.warn(
         `system1: jev judges agent ${agentId} stuck (p=${loopDecision.value.toFixed(2)}, model=${loopDecision.trace.model ?? 'unknown'})`,
       )
+    }
+    if (config.mode !== 'shadow') {
+      decisions.forEach((judged, index) => {
+        const question = questions[index] as System1Question
+        if (judged.value === null) return
+        if (question.kind === 'injection-screen' && typeof judged.value === 'number' && judged.value >= config.injectionThreshold) {
+          ctx.logger.warn(
+            `system1: possible prompt injection in ${entry.name} result (p=${judged.value.toFixed(2)})`,
+          )
+        } else if (question.kind === 'result-triage' && (judged.value === 'noisy_keep_head' || judged.value === 'irrelevant')) {
+          ctx.logger.warn(
+            `system1: result triage would drop ${resultQuestions.resultText.length} chars from ${entry.name} (${judged.value})`,
+          )
+        } else if (question.kind === 'subagent-accept' && judged.value === 'fails') {
+          ctx.logger.warn('system1: subagent output acceptance would re-steer the teammate')
+        }
+      })
     }
   }
 
@@ -913,6 +1558,7 @@ export function apply(ctx: Context, config: Config): void {
     const history = agents.note(agentId)
     history.push(entry)
     while (history.length > 12) history.shift()
+    noteResultToolName(agentId, exec.callId, exec.name)
 
     const contexts: UserMessage[] = []
     // Deterministic delegation bookkeeping runs before the loop branch so a
@@ -984,6 +1630,14 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
     }
+    // Result layer: result triage, injection screening, and subagent-output
+    // acceptance join the same batch — Jev evaluates questions in parallel,
+    // so judging the result costs barely more than the loop/retry/delegation
+    // questions alone.
+    const resultQuestions = buildResultQuestions(exec, result, spawn)
+    questions.push(...resultQuestions.questions)
+    validators.push(...resultQuestions.validators)
+    kinds.push(...resultQuestions.kinds)
     const decisions = questions.length > 0
       ? await service.askMany(questions, validators, 'turn', exec.signal, agentId)
       : []
@@ -993,6 +1647,9 @@ export function apply(ctx: Context, config: Config): void {
     // they resolve after the per-question loop below.
     const delegationScores: number[] = []
     const delegationScoreTraces: Array<{ trace: { id: string } }> = []
+    // A confident result-triage verdict may replace the tool result's
+    // content with its head plus a marker; applied after the loop.
+    let replacement: ContentBlock[] | null = null
     decisions.forEach((judged, index) => {
       const kind = kinds[index]
       if (judged.value === null || kind === undefined) return
@@ -1020,6 +1677,51 @@ export function apply(ctx: Context, config: Config): void {
         // A failure the harness acted on arms one level of deeper reasoning
         // for the next step: same failure, harder thinking.
         agents.noteEscalation(agentId)
+        return
+      }
+      if (kind === 'result-triage' && typeof judged.value === 'string') {
+        const triage = judged.value as ResultTriageVerdict
+        if (triage === 'noisy_keep_head' || triage === 'irrelevant') {
+          // Replace the bulky result with its head plus a durable marker:
+          // the marker names the tool and the original length so a replay
+          // can reconstruct what the model saw.
+          const head = resultQuestions.resultText.slice(0, config.triageHeadChars)
+          replacement = [{ type: 'text', text: `${head}${buildPruneMarker(entry.name, resultQuestions.resultText.length)}` }]
+          ctx.logger.warn(
+            `system1: result triage dropped ${resultQuestions.resultText.length} chars from ${entry.name} (${triage})`,
+          )
+          service.markActed(judged.trace.id)
+        } else if (triage === 'error_actionable' || triage === 'error_transient') {
+          contexts.push(guidance(
+            `System 1: the ${entry.name} result reports a failure that looks ${
+              triage === 'error_actionable' ? 'actionable' : 'transient'
+            } — address it before continuing.`,
+          ))
+          service.markActed(judged.trace.id)
+        }
+        return
+      }
+      if (kind === 'injection-screen' && typeof judged.value === 'number' && judged.value >= config.injectionThreshold) {
+        ctx.logger.warn(
+          `system1: possible prompt injection in ${entry.name} result (p=${judged.value.toFixed(2)}, model=${judged.trace.model ?? 'unknown'})`,
+        )
+        contexts.push(guidance(buildInjectionWarning(entry.name, judged.value)))
+        service.markActed(judged.trace.id)
+        return
+      }
+      if (kind === 'subagent-accept' && typeof judged.value === 'string' && spawn !== null) {
+        const accept = judged.value as SubagentAcceptVerdict
+        if (accept === 'fails') {
+          contexts.push(guidance(buildSubagentReworkHint(spawn.name, judged.judgment?.confidence ?? 0)))
+          service.markActed(judged.trace.id)
+          agents.noteEscalation(agentId)
+        } else if (accept === 'partial') {
+          contexts.push(guidance(
+            `System 1: the ${spawn.name} teammate's output looks partially complete — verify the missing part before relying on it.`,
+          ))
+          service.markActed(judged.trace.id)
+        }
+        return
       }
     })
     if (spawn !== null && delegationScores.length === 3) {
@@ -1043,7 +1745,15 @@ export function apply(ctx: Context, config: Config): void {
       // Identical spawn scored earlier: reuse its advisory, no new questions.
       contexts.push(guidance(cachedDelegation.advisory))
     }
-    return withContexts(decision, contexts)
+    const withGuidance = withContexts(decision, contexts)
+    // A confident drop verdict replaces the bulky result with its head plus
+    // a durable marker, whether or not the downstream decision set content:
+    // the marker stands in for the original result either way.
+    // oxlint-disable-next-line typescript/no-unnecessary-condition -- assigned in the forEach above
+    if (replacement !== null && withGuidance.kind === 'accept') {
+      return { ...withGuidance, content: replacement }
+    }
+    return withGuidance
   }
 
   /** Fold injected guidance into an accepted tool decision; blocks pass through untouched. */
@@ -1170,8 +1880,25 @@ export function apply(ctx: Context, config: Config): void {
    * lifetime signal, like the other shadow observations.
    */
   const disposeTurnStopping = ctx.on('agent/turn-stopping', (payload) => {
+    // Drop stale prefetches: a streamed call that never reached pre-execute
+    // (aborted turn, rejected step) must not leak into the next turn.
+    prefetches.delete(payload.agent.id)
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
     void observeFinalAnswer(payload.agent, payload.turn).catch(() => undefined)
+  })
+
+  /**
+   * Stream-time speculation: `agent/assistant-stream` tool-call-delta
+   * chunks start the tool-choice judgment while the call streams. The
+   * handler is synchronous and never throws — a missed chunk only costs
+   * the optimization, never correctness.
+   */
+  const disposeAssistantStream = ctx.on('agent/assistant-stream', (payload) => {
+    try {
+      prefetchFromStream(payload)
+    } catch {
+      // A malformed chunk must not break the stream.
+    }
   })
 
   /**
@@ -1208,7 +1935,17 @@ export function apply(ctx: Context, config: Config): void {
    * sees `idle`; inserts while running are steering, not new tasks.
    */
   const disposeInbox = ctx.on('agent/inbox/inserted', (payload) => {
-    resetTaskOnFreshUserMessage(payload.agent.id)
+    const newTask = resetTaskOnFreshUserMessage(payload.agent.id)
+    // Session-start preselection begins at the task's first message so the
+    // Jev round-trip overlaps the wake; the first pre-step awaits it before
+    // the request is built, so the restriction lands in time either way.
+    if (newTask && enforce && config.preselect) {
+      const pending = runPreselect(payload.agent, fullMessageText(payload.message))
+      preselectTasks.set(payload.agent.id, pending)
+      capMap(preselectTasks, MAX_TRACKED_AGENTS)
+      /* v8 ignore next -- defensive: runPreselect never rejects */
+      void pending.catch(() => undefined)
+    }
   })
 
   /** Track running/idle per agent for the task-boundary reset. */
@@ -1219,10 +1956,12 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.effect(() => () => {
     lifetime.abort(new Error('system1: plugin disposed'))
+    disposeTelemetry()
     disposeTriage()
     disposeTools()
     disposePreExecute()
     disposeTurnStopping()
+    disposeAssistantStream()
     disposeRequest()
     disposeRequestError()
     disposeInbox()

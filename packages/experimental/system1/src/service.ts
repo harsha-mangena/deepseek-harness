@@ -29,6 +29,14 @@ import type {
 /** Budget scope: one agent turn or one whole agent task. */
 export type BudgetScope = 'turn' | 'task'
 
+/**
+ * Receives every recorded trace, synchronously, in record order. A throwing
+ * listener must not break the service — the service swallows listener
+ * errors — but listeners should still be cheap: they run on the decision
+ * path.
+ */
+export type TraceListener = (trace: System1Trace) => void
+
 function clampConfidence(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value)
     ? Math.min(1, Math.max(0, value))
@@ -102,11 +110,34 @@ export class System1Service {
   private consecutiveFailures = 0
   private circuitOpenedAt: number | null = null
   private readonly traces: System1Trace[] = []
+  private readonly traceListeners = new Set<TraceListener>()
 
   constructor(
     private readonly backend: System1Backend,
     private readonly config: System1RuntimeConfig,
   ) {}
+
+  /**
+   * Subscribe to every recorded trace, including `markActed` updates.
+   * Returns a disposer. Listener errors are swallowed so telemetry can
+   * never break the decision path.
+   */
+  onTrace(listener: TraceListener): () => void {
+    this.traceListeners.add(listener)
+    return () => {
+      this.traceListeners.delete(listener)
+    }
+  }
+
+  private notifyTrace(trace: System1Trace): void {
+    for (const listener of this.traceListeners) {
+      try {
+        listener(trace)
+      } catch {
+        // Telemetry must never break decisions; the listener is at fault.
+      }
+    }
+  }
 
   /** Cap a budget map; agents are bounded upstream, this is a backstop. */
   private capBudgets(): void {
@@ -139,12 +170,15 @@ export class System1Service {
    * Mark a previously recorded trace as acted-upon: the harness injected
    * guidance because of this judgment. No-op for unknown ids; traces are
    * replaced immutably so readers never see a half-updated record.
+   * Listeners registered via {@link onTrace} also see the updated trace.
    */
   markActed(traceId: string): void {
     const index = this.traces.findIndex(trace => trace.id === traceId)
     if (index === -1) return
     const trace = this.traces[index] as System1Trace
-    this.traces[index] = { ...trace, acted: true }
+    const updated = { ...trace, acted: true }
+    this.traces[index] = updated
+    this.notifyTrace(updated)
   }
 
   private circuitOpen(): boolean {
@@ -160,11 +194,13 @@ export class System1Service {
     judgment: System1Judgment | null,
     fallback: System1FallbackReason | null,
     acted: boolean,
+    agentId: string,
     note?: string,
   ): System1Trace {
     const trace: System1Trace = {
       id: randomUUID(),
       at: Date.now(),
+      agentId,
       questionKind: question.kind,
       mode: this.config.mode,
       backend: this.backend.kind,
@@ -177,19 +213,21 @@ export class System1Service {
     }
     this.traces.push(trace)
     while (this.traces.length > this.config.traceBufferSize) this.traces.shift()
+    this.notifyTrace(trace)
     return trace
   }
 
   private fallback<T>(
     question: System1Question,
     reason: System1FallbackReason,
+    agentId: string,
     note?: string,
   ): System1Decision<T> {
     return {
       judgment: null,
       value: null,
       fallback: reason,
-      trace: this.recordTrace(question, null, reason, false, note),
+      trace: this.recordTrace(question, null, reason, false, agentId, note),
     }
   }
 
@@ -203,6 +241,7 @@ export class System1Service {
     question: System1Question,
     judgment: System1Judgment,
     validate: (answer: unknown) => T | null,
+    agentId: string,
   ): System1Decision<T> {
     const threshold = this.config.thresholds[question.kind] ?? question.threshold ?? this.config.confidenceThreshold
     const confidence = clampConfidence(judgment.confidence)
@@ -211,7 +250,7 @@ export class System1Service {
         judgment,
         value: null,
         fallback: 'abstain',
-        trace: this.recordTrace(question, judgment, 'abstain', false),
+        trace: this.recordTrace(question, judgment, 'abstain', false, agentId),
       }
     }
     if (confidence < threshold) {
@@ -219,7 +258,7 @@ export class System1Service {
         judgment,
         value: null,
         fallback: 'low-confidence',
-        trace: this.recordTrace(question, judgment, 'low-confidence', false, `confidence ${confidence.toFixed(2)} below gate ${threshold.toFixed(2)}`),
+        trace: this.recordTrace(question, judgment, 'low-confidence', false, agentId, `confidence ${confidence.toFixed(2)} below gate ${threshold.toFixed(2)}`),
       }
     }
     const validated = safeValidate(validate, judgment.answer)
@@ -228,7 +267,7 @@ export class System1Service {
         judgment,
         value: null,
         fallback: 'backend-error',
-        trace: this.recordTrace(question, judgment, 'backend-error', false, `validator threw: ${validated.message}`),
+        trace: this.recordTrace(question, judgment, 'backend-error', false, agentId, `validator threw: ${validated.message}`),
       }
     }
     if (validated.value === null) {
@@ -236,14 +275,14 @@ export class System1Service {
         judgment,
         value: null,
         fallback: 'backend-error',
-        trace: this.recordTrace(question, judgment, 'backend-error', false, 'answer failed validation'),
+        trace: this.recordTrace(question, judgment, 'backend-error', false, agentId, 'answer failed validation'),
       }
     }
     return {
       judgment,
       value: validated.value,
       fallback: null,
-      trace: this.recordTrace(question, judgment, null, false),
+      trace: this.recordTrace(question, judgment, null, false, agentId),
     }
   }
 
@@ -270,10 +309,10 @@ export class System1Service {
   ): Promise<Array<System1Decision<T>>> {
     if (questions.length === 0) return []
     if (!this.config.enabled) {
-      return questions.map(question => this.fallback<T>(question, 'disabled'))
+      return questions.map(question => this.fallback<T>(question, 'disabled', agentId))
     }
     if (this.circuitOpen()) {
-      return questions.map(question => this.fallback<T>(question, 'backend-error', 'circuit open'))
+      return questions.map(question => this.fallback<T>(question, 'backend-error', agentId, 'circuit open'))
     }
 
     // Budget counts questions, not batches: each question costs tokens.
@@ -292,12 +331,12 @@ export class System1Service {
     questions.forEach((question, index) => {
       const validate = validators[index]
       if (validate === undefined) {
-        decisions[index] = this.fallback<T>(question, 'backend-error', 'missing validator')
+        decisions[index] = this.fallback<T>(question, 'backend-error', agentId, 'missing validator')
         return
       }
       if (primaryUsed + askable.length >= primaryBudget ||
           taskUsed + askable.length >= this.config.budgetPerTask) {
-        decisions[index] = this.fallback<T>(question, 'budget-exceeded')
+        decisions[index] = this.fallback<T>(question, 'budget-exceeded', agentId)
         return
       }
       askable.push({ index, question, validate })
@@ -328,7 +367,7 @@ export class System1Service {
         }
         const note = transient ? `${message} (transient pacing signal; circuit untouched)` : message
         askable.forEach(({ index, question }) => {
-          decisions[index] = this.fallback<T>(question, reason, note)
+          decisions[index] = this.fallback<T>(question, reason, agentId, note)
         })
         return decisions as Array<System1Decision<T>>
       }
@@ -337,7 +376,7 @@ export class System1Service {
         const judgment = judgments[batchIndex]
         if (judgment === undefined) {
           dropped += 1
-          decisions[index] = this.fallback<T>(question, 'backend-error', 'backend dropped a question')
+          decisions[index] = this.fallback<T>(question, 'backend-error', agentId, 'backend dropped a question')
           return
         }
         // Every answered question spends from both budgets (see the gate
@@ -345,7 +384,7 @@ export class System1Service {
         // counter only on a new task.
         this.turnUsed.set(agentId, (this.turnUsed.get(agentId) ?? 0) + 1)
         this.taskUsed.set(agentId, (this.taskUsed.get(agentId) ?? 0) + 1)
-        decisions[index] = this.gate(question, judgment, validate)
+        decisions[index] = this.gate(question, judgment, validate, agentId)
       })
       this.capBudgets()
       // A backend that answers short violates its contract (one judgment per

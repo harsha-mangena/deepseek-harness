@@ -30,6 +30,22 @@ export type System1QuestionKind =
   | 'delegation'
   | 'delegation-triage'
   | 'request-retry'
+  | 'preselect'
+  | 'result-triage'
+  | 'injection-screen'
+  | 'subagent-accept'
+  | 'prune'
+
+/** Jev's verdict on a subagent's output: meets the task, partially meets it, or fails it. */
+export type SubagentAcceptVerdict = 'meets' | 'partial' | 'fails'
+
+/** Jev's verdict on a tool result: useful as-is, keep only the head, irrelevant, or an error. */
+export type ResultTriageVerdict =
+  | 'useful'
+  | 'noisy_keep_head'
+  | 'irrelevant'
+  | 'error_actionable'
+  | 'error_transient'
 
 /**
  * One typed question for a System 1 backend, expressed in Jev's native
@@ -107,6 +123,8 @@ export interface System1Decision<T> {
 export interface System1Trace {
   readonly id: string
   readonly at: number
+  /** The agent the question belonged to; '' only when the caller omitted it. */
+  readonly agentId: string
   readonly questionKind: System1QuestionKind
   readonly mode: System1Mode
   readonly backend: System1BackendKind
@@ -190,6 +208,36 @@ export interface System1RuntimeConfig {
    * here means "Jev is nearly certain the agent is stuck, not polling".
    */
   readonly stopStuckThreshold: number
+  /** Scrub secret-shaped values from state sent to the Jev backend. */
+  readonly redactState: boolean
+  /** Prefetch risk/tool-choice judgments while tool calls stream. */
+  readonly prefetchToolChoice: boolean
+  /** Ask Jev which MCP servers a task needs at session start. */
+  readonly preselect: boolean
+  /** Jev need-probability below which a server is denied (0..1). */
+  readonly preselectDenyThreshold: number
+  /** Minimum distinct MCP servers before preselection runs. */
+  readonly preselectMinServers: number
+  /** Tool-result chars at or above which post-execute triage runs. */
+  readonly triageMinChars: number
+  /** Head chars kept for `noisy_keep_head` results. */
+  readonly triageHeadChars: number
+  /** Screen untrusted tool results for prompt injection. */
+  readonly injectionScreen: boolean
+  /** Injection probability at or above which a result is flagged (0..1). */
+  readonly injectionThreshold: number
+  /** Check subagent outputs against their delegated task. */
+  readonly subagentAccept: boolean
+  /** Pressure-gated pruning of past tool results (compaction). */
+  readonly compactionPrune: boolean
+  /** Token-meter pressure at or above which the prune gate runs (0..1). */
+  readonly prunePressureThreshold: number
+  /** Tool-result chars at or above which a result is prune-eligible. */
+  readonly pruneMinChars: number
+  /** Still-needed probability below which a result is dropped (0..1). */
+  readonly pruneDropThreshold: number
+  /** Max history rewrites per agent task. */
+  readonly maxPrunePerTask: number
 }
 
 /** Triage verdict for one proposed agent step. */

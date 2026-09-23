@@ -74,8 +74,23 @@ When the agent-team packages are installed, the Lead can delegate via the `spawn
 
 - **Delegation triage** (one Jev `delegation-triage` question per spawn, joining the post-execute batch): `complex`/`standard` verdicts advise the Lead through `additionalContexts` — which strategy the subtask deserves (the teammate, being an agent, receives the matching atom/chain/tree-of-thoughts hint on its own first step) and proportionate oversight. `trivial` stays silent; the Lead's context stays clean. The scored composite is cached per agent under the spawn's canonical args key: an identical repeat reuses the advisory instead of re-asking Jev byte-identical questions.
 - **Duplicate-purpose detection** (deterministic, no model call): a bounded registry of recent spawns flags same-name or similar-purpose teammates (Jaccard ≥ 0.5 within 30 minutes) so the Lead can interrupt or merge before two teammates burn tokens on the same work. Registry writes and duplicate warnings run before the loop early-return, so a repeated `spawn_teammate` cannot dodge bookkeeping by looking like a loop — and a looping spawn still receives the cached delegation advisory, so it never skips Jev oversight either.
+- **Subagent-output acceptance** (one Jev `subagent-accept` question per completed spawn, joining the post-execute batch): the teammate's result is judged `meets` / `partial` / `fails`. A confident `fails` injects a rework hint (restate the task precisely and delegate again, or do the step directly) and arms the one-step escalation; `partial` injects a verify-before-relying hint. Shadow traces; assist warns; enforce injects. Non-spawn tools never trigger it.
 
 Shadow traces the triage; assist warns; enforce injects. The branch only fires for `spawn_teammate`, so without the agent-team packages it is inert — no config flag needed. Delegations are never denied: the plugin advises, the Lead decides.
+
+### New atoms: prefetch, preselect, result triage, injection screen, prune
+
+- **Stream-time tool-choice prefetch.** The plugin watches `agent/assistant-stream` for tool-call deltas and starts the `tool-choice` judgment speculatively, keyed by stream call id. `tools/pre-execute` awaits the in-flight judgment when the ids correlate, or judges synchronously when they do not. One Jev round trip is saved on the common path; the verdict still gates dispatch (confident `wrong-tool` denies in enforce).
+- **MCP server preselection** (opt-in, `preselect`). On a fresh task, MCP tools (`mcp__<server>__<tool>`) are grouped by server and one `preselect` need-probability question is asked per server. Servers below `preselectDenyThreshold` are denied via the tools `restrict()` API before the first step; the restriction is lifted when the next task starts. Skipped with fewer than `preselectMinServers` servers; fail-open on backend errors.
+- **Result triage** (one Jev `result-triage` question per large successful result, joining the post-execute batch): `useful` keeps the result; `noisy_keep_head` / `irrelevant` replace it with its head plus a durable `[System 1 prune]` marker naming the tool and original length; `error_actionable` / `error_transient` inject a fix-or-retry hint. Only results at or above `triageMinChars` are judged. Shadow traces; assist warns; enforce rewrites.
+- **Injection screening** (one Jev `injection-screen` noul question per untrusted result, joining the post-execute batch): MCP results, or any result at or above `triageMinChars`, are scored for embedded-instruction probability. At or above `injectionThreshold`, enforce injects a treat-as-data warning; shadow traces. The result text is labeled untrusted data in the question, never instructions.
+- **Pressure-gated prune** (opt-in, `compactionPrune`). When context pressure (token-meter usage ÷ window) reaches `prunePressureThreshold`, Jev judges candidate tool results (`prune` noul, per result at or above `pruneMinChars`). A confident drop verdict gates one call to the existing `toolResultPruner.pruneSession(session)` — the pruner owns the durable rewrite; System 1 only decides *whether* to run it. Bounded per task (`maxPrunePerTask`); without the pruner service it warns and skips.
+
+### Outbound hygiene: redaction and telemetry
+
+- **Secret redaction** (`redactState`, default on). Every Jev-bound state object is deep-scrubbed inside `JevBackend.decideMany`: secret-like key names and high-precision credential prefixes (provider-issued `sk-`, `ghp_`, `Bearer`, …) are replaced with `[REDACTED]`. Surrounding prose survives so Jev keeps its context; cycles and deep nesting are cut without throwing; the input is never mutated.
+- **Decision telemetry.** Every trace — including shadow observations and fallbacks — appends a durable `system1/decision` session event; actuations append a separate `system1/decision-acted` event keyed by the stable trace id. Both appends are best-effort and never throw, so telemetry cannot break the decision path. The in-memory ring buffer remains for live replay; the session log is the durable record.
+- **Calibration** (`src/calibration.ts`). `computeECE`, `reliabilityCurve`, and `summarizeCalibration` join decision traces with operator labels to report per-kind accuracy, ECE, mean confidence, p95 latency, and reliability bins; `calibrationVerdict` applies the go/no-go criteria (default: ≥30 labeled samples, ECE ≤0.15, accuracy ≥0.70). The label import and replay join are still to come — see Deferred Work.
 
 ## Configuration
 
@@ -102,6 +117,19 @@ All tunables are Schemastery-validated with safe defaults:
 | `delegationWeights` | `{ novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 }` | Relative weights for the delegation composite (normalized in code; individual weights may be zero, the total must be positive) |
 | `modelRoute` | `{}` | Verdict→override table for model routing (enforce), e.g. `{ complex: { model: 'strong-model' } }`. Each override may set `provider`, `model`, and/or `reasoningEffort`; unset fields keep the loop's config. Inert by default: provider/model names are deployment-specific |
 | `maxRequestRetries` | `1` | Max System 1-owned retries per failed model request per step (enforce); further failures delegate to the loop default |
+| `redactState` | `true` | Scrub secret-like values from Jev-bound state before the wire call |
+| `prefetchToolChoice` | `true` | Start the tool-choice judgment from stream deltas before pre-execute |
+| `preselect` | `false` | Ask per-server need-probability questions and restrict unneeded MCP servers (opt-in) |
+| `preselectDenyThreshold` | `0.15` | Need-probability below which a preselected MCP server is denied |
+| `preselectMinServers` | `3` | Minimum distinct MCP servers before preselection runs |
+| `triageMinChars` / `triageHeadChars` | `4000` / `2000` | Result size that triggers triage; head length kept on a drop verdict |
+| `injectionScreen` / `injectionThreshold` | `true` / `0.8` | Screen untrusted results for embedded instructions; warn at/above this probability |
+| `subagentAccept` | `true` | Judge completed `spawn_teammate` outputs (meets/partial/fails) |
+| `compactionPrune` | `false` | Jev-gated tool-result pruning under context pressure (opt-in; needs the `toolResultPruner` service) |
+| `prunePressureThreshold` | `0.7` | Context pressure at/above which prune candidates are judged |
+| `pruneMinChars` | `4000` | Minimum result size for a prune candidate |
+| `pruneDropThreshold` | `0.2` | Drop probability below which a candidate is judged not needed |
+| `maxPrunePerTask` | `10` | Max pruner passes per agent task |
 
 ### Getting a Jev key
 
@@ -115,19 +143,21 @@ export TYPESAFE_API_KEY=<your key>
 
 ## Known Limitations
 
-- **Live verification done (2026-09-23).** The wire format was exercised against the real `POST /v1/systemone` API: 6/6 direct judgments sensible (triage trivial/standard, loop stuck-p 0.86 on x4-identical history vs 0.15 healthy, retry→retry on timeout, give-up on bad args), plus real-model E2E benchmarks with/without Jev. See `~/workspace/system1-jev-validation-results.md`.
+- **Live verification done (2026-09-23).** The wire format was exercised against the real `POST /v1/systemone` API: 6/6 direct judgments sensible (triage trivial/standard, loop stuck-p 0.86 on x4-identical history vs 0.15 healthy, retry→retry on timeout, give-up on bad args), plus real-model E2E benchmarks with/without Jev. See `~/workspace/system1-jev-validation-results.md`. The new atoms (prefetch, preselect, result triage, injection screen, subagent accept, prune, redaction, telemetry) are validated by stubbed-Jev composition tests only — live Jev verdicts for these question kinds have not been exercised yet.
 - **Laya sidecar shape is provisional and deferred.** The `/health` + `POST /decide` contract in `src/sidecar.ts` is unverified; Laya is not the current focus.
 - **Tool shortlist is not wired.** Hierarchical tool selection needs a tool-catalog seam the harness does not expose (verified against the tools package source); the dead `tool-shortlist` question kind was removed rather than left as a stub.
 - **Plan viability is not judged.** Plan mode is user-interactive (propose → human review → approve); there is no machine-judgment seam for plan viability, so none is invented.
-- **No session events.** Traces live in a per-plugin in-memory ring buffer and do not survive restarts. Durable `system1/*` session events are deferred (they carry persistence/versioning requirements).
+- **Decision telemetry is best-effort.** `system1/decision` and `system1/decision-acted` events are appended when the session accepts them; a closed or read-only session drops them silently rather than breaking the decision path.
 - **Budgets are guardrails, not accounting.** Task boundaries are detected from inbox insertions while the agent is idle; an agent that never goes idle keeps one task budget, by design.
 - **Model routing is only as good as the route table.** The plugin ships no provider/model names — routing is inert until the operator configures `modelRoute` for their deployment.
+- **Prune gating is whole-pass.** A confident drop verdict on any candidate gates one call to the existing `toolResultPruner.pruneSession(session)`, which applies its own deterministic policy to the session — Jev approves the pass, not individual candidates.
 
 ## Deferred Work
 
 - Wiring the tool-shortlist gate into request preparation (blocked: no tool-catalog seam in the harness).
 - Secure Vault settings UI for the Jev API key (currently env-var only).
-- Durable trace persistence and a shadow-replay benchmark harness.
+- Calibration label import and session-event replay join (the ECE/reliability math is in `src/calibration.ts`; feeding it labeled traces from the `system1/decision` log is still to come).
+- Live-Jev validation of the new question kinds (prefetch tool-choice, preselect, result-triage, injection-screen, subagent-accept, prune).
 - Laya local-first pass: verify the sidecar contract, supervisor policy (restarts, resource limits).
 
 ## Safety invariants

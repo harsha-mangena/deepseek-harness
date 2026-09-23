@@ -20,6 +20,7 @@
  */
 
 import { decideManySequential, type System1Backend } from '../backend.ts'
+import { redactSecrets } from '../redact.ts'
 import type {
   JevPrimitive,
   System1Judgment,
@@ -180,7 +181,10 @@ export class JevBackend implements System1Backend {
       const id = `${question.kind}#${index}`
       ids.push(id)
       wireQuestions[id] = toWireQuestion(question)
-      state[id] = question.context
+      // The state leaves the process for the Jev API: scrub secret-shaped
+      // values at this single outbound boundary so every call site is
+      // covered. Opt-out via `redactState: false` for air-gapped proxies.
+      state[id] = this.config.redactState ? redactSecrets(question.context) : question.context
     })
 
     const response = await fetch(this.config.jevEndpoint, {
