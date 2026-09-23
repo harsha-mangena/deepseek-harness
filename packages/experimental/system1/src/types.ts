@@ -3,8 +3,10 @@
  *
  * System 1 answers small, typed questions about agent-loop traffic so the
  * harness can skip, shorten, or supervise work without paying for a full
- * reasoning-model call. Every judgment carries a confidence and a structured
- * trace; anything uncertain falls back to existing harness behavior.
+ * reasoning-model call. Questions are expressed in Jev's three native
+ * primitives (choice, score, noul); every judgment carries a confidence and
+ * a structured trace, and anything uncertain falls back to existing harness
+ * behavior.
  *
  * @module @deepseek-ai/dsh-experimental-system1
  */
@@ -14,6 +16,9 @@ export type System1BackendKind = 'laya' | 'jev' | 'none'
 
 /** How much authority System 1 has over the agent loop. */
 export type System1Mode = 'shadow' | 'assist' | 'enforce'
+
+/** Jev's native question primitives. */
+export type JevPrimitive = 'choice' | 'score' | 'noul'
 
 /** The question areas System 1 can be asked about. */
 export type System1QuestionKind =
@@ -25,22 +30,35 @@ export type System1QuestionKind =
   | 'plausibility'
 
 /**
- * One typed question for a System 1 backend. Backends return a judgment, not
- * prose; the service validates the answer against `answerSchema`.
+ * One typed question for a System 1 backend, expressed in Jev's native
+ * primitives so the backend can answer it directly:
+ *
+ * - `choice`: `options` maps each option name to a one-line description
+ *   (Jev `criteria`); the answer is the chosen option name.
+ * - `score`: `levels` is an ordered rubric of 2-10 descriptions; the answer
+ *   is a score that may land between levels.
+ * - `noul`: the answer is a single 0-1 probability that `prompt` holds.
+ *
+ * Backends return a judgment, not prose; the service validates the answer
+ * against the primitive.
  */
 export interface System1Question {
   readonly kind: System1QuestionKind
-  /** Compact natural-language question for the backend. */
+  readonly primitive: JevPrimitive
+  /** The Jev `instructions` text: one atomic judgment, never prose. */
   readonly prompt: string
-  /** Structured facts the backend may use to answer. */
+  /** Structured facts the backend may use; sent as Jev `state`. */
   readonly context: Readonly<Record<string, unknown>>
-  /** Expected answer shape, used to validate the backend response. */
-  readonly answerSchema: 'triage' | 'choice' | 'boolean' | 'score'
+  /** Choice options: option name to one-line description. */
+  readonly options?: Readonly<Record<string, string>>
+  /** Score rubric: 2-10 ordered level descriptions. */
+  readonly levels?: readonly string[]
 }
 
 /**
  * A backend's raw answer to one question, including abstention.
- * `confidence` is always in the closed 0..1 range.
+ * `confidence` is always in the closed 0..1 range. For `noul` answers the
+ * answer is the probability itself and confidence is `max(p, 1 - p)`.
  */
 export interface System1Judgment {
   readonly answer: unknown
@@ -48,6 +66,8 @@ export interface System1Judgment {
   readonly latencyMs: number
   readonly backend: System1BackendKind
   readonly abstained: boolean
+  /** Versioned model id reported by the backend (e.g. `jev-1.13.0`). */
+  readonly model?: string
 }
 
 /** Why a gate produced no usable value. */
@@ -84,6 +104,8 @@ export interface System1Trace {
   readonly fallback: System1FallbackReason | null
   /** Whether the harness acted on the judgment (never true in shadow mode). */
   readonly acted: boolean
+  /** Versioned model id that answered, when the backend reports one. */
+  readonly model?: string
   readonly note?: string
 }
 
@@ -98,11 +120,11 @@ export interface System1RuntimeConfig {
   readonly enabled: boolean
   /** Minimum confidence for a judgment to pass the gate. */
   readonly confidenceThreshold: number
-  /** Max System 1 calls per agent turn. */
+  /** Max System 1 questions per agent turn (each question costs tokens). */
   readonly budgetPerTurn: number
-  /** Max System 1 calls per agent task. */
+  /** Max System 1 questions per agent task. */
   readonly budgetPerTask: number
-  /** Per-call timeout in milliseconds. */
+  /** Per-batch backend timeout in milliseconds. */
   readonly timeoutMs: number
   /** Consecutive backend failures before the circuit opens. */
   readonly failureThreshold: number
@@ -114,6 +136,8 @@ export interface System1RuntimeConfig {
   readonly jevApiKeyEnv: string
   /** Jev System One endpoint URL. */
   readonly jevEndpoint: string
+  /** Jev model alias or pinned version (e.g. `jev-latest`, `jev-1.13.0`). */
+  readonly jevModel: string
   /** Laya sidecar decision endpoint URL (used when `layaAutoStart` is false). */
   readonly layaEndpoint: string
   /** Start a local Laya sidecar on demand instead of using `layaEndpoint`. */
@@ -124,6 +148,9 @@ export interface System1RuntimeConfig {
 
 /** Triage verdict for one proposed agent step. */
 export type TriageVerdict = 'trivial' | 'standard' | 'complex'
+
+/** Retry verdict for a failed tool call. */
+export type RetryVerdict = 'retry' | 'retry-different' | 'give-up'
 
 /** Loop-check verdict for recent tool-call history. */
 export interface LoopCheckVerdict {

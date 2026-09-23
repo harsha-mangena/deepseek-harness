@@ -7,6 +7,11 @@
  * circuit — resolves to a decision with `value: null` and a `fallback`
  * reason, so the harness always continues with existing behavior.
  *
+ * Questions are asked in batches via {@link askMany}: the backend answers
+ * every question in one round-trip (Jev evaluates them in parallel), and
+ * per-question gates are applied to each judgment. Budgets count questions,
+ * not batches, because each question costs tokens.
+ *
  * @module @deepseek-ai/dsh-experimental-system1
  */
 
@@ -30,22 +35,36 @@ function clampConfidence(value: unknown): number {
     : 0
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, signal: AbortSignal): Promise<T> {
-  if (ms <= 0) return promise
+/**
+ * Race a promise against a timeout that also aborts the underlying work:
+ * the timeout fires `controller.abort()`, so a hung backend call releases
+ * its socket instead of lingering after the race is lost.
+ */
+function withAbortTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  ms: number,
+  signal: AbortSignal,
+): Promise<T> {
+  const controller = new AbortController()
+  const forward = (): void => {
+    controller.abort(signal.reason)
+  }
+  if (signal.aborted) controller.abort(signal.reason)
+  else signal.addEventListener('abort', forward, { once: true })
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<never>((_, reject) => {
+    if (ms <= 0) return
     timer = setTimeout(() => {
-      reject(new Error(`system1: backend timed out after ${ms}ms`))
+      const timeoutError = new Error(`system1: backend timed out after ${ms}ms`)
+      controller.abort(timeoutError)
+      reject(timeoutError)
     }, ms)
   })
   const cleanup = (): void => {
     if (timer !== undefined) clearTimeout(timer)
+    signal.removeEventListener('abort', forward)
   }
-  signal.addEventListener('abort', cleanup, { once: true })
-  return Promise.race([promise, timeout]).finally(() => {
-    cleanup()
-    signal.removeEventListener('abort', cleanup)
-  })
+  return Promise.race([run(controller.signal), timeout]).finally(cleanup)
 }
 
 /**
@@ -106,7 +125,8 @@ export class System1Service {
       latencyMs: judgment?.latencyMs ?? 0,
       fallback,
       acted,
-      ...note === undefined ? {} : { note },
+      ...(judgment?.model === undefined ? {} : { model: judgment.model }),
+      ...(note === undefined ? {} : { note }),
     }
     this.traces.push(trace)
     while (this.traces.length > this.config.traceBufferSize) this.traces.shift()
@@ -126,46 +146,11 @@ export class System1Service {
     }
   }
 
-  /**
-   * Ask one System 1 question. Never rejects: every failure path resolves
-   * to a fallback decision so the caller keeps existing behavior.
-   *
-   * @param question - the typed question for the backend.
-   * @param scope - which budget the call counts against.
-   * @param signal - caller cancellation; also bounds the backend call.
-   * @param validate - validates the raw answer into a typed value, or null.
-   */
-  async ask<T>(
+  private gate<T>(
     question: System1Question,
-    scope: BudgetScope,
-    signal: AbortSignal,
+    judgment: System1Judgment,
     validate: (answer: unknown) => T | null,
-  ): Promise<System1Decision<T>> {
-    if (!this.config.enabled) return this.fallback(question, 'disabled')
-    if (this.circuitOpen()) {
-      return this.fallback(question, 'backend-error', 'circuit open')
-    }
-    const used = scope === 'turn' ? this.turnUsed : this.taskUsed
-    const budget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
-    if (used >= budget) return this.fallback(question, 'budget-exceeded')
-
-    let judgment: System1Judgment
-    try {
-      judgment = await withTimeout(this.backend.decide(question, signal), this.config.timeoutMs, signal)
-    } catch (error: unknown) {
-      this.consecutiveFailures += 1
-      if (this.consecutiveFailures >= this.config.failureThreshold) {
-        this.circuitOpenedAt = Date.now()
-      }
-      const reason: System1FallbackReason = error instanceof Error && error.message.includes('timed out')
-        ? 'timeout'
-        : 'backend-error'
-      return this.fallback(question, reason, error instanceof Error ? error.message : String(error))
-    }
-    this.consecutiveFailures = 0
-    if (scope === 'turn') this.turnUsed += 1
-    else this.taskUsed += 1
-
+  ): System1Decision<T> {
     const confidence = clampConfidence(judgment.confidence)
     if (judgment.abstained) {
       return {
@@ -198,5 +183,98 @@ export class System1Service {
       fallback: null,
       trace: this.recordTrace(question, judgment, null, false),
     }
+  }
+
+  /**
+   * Ask many System 1 questions in one backend round-trip. Never rejects:
+   * every failure path resolves to fallback decisions so the caller keeps
+   * existing behavior.
+   *
+   * @param questions - the typed questions for the backend, in order.
+   * @param validators - one answer validator per question, in the same order.
+   * @param scope - which budget each question counts against.
+   * @param signal - caller cancellation; also bounds the backend call.
+   */
+  async askMany<T>(
+    questions: readonly System1Question[],
+    validators: ReadonlyArray<(answer: unknown) => T | null>,
+    scope: BudgetScope,
+    signal: AbortSignal,
+  ): Promise<Array<System1Decision<T>>> {
+    if (questions.length === 0) return []
+    if (!this.config.enabled) {
+      return questions.map(question => this.fallback<T>(question, 'disabled'))
+    }
+    if (this.circuitOpen()) {
+      return questions.map(question => this.fallback<T>(question, 'backend-error', 'circuit open'))
+    }
+
+    // Budget counts questions, not batches: each question costs tokens.
+    const askable: Array<{ index: number; question: System1Question; validate: (answer: unknown) => T | null }> = []
+    const decisions = new Array<System1Decision<T> | undefined>(questions.length)
+    questions.forEach((question, index) => {
+      const used = scope === 'turn' ? this.turnUsed : this.taskUsed
+      const budget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
+      const validate = validators[index]
+      if (validate === undefined) {
+        decisions[index] = this.fallback<T>(question, 'backend-error', 'missing validator')
+        return
+      }
+      if (used + askable.length >= budget) {
+        decisions[index] = this.fallback<T>(question, 'budget-exceeded')
+        return
+      }
+      askable.push({ index, question, validate })
+    })
+
+    if (askable.length > 0) {
+      let judgments: System1Judgment[]
+      try {
+        judgments = await withAbortTimeout(
+          batchSignal => this.backend.decideMany(askable.map(entry => entry.question), batchSignal),
+          this.config.timeoutMs,
+          signal,
+        )
+      } catch (error: unknown) {
+        this.consecutiveFailures += 1
+        if (this.consecutiveFailures >= this.config.failureThreshold) {
+          this.circuitOpenedAt = Date.now()
+        }
+        const message = error instanceof Error ? error.message : String(error)
+        const reason: System1FallbackReason = message.includes('timed out') ? 'timeout' : 'backend-error'
+        askable.forEach(({ index, question }) => {
+          decisions[index] = this.fallback<T>(question, reason, message)
+        })
+        return decisions as Array<System1Decision<T>>
+      }
+      this.consecutiveFailures = 0
+      askable.forEach(({ index, question, validate }, batchIndex) => {
+        const judgment = judgments[batchIndex]
+        if (judgment === undefined) {
+          decisions[index] = this.fallback<T>(question, 'backend-error', 'backend dropped a question')
+          return
+        }
+        if (scope === 'turn') this.turnUsed += 1
+        else this.taskUsed += 1
+        decisions[index] = this.gate(question, judgment, validate)
+      })
+    }
+    return decisions as Array<System1Decision<T>>
+  }
+
+  /**
+   * Ask one System 1 question. Never rejects: every failure path resolves
+   * to a fallback decision so the caller keeps existing behavior.
+   */
+  async ask<T>(
+    question: System1Question,
+    scope: BudgetScope,
+    signal: AbortSignal,
+    validate: (answer: unknown) => T | null,
+  ): Promise<System1Decision<T>> {
+    const decisions = await this.askMany([question], [validate], scope, signal)
+    const first = decisions[0]
+    if (first === undefined) throw new Error('system1: askMany returned no decisions')
+    return first
   }
 }

@@ -1,8 +1,11 @@
 /**
  * System 1 question builders: pure functions that turn agent-loop traffic
- * into typed {@link System1Question}s, plus the deterministic loop detector
- * that runs before any model call.
+ * into Jev-native typed {@link System1Question}s, plus the deterministic
+ * loop detector that runs before any model call.
  *
+ * Design follows TypeSafe's own guidance: keep control flow in code and give
+ * the model narrow, atomic judgments. Exact repetition is detected by
+ * {@link detectLoop} in code — Jev is only asked about ambiguous patterns.
  * Builders never touch the network and never throw on malformed input; they
  * degrade to generic prompts so a weird payload cannot break the loop.
  *
@@ -11,6 +14,7 @@
 
 import type {
   LoopCheckVerdict,
+  RetryVerdict,
   System1Question,
   TriageVerdict,
 } from './types.ts'
@@ -38,11 +42,14 @@ export function buildTriageQuestion(messages: readonly unknown[]): System1Questi
     .join('\n')
   return {
     kind: 'triage',
-    prompt:
-      'Classify this agent step as trivial (no reasoning needed), standard, or complex (needs full reasoning). '
-      + 'Answer with exactly one word.',
+    primitive: 'choice',
+    prompt: 'How much reasoning does this agent step need?',
     context: { messagePreview: preview, messageCount: messages.length },
-    answerSchema: 'triage',
+    options: {
+      trivial: 'No reasoning needed; a reflex or cached answer suffices',
+      standard: 'Normal step; proceed with the default reasoning effort',
+      complex: 'Needs full reasoning; do not shortcut or delegate this step',
+    },
   }
 }
 
@@ -81,13 +88,17 @@ export function detectLoop(
   }
 }
 
-/** Build a loop-check question for ambiguous repetition patterns. */
+/**
+ * Build a loop-check question for ambiguous repetition patterns — cases the
+ * deterministic {@link detectLoop} cannot settle (similar but not identical
+ * calls, alternating tools, semantic repetition). A single noul: the
+ * probability that the agent is stuck and should be interrupted.
+ */
 export function buildLoopQuestion(history: readonly ObservedToolCall[]): System1Question {
   return {
     kind: 'loop-check',
-    prompt:
-      'Given this recent tool-call history, is the agent stuck in a loop? '
-      + 'Answer with a JSON object: {"looping": boolean, "suggestion": "continue"|"interrupt"|"ask-user"}.',
+    primitive: 'noul',
+    prompt: 'The agent is stuck repeating itself and should be interrupted',
     context: {
       history: history.slice(-8).map((entry) => {
         return {
@@ -97,24 +108,37 @@ export function buildLoopQuestion(history: readonly ObservedToolCall[]): System1
         }
       }),
     },
-    answerSchema: 'choice',
   }
+}
+
+/**
+ * Validate a raw loop-check answer into a stuck-probability. The caller
+ * thresholds it in code (default 0.7); the service's confidence gate already
+ * rejected wishy-washy probabilities near 0.5.
+ */
+export function validateLoopAnswer(answer: unknown): number | null {
+  return typeof answer === 'number' && Number.isFinite(answer) && answer >= 0 && answer <= 1
+    ? answer
+    : null
 }
 
 /** Build a retry-judgment question for a failed tool call. */
 export function buildRetryQuestion(toolName: string, argsKey: string, errorText: string): System1Question {
   return {
     kind: 'retry-judgment',
-    prompt:
-      'This tool call failed. Should the agent retry it as-is, retry with different arguments, or give up? '
-      + 'Answer with exactly one word: retry, retry-different, or give-up.',
+    primitive: 'choice',
+    prompt: 'This tool call failed. What should the agent do next?',
     context: { toolName, argsKey: argsKey.slice(0, 500), errorText: errorText.slice(0, 500) },
-    answerSchema: 'choice',
+    options: {
+      retry: 'Retry the identical call; the failure looks transient',
+      'retry-different': 'Retry with different arguments; the call itself was wrong',
+      'give-up': 'Do not retry; surface the failure to the agent',
+    },
   }
 }
 
-/** Validate a raw retry answer. */
-export function validateRetry(answer: unknown): 'retry' | 'retry-different' | 'give-up' | null {
+/** Validate a raw retry answer into a {@link RetryVerdict}. */
+export function validateRetry(answer: unknown): RetryVerdict | null {
   return answer === 'retry' || answer === 'retry-different' || answer === 'give-up' ? answer : null
 }
 
@@ -122,30 +146,21 @@ export function validateRetry(answer: unknown): 'retry' | 'retry-different' | 'g
 export function buildDelegationQuestion(stepSummary: string): System1Question {
   return {
     kind: 'delegation',
-    prompt:
-      'Can this step be delegated to a cheaper sub-agent without losing quality? '
-      + 'Answer with exactly one word: yes or no.',
+    primitive: 'choice',
+    prompt: 'How should this step be staffed?',
     context: { stepSummary: stepSummary.slice(0, 1000) },
-    answerSchema: 'boolean',
+    options: {
+      delegate: 'A cheaper sub-agent can handle this without losing quality',
+      keep: 'The main agent should handle this itself',
+    },
   }
 }
 
 /** Validate a raw delegation answer. */
 export function validateDelegation(answer: unknown): boolean | null {
-  if (answer === true || answer === 'yes') return true
-  if (answer === false || answer === 'no') return false
+  if (answer === 'delegate') return true
+  if (answer === 'keep') return false
   return null
-}
-
-/** Validate a raw loop-check answer into a {@link LoopCheckVerdict}. */
-export function validateLoopAnswer(answer: unknown): LoopCheckVerdict | null {
-  if (typeof answer !== 'object' || answer === null) return null
-  const raw = answer as { looping?: unknown; suggestion?: unknown }
-  if (typeof raw.looping !== 'boolean') return null
-  const suggestion = raw.suggestion === 'interrupt' || raw.suggestion === 'ask-user'
-    ? raw.suggestion
-    : 'continue'
-  return { looping: raw.looping, repetitions: 0, suggestion }
 }
 
 /**

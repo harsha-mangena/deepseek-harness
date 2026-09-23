@@ -1,6 +1,6 @@
 /**
  * Unit tests for the System 1 question builders and the deterministic loop
- * detector.
+ * detector. Builders emit Jev-native primitives (choice/score/noul).
  */
 
 import { describe, expect, it } from 'vitest'
@@ -59,29 +59,35 @@ describe('detectLoop', () => {
 })
 
 describe('question builders', () => {
-  it('builds a triage question with the right kind and schema', () => {
+  it('builds a triage choice with criteria', () => {
     const q = buildTriageQuestion([{ role: 'user', content: 'hi' }])
     expect(q.kind).toBe('triage')
-    expect(q.answerSchema).toBe('triage')
-    expect(q.prompt).toContain('trivial')
+    expect(q.primitive).toBe('choice')
+    expect(Object.keys(q.options ?? {}).sort()).toEqual(['complex', 'standard', 'trivial'])
+    expect(q.prompt.length).toBeGreaterThan(0)
   })
 
-  it('builds a loop question over recent history', () => {
+  it('builds a loop-check noul over recent history', () => {
     const q = buildLoopQuestion([call('read'), call('read')])
     expect(q.kind).toBe('loop-check')
+    expect(q.primitive).toBe('noul')
+    expect(q.options).toBeUndefined()
     expect((q.context['history'] as unknown[])).toHaveLength(2)
   })
 
-  it('builds a retry question naming the tool', () => {
+  it('builds a retry choice naming the tool', () => {
     const q = buildRetryQuestion('exec', '{"cmd":"x"}', 'exit 1')
     expect(q.kind).toBe('retry-judgment')
+    expect(q.primitive).toBe('choice')
+    expect(Object.keys(q.options ?? {}).sort()).toEqual(['give-up', 'retry', 'retry-different'])
     expect(q.context['toolName']).toBe('exec')
   })
 
-  it('builds a delegation question', () => {
+  it('builds a delegation choice', () => {
     const q = buildDelegationQuestion('summarize this file')
     expect(q.kind).toBe('delegation')
-    expect(q.answerSchema).toBe('boolean')
+    expect(q.primitive).toBe('choice')
+    expect(Object.keys(q.options ?? {}).sort()).toEqual(['delegate', 'keep'])
   })
 })
 
@@ -100,19 +106,18 @@ describe('validators', () => {
   })
 
   it('validates delegation answers', () => {
-    expect(validateDelegation('yes')).toBe(true)
-    expect(validateDelegation(false)).toBe(false)
+    expect(validateDelegation('delegate')).toBe(true)
+    expect(validateDelegation('keep')).toBe(false)
+    expect(validateDelegation('yes')).toBeNull()
     expect(validateDelegation('perhaps')).toBeNull()
   })
 
-  it('validates loop-check answers', () => {
-    expect(validateLoopAnswer({ looping: true, suggestion: 'interrupt' })).toEqual({
-      looping: true,
-      repetitions: 0,
-      suggestion: 'interrupt',
-    })
-    expect(validateLoopAnswer({ looping: false, suggestion: 'bogus' })?.suggestion).toBe('continue')
-    expect(validateLoopAnswer({ looping: 'yes' })).toBeNull()
+  it('validates loop-check noul probabilities', () => {
+    expect(validateLoopAnswer(0.9)).toBe(0.9)
+    expect(validateLoopAnswer(0)).toBe(0)
+    expect(validateLoopAnswer(1.5)).toBeNull()
+    expect(validateLoopAnswer(-0.1)).toBeNull()
+    expect(validateLoopAnswer('high')).toBeNull()
     expect(validateLoopAnswer(null)).toBeNull()
   })
 })

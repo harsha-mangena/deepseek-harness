@@ -1,14 +1,14 @@
 /**
- * Null backend: always abstains. Used when System 1 is disabled or no backend
- * is configured; every gate falls back to existing harness behavior.
+ * Null backend: always abstains. Used when System 1 is configured with
+ * `backend: 'none'` or as a safe stand-in in tests.
  *
  * @module @deepseek-ai/dsh-experimental-system1
  */
 
-import type { System1Backend } from '../backend.ts'
+import { decideManySequential, type System1Backend } from '../backend.ts'
 import type { System1Judgment, System1Question } from '../types.ts'
 
-/** Backend that abstains on every question with zero confidence. */
+/** Backend that abstains on every question. */
 export class NullBackend implements System1Backend {
   readonly kind = 'none' as const
 
@@ -22,7 +22,9 @@ export class NullBackend implements System1Backend {
     })
   }
 
-  async dispose(): Promise<void> {
-    // Nothing held.
+  decideMany(questions: readonly System1Question[], signal: AbortSignal): Promise<System1Judgment[]> {
+    return decideManySequential(this, questions, signal)
   }
+
+  async dispose(): Promise<void> {}
 }

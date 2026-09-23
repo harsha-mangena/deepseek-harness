@@ -1,6 +1,9 @@
 /**
  * Laya backend: zero-configuration local fast-thinking model.
  *
+ * NOTE: Laya is currently deferred — Jev is the primary backend (see
+ * README). This adapter is kept compiling for a future local-first pass.
+ *
  * Laya runs as a local sidecar (see {@link startLayaSidecar}), so this backend
  * needs no API key. The wire shape below is provisional and must be verified
  * against the installed Laya version; any mismatch surfaces as a backend
@@ -9,7 +12,7 @@
  * @module @deepseek-ai/dsh-experimental-system1
  */
 
-import type { System1Backend } from '../backend.ts'
+import { decideManySequential, type System1Backend } from '../backend.ts'
 import { startLayaSidecar, type LayaSidecar } from '../sidecar.ts'
 import type {
   System1Judgment,
@@ -61,9 +64,11 @@ export class LayaBackend implements System1Backend {
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         kind: question.kind,
+        primitive: question.primitive,
         prompt: question.prompt,
         context: question.context,
-        answer_schema: question.answerSchema,
+        options: question.options ?? null,
+        levels: question.levels ?? null,
       }),
       signal,
     })
@@ -83,6 +88,14 @@ export class LayaBackend implements System1Backend {
       backend: 'laya',
       abstained: body.abstained === true,
     }
+  }
+
+  async decideMany(
+    questions: readonly System1Question[],
+    signal: AbortSignal,
+  ): Promise<System1Judgment[]> {
+    // No native batching on the sidecar contract; ask in turn.
+    return decideManySequential(this, questions, signal)
   }
 
   async dispose(): Promise<void> {

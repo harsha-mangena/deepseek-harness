@@ -1,16 +1,21 @@
 /**
  * System 1 fast-thinking plugin for the DeepSeek Harness agent loop.
  *
- * A small local (or hosted) model answers typed questions about agent-loop
+ * Jev (TypeSafe's System One model) answers typed questions about agent-loop
  * traffic — step triage, tool-loop detection, retry judgment — so the
  * harness can skip, shorten, or supervise work without a full
- * reasoning-model call.
+ * reasoning-model call. Questions are expressed in Jev's native primitives
+ * (`choice`, `score`, `noul`) and each decision point sends all of its
+ * questions in a single `POST /v1/systemone` call; Jev evaluates them in
+ * parallel, so a batch costs barely more time than one question.
  *
  * This integration runs shadow-first: every gate is evaluated against real
  * traffic and recorded as a structured trace, but the loop's behavior never
  * changes. In `assist` mode the plugin additionally logs loop hints in the
  * style of the repeat-tool reminder; `enforce` actuation is deferred (see
  * README "Deferred Work").
+ *
+ * Laya (local sidecar) is currently deferred — see README.
  *
  * @module @deepseek-ai/dsh-experimental-system1
  */
@@ -37,6 +42,7 @@ import { System1Service } from './service.ts'
 import type {
   System1BackendKind,
   System1Mode,
+  System1Question,
   System1RuntimeConfig,
 } from './types.ts'
 
@@ -49,7 +55,8 @@ export const inject: readonly string[] = []
  * Plugin configuration. Every tunable is user-overridable; `.default()`
  * guarantees the fields are set after validation, so `apply` reads them
  * directly. No deployment secret lives here: the Jev key is named by
- * `jevApiKeyEnv` and read from the environment at call time.
+ * `jevApiKeyEnv` (default `TYPESAFE_API_KEY`, the official SDK convention)
+ * and read from the environment at call time.
  */
 export interface Config {
   /** Master switch; when false the plugin registers nothing. */
@@ -60,11 +67,11 @@ export interface Config {
   mode: System1Mode
   /** Minimum confidence for a judgment to pass a gate (0..1). */
   confidenceThreshold: number
-  /** Max System 1 calls per agent turn. */
+  /** Max System 1 questions per agent turn (each question costs tokens). */
   budgetPerTurn: number
-  /** Max System 1 calls per agent task. */
+  /** Max System 1 questions per agent task. */
   budgetPerTask: number
-  /** Per-call backend timeout in milliseconds. */
+  /** Per-batch backend timeout in milliseconds. Jev answers in 70-500ms. */
   timeoutMs: number
   /** Consecutive backend failures before the circuit opens. */
   failureThreshold: number
@@ -76,6 +83,8 @@ export interface Config {
   jevApiKeyEnv: string
   /** Jev System One endpoint URL. */
   jevEndpoint: string
+  /** Jev model alias or pinned version. Pin (e.g. `jev-1.13.0`) once thresholds are tuned. */
+  jevModel: string
   /** Laya sidecar decision endpoint URL (used when `layaAutoStart` is false). */
   layaEndpoint: string
   /** Start a local Laya sidecar on demand instead of using `layaEndpoint`. */
@@ -87,23 +96,27 @@ export interface Config {
 /** Runtime schema for {@link Config}. */
 export const Config: z<Config> = z.object({
   enabled: z.boolean().default(true),
-  backend: z.union(['laya', 'jev', 'none'] as const).default('laya'),
+  backend: z.union(['laya', 'jev', 'none'] as const).default('jev'),
   mode: z.union(['shadow', 'assist', 'enforce'] as const).default('shadow'),
   confidenceThreshold: z.percent().default(0.7),
   budgetPerTurn: z.natural().default(4),
   budgetPerTask: z.natural().default(12),
-  timeoutMs: z.natural().default(150),
+  timeoutMs: z.natural().default(1200),
   failureThreshold: z.natural().min(1).default(3),
   cooldownMs: z.natural().default(30_000),
   traceBufferSize: z.natural().min(1).default(200),
-  jevApiKeyEnv: z.string().min(1).default('JEV_API_KEY'),
-  jevEndpoint: z.string().min(1).default('https://api.jev.ai/v1/systemone'),
+  jevApiKeyEnv: z.string().min(1).default('TYPESAFE_API_KEY'),
+  jevEndpoint: z.string().min(1).default('https://api.typesafe.ai/v1/systemone'),
+  jevModel: z.string().min(1).default('jev-latest'),
   layaEndpoint: z.string().min(1).default('http://127.0.0.1:17840/decide'),
   layaAutoStart: z.boolean().default(true),
   layaCommand: z.array(z.string()).min(1).default(['python3', '-m', 'laya_serve']),
 })
 
 type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
+
+/** Probability above which a loop-check noul counts as "stuck". Lives in code, not the prompt. */
+const LOOP_STUCK_THRESHOLD = 0.7
 
 function toRuntimeConfig(config: Config): System1RuntimeConfig {
   return {
@@ -119,6 +132,7 @@ function toRuntimeConfig(config: Config): System1RuntimeConfig {
     traceBufferSize: config.traceBufferSize,
     jevApiKeyEnv: config.jevApiKeyEnv,
     jevEndpoint: config.jevEndpoint,
+    jevModel: config.jevModel,
     layaEndpoint: config.layaEndpoint,
     layaAutoStart: config.layaAutoStart,
     layaCommand: config.layaCommand,
@@ -167,7 +181,12 @@ export function apply(ctx: Context, config: Config): void {
     await service.ask(question, 'turn', payload.signal, validateTriage)
   }
 
-  /** Track tool calls for loop detection and judge failures; shadow only. */
+  /**
+   * Track tool calls for loop detection and judge failures; shadow only.
+   * All questions for this decision point go out in ONE backend call —
+   * Jev evaluates them in parallel, so the batch costs barely more time
+   * than a single question.
+   */
   async function observeToolCall(exec: ToolExecution, result: ToolExecutionResult): Promise<void> {
     const agentId = exec.agent?.id ?? 'unknown-agent'
     const entry: ObservedToolCall = {
@@ -192,16 +211,29 @@ export function apply(ctx: Context, config: Config): void {
       }
       return
     }
+
+    const questions: System1Question[] = []
+    const validators: Array<(answer: unknown) => unknown> = []
     if (loop.repetitions >= 2) {
-      await service.ask(buildLoopQuestion(history), 'turn', exec.signal, validateLoopAnswer)
+      questions.push(buildLoopQuestion(history))
+      validators.push(validateLoopAnswer)
     }
     if (result.isError) {
-      const errorText = result.error.message
-      await service.ask(
-        buildRetryQuestion(entry.name, entry.argsKey, errorText),
-        'turn',
-        exec.signal,
-        validateRetry,
+      questions.push(buildRetryQuestion(entry.name, entry.argsKey, result.error.message))
+      validators.push(validateRetry)
+    }
+    if (questions.length === 0) return
+
+    const decisions = await service.askMany(questions, validators, 'turn', exec.signal)
+    const loopDecision = decisions[0]
+    if (
+      questions[0]?.kind === 'loop-check'
+      && typeof loopDecision?.value === 'number'
+      && loopDecision.value >= LOOP_STUCK_THRESHOLD
+      && config.mode !== 'shadow'
+    ) {
+      ctx.logger.warn(
+        `system1: jev judges agent ${agentId} stuck (p=${loopDecision.value.toFixed(2)}, model=${loopDecision.trace.model ?? 'unknown'})`,
       )
     }
   }
