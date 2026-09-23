@@ -47,7 +47,16 @@ Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay
 
 - `shadow` (default): trace only. The loop never changes.
 - `assist`: trace plus `warn`-level loop hints — both from the deterministic loop check and from high-probability Jev loop judgments.
-- `enforce`: judgments actuate. Triage injects a reasoning-strategy hint before each step (trivial → direct atomic answer, standard → step-by-step, complex → atomic decomposition with 2–3 alternative approaches), loop-check injects a nudge when the agent looks stuck (bounded per task and per episode), and retry-judgment advises on failed tool calls. Any fallback — abstention, low confidence, timeout, backend error, exhausted budget — injects nothing and the loop continues unchanged.
+- `enforce`: judgments actuate. Triage injects a reasoning-strategy hint before each step (trivial → direct atomic answer, standard → step-by-step, complex → atomic decomposition with 2–3 alternative approaches), loop-check injects a nudge when the agent looks stuck (bounded per task and per episode), retry-judgment advises on failed tool calls, and delegation triage advises the Lead on teammate spawns (see Orchestrator layer below). Any fallback — abstention, low confidence, timeout, backend error, exhausted budget — injects nothing and the loop continues unchanged.
+
+### Orchestrator layer: judge-before-delegate
+
+When the agent-team packages are installed, the Lead can delegate via the `spawn_teammate` tool. System 1 judges the delegation itself — an orchestration concern the per-step hooks cannot see:
+
+- **Delegation triage** (one Jev `delegation-triage` question per spawn, joining the post-execute batch): `complex`/`standard` verdicts advise the Lead through `additionalContexts` — which strategy the subtask deserves (the teammate, being an agent, receives the matching atom/chain/tree-of-thoughts hint on its own first step) and proportionate oversight. `trivial` stays silent; the Lead's context stays clean.
+- **Duplicate-purpose detection** (deterministic, no model call): a bounded registry of recent spawns flags same-name or similar-purpose teammates (Jaccard ≥ 0.5 within 30 minutes) so the Lead can interrupt or merge before two teammates burn tokens on the same work.
+
+Shadow traces the triage; assist warns; enforce injects. The branch only fires for `spawn_teammate`, so without the agent-team packages it is inert — no config flag needed. Delegations are never denied: the plugin advises, the Lead decides.
 
 ## Configuration
 

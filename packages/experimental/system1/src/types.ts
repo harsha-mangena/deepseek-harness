@@ -27,6 +27,7 @@ export type System1QuestionKind =
   | 'loop-check'
   | 'retry-judgment'
   | 'delegation'
+  | 'delegation-triage'
   | 'plausibility'
 
 /**

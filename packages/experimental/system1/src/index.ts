@@ -15,9 +15,10 @@
  * style of the repeat-tool reminder. In `enforce` mode the judgments actuate:
  * triage selects a reasoning strategy (atom/chain/tree of thoughts) injected
  * as a hint before the step, loop-check injects a nudge when the agent looks
- * stuck, and retry-judgment advises the agent on failed tool calls. Every
- * actuation is bounded (timeouts, budgets, nudge caps) and any failure falls
- * back to existing harness behavior.
+ * stuck, retry-judgment advises the agent on failed tool calls, and delegation
+ * triage advises the Lead on teammate spawns (orchestrator layer:
+ * judge-before-delegate). Every actuation is bounded (timeouts, budgets,
+ * nudge caps) and any failure falls back to existing harness behavior.
  *
  * Laya (local sidecar) is currently deferred — see README.
  *
@@ -47,6 +48,14 @@ import {
   type ObservedToolCall,
 } from './gates.ts'
 import { System1Service } from './service.ts'
+import {
+  buildDelegationAdvisory,
+  buildDelegationTriageQuestion,
+  buildDuplicateWarning,
+  createDelegationState,
+  extractSpawnArgs,
+  SPAWN_TOOL_NAME,
+} from './orchestrator.ts'
 import type {
   RetryVerdict,
   System1BackendKind,
@@ -55,6 +64,7 @@ import type {
   System1Question,
   System1QuestionKind,
   System1RuntimeConfig,
+  TriageVerdict,
 } from './types.ts'
 
 export const name = 'system1'
@@ -235,9 +245,9 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
  * afterwards, so a slow or failing backend can never change or delay loop
  * behavior. Enforce listeners judge first (bounded by the service timeout;
  * the service never rejects) and inject guidance — a triage strategy hint
- * before the step, loop nudges and retry hints after tool calls — then
- * delegate. Any fallback resolves to "no injection", so the loop always
- * continues with existing behavior.
+ * before the step, loop nudges and retry hints after tool calls, delegation
+ * advisories after teammate spawns — then delegate. Any fallback resolves
+ * to "no injection", so the loop always continues with existing behavior.
  *
  * Shadow observations run on the plugin's own lifetime signal, bounded by
  * the service timeout — not on the step/tool signals handed to the
@@ -259,6 +269,12 @@ export function apply(ctx: Context, config: Config): void {
   const agents = createAgentState()
   const lifetime = new AbortController()
   const enforce = config.mode === 'enforce'
+  /**
+   * Orchestrator-level delegation memory: recent `spawn_teammate` calls for
+   * duplicate-purpose detection. Only consulted for that tool, which exists
+   * solely when the agent-team packages are installed — otherwise inert.
+   */
+  const delegations = createDelegationState()
 
   /**
    * Track the agent's turn; a new agent or a turn-number reset starts a new
@@ -354,6 +370,10 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
 
+    // Orchestrator layer: delegation observation is independent of the
+    // loop/retry batch below, so it runs before the empty-batch early return.
+    await observeDelegation(exec, result)
+
     const questions: System1Question[] = []
     const validators: Array<(answer: unknown) => unknown> = []
     if (loop.repetitions >= 2) {
@@ -381,6 +401,33 @@ export function apply(ctx: Context, config: Config): void {
       ctx.logger.warn(
         `system1: jev judges agent ${agentId} stuck (p=${loopDecision.value.toFixed(2)}, model=${loopDecision.trace.model ?? 'unknown'})`,
       )
+    }
+  }
+
+  /**
+   * Orchestrator layer, shadow/assist: judge the delegation itself. The
+   * spawn is recorded for duplicate detection in every mode; the triage is
+   * traced always and additionally warned in assist. Never injects.
+   */
+  async function observeDelegation(exec: ToolExecution, result: ToolExecutionResult): Promise<void> {
+    if (exec.name !== SPAWN_TOOL_NAME || result.isError) return
+    const spawn = extractSpawnArgs(exec.arguments)
+    if (spawn === null) return
+    const duplicate = delegations.findDuplicate(spawn.name, spawn.description)
+    delegations.noteSpawn(spawn.name, spawn.description)
+    const triage = await service.ask(
+      buildDelegationTriageQuestion(spawn.name, spawn.description, spawn.prompt),
+      'turn',
+      lifetime.signal,
+      validateTriage,
+    )
+    if (config.mode === 'shadow') return
+    if (duplicate !== null) {
+      ctx.logger.warn(`system1: ${buildDuplicateWarning(spawn.name, duplicate)}`)
+    }
+    if (triage.value !== null) {
+      const advisory = buildDelegationAdvisory(spawn.name, triage.value)
+      if (advisory !== null) ctx.logger.warn(`system1: ${advisory}`)
     }
   }
 
@@ -432,14 +479,46 @@ export function apply(ctx: Context, config: Config): void {
       validators.push(validateRetry)
       kinds.push('retry-judgment')
     }
+    // Orchestrator layer: judge-before-delegate. The delegation triage joins
+    // the batch — Jev evaluates questions in parallel, so it costs barely
+    // more than the loop/retry questions alone. The duplicate check is
+    // deterministic and runs before the spawn is recorded, so the candidate
+    // never matches itself.
+    const spawn = exec.name === SPAWN_TOOL_NAME && !result.isError
+      ? extractSpawnArgs(exec.arguments)
+      : null
+    let duplicateWarning: string | null = null
+    if (spawn !== null) {
+      const duplicate = delegations.findDuplicate(spawn.name, spawn.description)
+      delegations.noteSpawn(spawn.name, spawn.description)
+      if (duplicate !== null) {
+        duplicateWarning = buildDuplicateWarning(spawn.name, duplicate)
+        ctx.logger.warn(`system1: ${duplicateWarning}`)
+      }
+      questions.push(buildDelegationTriageQuestion(spawn.name, spawn.description, spawn.prompt))
+      validators.push(validateTriage)
+      kinds.push('delegation-triage')
+    }
     const decisions = questions.length > 0
       ? await service.askMany(questions, validators, 'turn', exec.signal)
       : []
 
     const decision = await next()
+    // The duplicate warning is the most urgent guidance: it leads.
+    if (duplicateWarning !== null) contexts.push(guidance(duplicateWarning))
     decisions.forEach((judged, index) => {
       const kind = kinds[index]
       if (judged.value === null || kind === undefined) return
+      if (kind === 'delegation-triage' && typeof judged.value === 'string' && spawn !== null) {
+        // The triage validator passed, so the string is a TriageVerdict.
+        const advisory = buildDelegationAdvisory(spawn.name, judged.value as TriageVerdict)
+        if (advisory !== null) {
+          ctx.logger.warn(`system1: ${advisory}`)
+          contexts.push(guidance(advisory))
+          service.markActed(judged.trace.id)
+        }
+        return
+      }
       if (kind === 'loop-check' && typeof judged.value === 'number' && judged.value >= config.loopStuckThreshold) {
         ctx.logger.warn(
           `system1: jev judges agent ${agentId} stuck (p=${judged.value.toFixed(2)}, model=${judged.trace.model ?? 'unknown'})`,
