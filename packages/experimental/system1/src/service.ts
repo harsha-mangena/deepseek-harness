@@ -74,6 +74,14 @@ function safeValidate<T>(
  * @param ms - timeout in milliseconds. Values <= 0 disable the timeout
  * entirely; the call is then bounded only by the caller's `signal`.
  */
+/** Fresh read of an AbortSignal's aborted flag. The early return in
+ * {@link System1Service.askMany} narrows `signal.aborted` to false for the
+ * rest of the call, but the signal can abort while a batch is in flight and
+ * narrowing is not reset at await points — so read it through here. */
+function isAborted(signal: AbortSignal): boolean {
+  return signal.aborted
+}
+
 function withAbortTimeout<T>(
   run: (signal: AbortSignal) => Promise<T>,
   ms: number,
@@ -153,6 +161,7 @@ export class System1Service {
     for (const map of [this.turnUsed, this.taskUsed]) {
       while (map.size > 256) {
         const oldest = map.keys().next().value
+        /* v8 ignore next -- defensive: a non-empty map always has a first key */
         if (oldest === undefined) break
         map.delete(oldest)
       }
@@ -402,7 +411,7 @@ export class System1Service {
         if (probe) this.probeInFlight = false
         // A caller abort (user interrupt, cancelled turn, disposed plugin)
         // says nothing about backend health: never count it as a failure.
-        if (signal.aborted) {
+        if (isAborted(signal)) {
           askable.forEach(({ index, question }) => {
             decisions[index] = this.fallback<T>(question, 'cancelled', agentId)
           })

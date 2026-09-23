@@ -108,6 +108,7 @@ export function reliabilityCurve(
 }
 
 function percentile(sorted: readonly number[], p: number): number {
+  /* v8 ignore next -- defensive: callers only pass non-empty latency lists */
   if (sorted.length === 0) return 0
   const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1))
   return sorted[index] as number

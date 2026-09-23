@@ -189,6 +189,7 @@ export class JevBackend implements System1Backend {
     const shared = contexts.every(context => stableJson(context) === stableJson(contexts[0]))
     let state: unknown
     if (shared) {
+      /* v8 ignore next -- defensive: questions is non-empty after the early return, so contexts[0] exists */
       state = contexts[0] ?? {}
     } else {
       const namespaced: Record<string, unknown> = {}

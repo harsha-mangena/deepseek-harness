@@ -182,6 +182,7 @@ export function createDelegationState(
       scoreCache.set(argsKey, cached)
       while (scoreCache.size > Math.max(1, maxSpawns)) {
         const oldest = scoreCache.keys().next().value
+        /* v8 ignore next -- defensive: a non-empty map always has a first key */
         if (oldest === undefined) break
         scoreCache.delete(oldest)
       }

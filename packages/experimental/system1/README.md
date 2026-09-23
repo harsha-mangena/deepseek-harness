@@ -68,6 +68,30 @@ Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay
 
   Any fallback — abstention, low confidence, timeout, backend error, exhausted budget — injects nothing (and denies nothing) and the loop continues unchanged.
 
+### Async actuation
+
+Enforce ships with `actuation: 'async'` (default). The judgments and the guidance are the same as the blocking path, but no Jev round trip sits on the loop's critical path except where a deadline explicitly allows it — at ~1.7 s mean Jev latency, awaiting every seam would roughly double a short turn.
+
+- **Turn triage is speculative.** It is asked once per turn at inbox insert (overlapping the agent wake) and awaited at most `routeDeadlineMs` (250 ms) before the first request. Routing is sticky per turn (upgrade-only) so the provider prefix cache survives; a late verdict can still land at `agent/request` via peek.
+- **Only risky tool calls wait.** A tool-choice judgment gates dispatch only for tools matching `riskyTools` (shells, file writes/deletes, MCP tools by default), and at most `toolGateDeadlineMs` (400 ms). Everything else dispatches immediately.
+- **Post-execute judgments are posted, not awaited.** Loop, retry, injection-screen, subagent-accept, and delegation verdicts go to the judgment board and are delivered at the next pre-step — still before the next model request, so the model sees them at the same point in its trajectory. The pre-step waits at most `drainDeadlineMs` (300 ms) for pending posts.
+- **Large-result triage waits (bounded).** The result text must be replaced before the model reads it, so post-execute waits at most `resultTriageDeadlineMs` (600 ms) for the triage verdict; on timeout the original result flows through.
+
+`actuation: 'blocking'` restores the original judge-first behavior on every seam: pre-step, pre-execute, and post-execute each await their Jev batch (bounded by `timeoutMs`).
+
+**Blocking points.** Where each mode can pause the loop:
+
+| Seam | `shadow` / `assist` | `enforce` + `async` | `enforce` + `blocking` |
+| --- | --- | --- | --- |
+| `agent/pre-step` (triage hint, loop nudge) | never blocks | ≤ `drainDeadlineMs` for posted hints | awaits triage batch (≤ `timeoutMs`) |
+| `agent/request` (model routing) | never routes | ≤ `routeDeadlineMs` for the triage verdict | awaits triage (≤ `timeoutMs`) |
+| `tools/pre-execute` (tool-choice gate) | never blocks | ≤ `toolGateDeadlineMs`, risky tools only | awaits tool-choice (≤ `timeoutMs`) |
+| `tools/post-execute` (loop/retry/injection) | never blocks | never blocks (posted to board) | awaits batch (≤ `timeoutMs`) |
+| `tools/post-execute` (large-result triage) | never blocks | ≤ `resultTriageDeadlineMs` | awaits batch (≤ `timeoutMs`) |
+| `agent/request-error` (retry) | never blocks | awaits retry judgment (≤ `timeoutMs`) | awaits retry judgment (≤ `timeoutMs`) |
+
+Budgets still count every question in async mode — including posted ones — against both per-turn and per-task ceilings. `criticalReserve` (default 4) holds back that many questions per turn/task for loop-check, request-retry, and retry-judgment, so speculative triage cannot starve the judgments that protect the turn.
+
 ### Orchestrator layer: judge-before-delegate
 
 When the agent-team packages are installed, the Lead can delegate via the `spawn_teammate` tool. System 1 judges the delegation itself — an orchestration concern the per-step hooks cannot see:
@@ -117,6 +141,15 @@ All tunables are Schemastery-validated with safe defaults:
 | `delegationWeights` | `{ novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 }` | Relative weights for the delegation composite (normalized in code; individual weights may be zero, the total must be positive) |
 | `modelRoute` | `{}` | Verdict→override table for model routing (enforce), e.g. `{ complex: { model: 'strong-model' } }`. Each override may set `provider`, `model`, and/or `reasoningEffort`; unset fields keep the loop's config. Inert by default: provider/model names are deployment-specific |
 | `maxRequestRetries` | `1` | Max System 1-owned retries per failed model request per step (enforce); further failures delegate to the loop default |
+| `actuation` | `'async'` | `'async'` (deadline-bounded, default) or `'blocking'` (judge-first on every seam) enforce behavior |
+| `routeDeadlineMs` | `250` | Max wait for the turn's triage verdict before the first request (async) |
+| `drainDeadlineMs` | `300` | Max wait at pre-step for pending post-execute judgments (async) |
+| `toolGateDeadlineMs` | `400` | Max wait for a risky tool call's tool-choice judgment (async) |
+| `resultTriageDeadlineMs` | `600` | Max wait for a large result's triage before the result reaches the model (async) |
+| `riskyTools` | shells, writers, MCP | Regex sources (case-insensitive) naming tools worth a blocking tool-choice gate (async). Default: `^(bash\|pwsh\|shell\|terminal)`, `(^|_)(write\|delete\|remove\|rm\|move\|rename\|kill)(_|\|$)`, `^mcp__` |
+| `criticalReserve` | `4` | Extra per-turn/per-task questions reserved for loop-check, request-retry, and retry-judgment |
+| `jevScopeInstructions` | `true` | Scope mixed-context Jev batches with per-question state pointers |
+| `warmup` | `true` | Open the Jev connection at plugin start so the first judgment skips the TLS handshake |
 | `redactState` | `true` | Scrub secret-like values from Jev-bound state before the wire call |
 | `prefetchToolChoice` | `true` | Start the tool-choice judgment from stream deltas before pre-execute |
 | `preselect` | `false` | Ask per-server need-probability questions and restrict unneeded MCP servers (opt-in) |
@@ -130,6 +163,21 @@ All tunables are Schemastery-validated with safe defaults:
 | `pruneMinChars` | `4000` | Minimum result size for a prune candidate |
 | `pruneDropThreshold` | `0.2` | Drop probability below which a candidate is judged not needed |
 | `maxPrunePerTask` | `10` | Max pruner passes per agent task |
+
+DeepSeek `modelRoute` example — route complex steps to the reasoning model, keep trivial steps on the cheap chat model:
+
+```ts
+System1Plugin.setup({
+  mode: 'enforce',
+  modelRoute: {
+    complex: { model: 'deepseek-reasoner' },
+    standard: { model: 'deepseek-chat' },
+    trivial: { model: 'deepseek-chat', reasoningEffort: 'low' },
+  },
+})
+```
+
+The override applies per `agent/request` from the cached triage verdict; no extra model call is spent. Stale, missing, or unmapped verdicts leave the loop's config untouched, and shadow/assist never route.
 
 ### Getting a Jev key
 

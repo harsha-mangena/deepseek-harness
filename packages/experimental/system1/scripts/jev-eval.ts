@@ -134,7 +134,15 @@ async function main(): Promise<void> {
   }
 
   // Quality: every case `repeat` times, `concurrency` in flight.
-  const perKind = new Map<string, { answered: number; correct: number; total: number; pairs: Array<{ confidence: number; correct: boolean }>; ms: number[]; misses: string[] }>()
+  interface KindStats {
+    answered: number
+    correct: number
+    total: number
+    pairs: Array<{ confidence: number; correct: boolean }>
+    ms: number[]
+    misses: string[]
+  }
+  const perKind = new Map<string, KindStats>()
   const jobs = CASES.flatMap(item => Array.from({ length: repeat }, () => item))
   await pool(jobs, concurrency, async (item) => {
     const kind = item.question.kind

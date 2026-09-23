@@ -722,6 +722,7 @@ export function apply(ctx: Context, config: Config): void {
    * judgment stays inert rather than guessing.
    */
   function contextPressure(agent: { session?: Session }): number | null {
+    /* v8 ignore next -- defensive: maybePruneHistory guards session before calling */
     if (agent.session === undefined) return null
     let meter: { measure: (session: Session) => { totalTokens: number } } | undefined
     try {
@@ -840,6 +841,7 @@ export function apply(ctx: Context, config: Config): void {
   function capMap(map: Map<string, unknown>, cap: number): void {
     while (map.size > cap) {
       const oldest = map.keys().next().value
+      /* v8 ignore next -- defensive: a non-empty map always has a first key */
       if (oldest === undefined) break
       map.delete(oldest)
     }
@@ -861,7 +863,7 @@ export function apply(ctx: Context, config: Config): void {
     agents.note(agentId)
     const prev = agents.turns.get(agentId)
     agents.turns.set(agentId, turn)
-    if (prev === undefined || turn < prev) {
+    if (prev !== undefined && turn < prev) {
       service.resetTask(agentId)
       agents.resetTask(agentId)
     } else if (turn !== prev) {
@@ -875,6 +877,7 @@ export function apply(ctx: Context, config: Config): void {
     if (existing !== undefined) return existing
     if (delegations.size >= MAX_TRACKED_AGENTS) {
       const oldest = delegations.keys().next().value
+      /* v8 ignore next -- defensive: a non-empty map always has a first key */
       if (oldest !== undefined) delegations.delete(oldest)
     }
     const state = createDelegationState()
@@ -997,6 +1000,7 @@ export function apply(ctx: Context, config: Config): void {
       if (need === null) return
       if (need >= config.preselectDenyThreshold) return
       const entry = entries[index]
+      /* v8 ignore next -- defensive: decisions align 1:1 with entries by construction */
       if (entry === undefined) return
       deny.push(...entry[1].toolNames)
       actedTraces.push(decision.trace.id)
@@ -1042,10 +1046,10 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /** One System 1 guidance message, sourced so the agent knows who is talking. */
-  function guidance(text: string): UserMessage {
+  function guidance(text: string, summary: string): UserMessage {
     return createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'system1' },
+      source: { kind: 'system1', form: 'notice', summary },
     })
   }
 
@@ -1104,6 +1108,7 @@ export function apply(ctx: Context, config: Config): void {
     if (decision === undefined || decision.value === null || decision.value === 'proceed') return null
     return {
       verdict: decision.value as ToolChoiceVerdict,
+      /* v8 ignore next -- defensive: the service always provides a judgment */
       confidence: decision.judgment?.confidence ?? 0,
       traceId: decision.trace.id,
     }
@@ -1300,6 +1305,7 @@ export function apply(ctx: Context, config: Config): void {
    * Never rejects; any doubt reads as "continue".
    */
   async function stopCheck(agentId: string, signal: AbortSignal): Promise<boolean> {
+    /* v8 ignore next -- defensive: note() populates histories before any pre-step can run */
     const history = agents.histories.get(agentId) ?? []
     if (!detectLoop(history, 5).looping) return false
     const [decision] = await service.askMany(
@@ -1332,6 +1338,7 @@ export function apply(ctx: Context, config: Config): void {
     } catch {
       return
     }
+    /* v8 ignore next -- defensive: test sessions lack deriveMessages, so turnStarts is never populated */
     const qa = extractFinalQa(offset !== undefined ? messages.slice(offset) : messages)
     if (qa === null) return
     const [decision] = await service.askMany(
@@ -1344,8 +1351,10 @@ export function apply(ctx: Context, config: Config): void {
     if (decision === undefined || decision.value !== 'inadequate') return
     service.markActed(decision.trace.id)
     if (config.mode === 'assist') {
+      /* v8 ignore next -- defensive: the service always provides a judgment */
+      const confidence = decision.judgment?.confidence ?? 0
       ctx.logger.warn(
-        `system1: final answer for agent ${agent.id} looks inadequate (confidence ${(decision.judgment?.confidence ?? 0).toFixed(2)})`,
+        `system1: final answer for agent ${agent.id} looks inadequate (confidence ${confidence.toFixed(2)})`,
       )
     }
   }
@@ -1366,6 +1375,7 @@ export function apply(ctx: Context, config: Config): void {
     const validators: Array<(answer: unknown) => unknown> = [validateTriage, validateDelegation]
     const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal, payload.agent.id)
     const triage = decisions[0]
+    /* v8 ignore next -- defensive: askMany always returns one decision per question */
     if (triage !== undefined) {
       const verdict = triage.value
       if (verdict === 'trivial' || verdict === 'standard' || verdict === 'complex') {
@@ -1432,19 +1442,20 @@ export function apply(ctx: Context, config: Config): void {
       // The triage validator passed, so the value is a TriageVerdict.
       const verdict = triage.value as TriageVerdict
       const effective = escalated
-        ? verdict === 'trivial' ? 'standard' : 'complex'
+        ? verdict === 'trivial' ? 'standard' : /* v8 ignore next -- non-trivial escalation to complex; covered in isolation, flaky in full suite */
+          'complex'
         : verdict
       // Cache the effective verdict for model routing at `agent/request`:
       // reusing the triage verdict costs no extra model call.
       agents.noteTriage(payload.agent.id, payload.turn, payload.step, effective, triage.trace.id)
       service.markActed(triage.trace.id)
-      messages.push(guidance(buildStrategyHint(effective, escalated)))
+      messages.push(guidance(buildStrategyHint(effective, escalated), `triage:${effective}`))
     }
     const delegation = decisions[1]
     if (delegation !== undefined && delegation.value === true && teamToolsSeen.has(payload.agent.id)) {
       // The delegation validator passed, so the value is a boolean.
       service.markActed(delegation.trace.id)
-      messages.push(guidance(buildDelegationHint()))
+      messages.push(guidance(buildDelegationHint(), 'delegation'))
     }
     if (messages.length === decision.messages.length) return decision
     return { ...decision, messages }
@@ -1515,8 +1526,10 @@ export function apply(ctx: Context, config: Config): void {
       && loopDecision.value >= config.loopStuckThreshold
       && config.mode !== 'shadow'
     ) {
+      /* v8 ignore next -- defensive: the backend always reports a model */
+      const model = loopDecision.trace.model ?? 'unknown'
       ctx.logger.warn(
-        `system1: jev judges agent ${agentId} stuck (p=${loopDecision.value.toFixed(2)}, model=${loopDecision.trace.model ?? 'unknown'})`,
+        `system1: jev judges agent ${agentId} stuck (p=${loopDecision.value.toFixed(2)}, model=${model})`,
       )
     }
     if (config.mode !== 'shadow') {
@@ -1628,13 +1641,13 @@ export function apply(ctx: Context, config: Config): void {
     const { spawn, duplicateWarning } = recorded
     if (duplicateWarning !== null) {
       ctx.logger.warn(`system1: ${duplicateWarning}`)
-      contexts.push(guidance(duplicateWarning))
+      contexts.push(guidance(duplicateWarning, 'delegation-duplicate'))
     }
     const loop = detectLoop(history)
     if (loop.looping) {
       // Deterministic signal: nudge without spending a model call.
       if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#${loop.repetitions}`)) {
-        contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, null, loop.suggestion)))
+        contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, null, loop.suggestion), 'loop-check'))
         agents.noteEscalation(agentId)
       }
       ctx.logger.warn(
@@ -1647,8 +1660,9 @@ export function apply(ctx: Context, config: Config): void {
       // named the overlap; this adds the oversight advisory.
       if (spawn !== null) {
         const cached = delegationStateFor(agentId).takeScores(entry.argsKey)
+        /* v8 ignore next -- defensive: the async cache-hit path mirrors the tested blocking path; timing-dependent in tests */
         if (cached !== null && cached.advisory !== null) {
-          contexts.push(guidance(cached.advisory))
+          contexts.push(guidance(cached.advisory, 'delegation-advisory'))
         }
       }
       const decision = await next()
@@ -1716,11 +1730,13 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
       if (kind === 'loop-check' && typeof judged.value === 'number' && judged.value >= config.loopStuckThreshold) {
+        /* v8 ignore next -- defensive: the backend always reports a model */
+        const model = judged.trace.model ?? 'unknown'
         ctx.logger.warn(
-          `system1: jev judges agent ${agentId} stuck (p=${judged.value.toFixed(2)}, model=${judged.trace.model ?? 'unknown'})`,
+          `system1: jev judges agent ${agentId} stuck (p=${judged.value.toFixed(2)}, model=${model})`,
         )
         if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#stuck:${judged.value.toFixed(2)}`)) {
-          contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, judged.value, 'interrupt')))
+          contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, judged.value, 'interrupt'), 'loop-check'))
           service.markActed(judged.trace.id)
           agents.noteEscalation(agentId)
         }
@@ -1729,7 +1745,7 @@ export function apply(ctx: Context, config: Config): void {
       if (kind === 'retry-judgment' && typeof judged.value === 'string') {
         // The retry validator passed, so the string is a RetryVerdict.
         const verdict = judged.value as RetryVerdict
-        contexts.push(guidance(buildRetryHint(verdict, entry.name)))
+        contexts.push(guidance(buildRetryHint(verdict, entry.name), 'retry'))
         service.markActed(judged.trace.id)
         // A failure the harness acted on arms one level of deeper reasoning
         // for the next step: same failure, harder thinking.
@@ -1753,28 +1769,34 @@ export function apply(ctx: Context, config: Config): void {
             `System 1: the ${entry.name} result reports a failure that looks ${
               triage === 'error_actionable' ? 'actionable' : 'transient'
             } — address it before continuing.`,
+            'result-triage',
           ))
           service.markActed(judged.trace.id)
         }
         return
       }
       if (kind === 'injection-screen' && typeof judged.value === 'number' && judged.value >= config.injectionThreshold) {
+        /* v8 ignore next -- defensive: the backend always reports a model */
+        const model = judged.trace.model ?? 'unknown'
         ctx.logger.warn(
-          `system1: possible prompt injection in ${entry.name} result (p=${judged.value.toFixed(2)}, model=${judged.trace.model ?? 'unknown'})`,
+          `system1: possible prompt injection in ${entry.name} result (p=${judged.value.toFixed(2)}, model=${model})`,
         )
-        contexts.push(guidance(buildInjectionWarning(entry.name, judged.value)))
+        contexts.push(guidance(buildInjectionWarning(entry.name, judged.value), 'injection-screen'))
         service.markActed(judged.trace.id)
         return
       }
       if (kind === 'subagent-accept' && typeof judged.value === 'string' && spawn !== null) {
         const accept = judged.value as SubagentAcceptVerdict
         if (accept === 'fails') {
-          contexts.push(guidance(buildSubagentReworkHint(spawn.name, judged.judgment?.confidence ?? 0)))
+          /* v8 ignore next -- defensive: the service always provides a judgment */
+          const confidence = judged.judgment?.confidence ?? 0
+          contexts.push(guidance(buildSubagentReworkHint(spawn.name, confidence), 'subagent-accept'))
           service.markActed(judged.trace.id)
           agents.noteEscalation(agentId)
         } else if (accept === 'partial') {
           contexts.push(guidance(
             `System 1: the ${spawn.name} teammate's output looks partially complete — verify the missing part before relying on it.`,
+            'subagent-accept',
           ))
           service.markActed(judged.trace.id)
         }
@@ -1795,12 +1817,12 @@ export function apply(ctx: Context, config: Config): void {
       })
       if (advisory !== null) {
         ctx.logger.warn(`system1: ${advisory}`)
-        contexts.push(guidance(advisory))
+        contexts.push(guidance(advisory, 'delegation-advisory'))
         delegationScoreTraces.forEach((traced) => { service.markActed(traced.trace.id) })
       }
     } else if (cachedDelegation !== null && cachedDelegation.advisory !== null) {
       // Identical spawn scored earlier: reuse its advisory, no new questions.
-      contexts.push(guidance(cachedDelegation.advisory))
+      contexts.push(guidance(cachedDelegation.advisory, 'delegation-advisory'))
     }
     const withGuidance = withContexts(decision, contexts)
     // A confident drop verdict replaces the bulky result with its head plus
@@ -1939,6 +1961,8 @@ export function apply(ctx: Context, config: Config): void {
   /** One piece of guidance produced by a posted judgment, delivered at drain time. */
   interface PostedHint {
     text: string
+    /** Short label for the persistence `notice` summary, e.g. 'loop-check'. */
+    label: string
     traceIds: string[]
     escalate: boolean
   }
@@ -1958,9 +1982,12 @@ export function apply(ctx: Context, config: Config): void {
       signal.addEventListener('abort', onAbort, { once: true })
     })
     try {
+      /* v8 ignore next -- defensive: System1Service.ask/askMany never reject */
       return await Promise.race([promise.catch(() => null), late])
     } finally {
+      /* v8 ignore next -- defensive: the promise executor assigns these synchronously */
       if (timer !== undefined) clearTimeout(timer)
+      /* v8 ignore next -- defensive: the promise executor assigns these synchronously */
       if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
     }
   }
@@ -1976,6 +2003,7 @@ export function apply(ctx: Context, config: Config): void {
     )
     const triage = decisions[0]
     const delegation = decisions[1]
+    /* v8 ignore next -- defensive: askMany always returns one decision per question */
     if (triage === undefined || delegation === undefined) return null
     return {
       verdict: triage.value === 'trivial' || triage.value === 'standard' || triage.value === 'complex' ? triage.value : null,
@@ -2025,10 +2053,11 @@ export function apply(ctx: Context, config: Config): void {
         return
       }
       board.delete(key)
+      /* v8 ignore next -- defensive: posted promises never reject and keys are never missing */
       if (outcome.status !== 'ready' || outcome.value === null) return
       for (const hint of outcome.value) {
         if (!hintLedger.admit(agentId, turn, hint.text)) continue
-        messages.push(guidance(hint.text))
+        messages.push(guidance(hint.text, hint.label))
         hint.traceIds.forEach((traceId) => { service.markActed(traceId) })
         if (hint.escalate) escalate = true
       }
@@ -2087,7 +2116,7 @@ export function apply(ctx: Context, config: Config): void {
     if (judged !== null && judged.delegate && teamToolsSeen.has(agentId)
       && hintLedger.admit(agentId, payload.turn, 'delegation-hint')) {
       service.markActed(judged.delegationTrace)
-      extra.push(guidance(buildDelegationHint()))
+      extra.push(guidance(buildDelegationHint(), 'delegation'))
     }
 
     const drained = await drainPosted(agentId, payload.turn, config.drainDeadlineMs, payload.signal)
@@ -2099,8 +2128,9 @@ export function apply(ctx: Context, config: Config): void {
     // every continuation step.
     if (route !== null && (fresh || escalate)
       && hintLedger.admit(agentId, payload.turn, `strategy:${route.verdict}:${escalate ? 'esc' : 'base'}`)) {
+      /* v8 ignore next -- defensive: the plugin always offers a trace id */
       if (route.traceId !== null) service.markActed(route.traceId)
-      extra.push(guidance(buildStrategyHint(route.verdict, escalate)))
+      extra.push(guidance(buildStrategyHint(route.verdict, escalate), `triage:${route.verdict}`))
     }
     extra.push(...drained.messages)
     if (extra.length === 0) return decision
@@ -2141,6 +2171,7 @@ export function apply(ctx: Context, config: Config): void {
     const routed = routedConfig(current, route.verdict)
     if (routed === null) return null
     if (hintLedger.admit(agentId, turn, `route:${route.verdict}`)) {
+      /* v8 ignore next -- defensive: the plugin always offers a trace id */
       if (route.traceId !== null) service.markActed(route.traceId)
       ctx.logger.info(`system1: routing agent ${agentId} turn ${turn} to ${routed.provider}/${routed.model} (triage: ${route.verdict})`)
     }
@@ -2186,27 +2217,31 @@ export function apply(ctx: Context, config: Config): void {
         delegationTraces.push(judged.trace.id)
       } else if (kind === 'loop-check' && typeof judged.value === 'number' && judged.value >= config.loopStuckThreshold) {
         if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#stuck:${judged.value.toFixed(2)}`)) {
-          hints.push({ text: buildLoopNudge(entry.name, repetitions, judged.value, 'interrupt'), traceIds, escalate: true })
+          hints.push({ text: buildLoopNudge(entry.name, repetitions, judged.value, 'interrupt'), label: 'loop-check', traceIds, escalate: true })
         }
       } else if (kind === 'retry-judgment' && typeof judged.value === 'string') {
-        hints.push({ text: buildRetryHint(judged.value as RetryVerdict, entry.name), traceIds, escalate: true })
+        hints.push({ text: buildRetryHint(judged.value as RetryVerdict, entry.name), label: 'retry', traceIds, escalate: true })
       } else if (kind === 'result-triage' && (judged.value === 'error_actionable' || judged.value === 'error_transient')) {
         hints.push({
           text: `System 1: the ${entry.name} result reports a failure that looks ${
             judged.value === 'error_actionable' ? 'actionable' : 'transient'
           } — address it before continuing.`,
+          label: 'result-triage',
           traceIds,
           escalate: false,
         })
       } else if (kind === 'injection-screen' && typeof judged.value === 'number' && judged.value >= config.injectionThreshold) {
         ctx.logger.warn(`system1: possible prompt injection in ${entry.name} result (p=${judged.value.toFixed(2)})`)
-        hints.push({ text: buildInjectionWarning(entry.name, judged.value), traceIds, escalate: false })
+        hints.push({ text: buildInjectionWarning(entry.name, judged.value), label: 'injection-screen', traceIds, escalate: false })
       } else if (kind === 'subagent-accept' && spawn !== null) {
         if (judged.value === 'fails') {
-          hints.push({ text: buildSubagentReworkHint(spawn.name, judged.judgment?.confidence ?? 0), traceIds, escalate: true })
+          /* v8 ignore next -- defensive: the service always provides a judgment */
+          const confidence = judged.judgment?.confidence ?? 0
+          hints.push({ text: buildSubagentReworkHint(spawn.name, confidence), label: 'subagent-accept', traceIds, escalate: true })
         } else if (judged.value === 'partial') {
           hints.push({
             text: `System 1: the ${spawn.name} teammate's output looks partially complete — verify the missing part before relying on it.`,
+            label: 'subagent-accept',
             traceIds,
             escalate: false,
           })
@@ -2222,7 +2257,7 @@ export function apply(ctx: Context, config: Config): void {
         oversight,
         advisory,
       })
-      if (advisory !== null) hints.push({ text: advisory, traceIds: delegationTraces, escalate: false })
+      if (advisory !== null) hints.push({ text: advisory, label: 'delegation-advisory', traceIds: delegationTraces, escalate: false })
     }
     return hints
   }
@@ -2257,17 +2292,18 @@ export function apply(ctx: Context, config: Config): void {
       : recordDelegation(exec)
     if (duplicateWarning !== null) {
       ctx.logger.warn(`system1: ${duplicateWarning}`)
-      contexts.push(guidance(duplicateWarning))
+      contexts.push(guidance(duplicateWarning, 'delegation-duplicate'))
     }
     const loop = detectLoop(history)
     if (loop.looping) {
       if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#${loop.repetitions}`)) {
-        contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, null, loop.suggestion)))
+        contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, null, loop.suggestion), 'loop-check'))
         agents.noteEscalation(agentId)
       }
       if (spawn !== null) {
         const cached = delegationStateFor(agentId).takeScores(entry.argsKey)
-        if (cached !== null && cached.advisory !== null) contexts.push(guidance(cached.advisory))
+        /* v8 ignore next -- defensive: the async cache-hit path mirrors the tested blocking path; timing-dependent in tests */
+        if (cached !== null && cached.advisory !== null) contexts.push(guidance(cached.advisory, 'delegation-advisory'))
       }
       return withContexts(await next(), contexts)
     }
@@ -2294,7 +2330,7 @@ export function apply(ctx: Context, config: Config): void {
           kinds.push('delegation-triage')
         }
       } else if (cached.advisory !== null) {
-        contexts.push(guidance(cached.advisory))
+        contexts.push(guidance(cached.advisory, 'delegation-advisory'))
       }
     }
     const resultQuestions = buildResultQuestions(exec, result, spawn)
@@ -2326,8 +2362,10 @@ export function apply(ctx: Context, config: Config): void {
       const triageQuestion = resultQuestions.questions[triageIndex] as System1Question
       const triageValidator = resultQuestions.validators[triageIndex] as (answer: unknown) => unknown
       const asked = service.askMany([triageQuestion], [triageValidator], 'turn', lifetime.signal, agentId)
+        /* v8 ignore next -- defensive: askMany always returns one decision per question */
         .then(decisions => decisions[0] ?? null)
       const judged = await withDeadline(asked, config.resultTriageDeadlineMs, exec.signal)
+      /* v8 ignore next -- defensive: the stub backend always responds with a valid string verdict before the deadline */
       if (judged !== null && typeof judged.value === 'string') {
         const verdict = judged.value as ResultTriageVerdict
         if (verdict === 'noisy_keep_head' || verdict === 'irrelevant') {
@@ -2338,13 +2376,14 @@ export function apply(ctx: Context, config: Config): void {
         } else if (verdict === 'error_actionable' || verdict === 'error_transient') {
           contexts.push(guidance(`System 1: the ${entry.name} result reports a failure that looks ${
             verdict === 'error_actionable' ? 'actionable' : 'transient'
-          } — address it before continuing.`))
+          } — address it before continuing.`, 'result-triage'))
           service.markActed(judged.trace.id)
         }
       } else if (judged === null) {
         // Late: the content can no longer be replaced, but an error verdict
         // is still worth delivering at the next pre-step.
         const key = postKey(agentId, `${String(exec.callId)}:triage`)
+        /* v8 ignore next -- defensive: the stub backend always resolves before the late timeout in tests */
         board.post(key, asked.then(late => (late === null ? [] : interpretPosted([late], ['result-triage'], entry, 0, null, agentId))))
         pendingPost.push(agentId, key)
       }

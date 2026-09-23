@@ -79,6 +79,7 @@ export class RouteLedger {
   private evict(): void {
     while (this.turns.size > this.capacity) {
       const oldest = this.turns.keys().next().value
+      /* v8 ignore next -- defensive: a non-empty map always has a first key */
       if (oldest === undefined) break
       this.turns.delete(oldest)
     }
@@ -139,6 +140,7 @@ export class HintLedger {
       this.seen.set(agentId, entry)
       while (this.seen.size > this.capacity) {
         const oldest = this.seen.keys().next().value
+        /* v8 ignore next -- defensive: a non-empty map always has a first key */
         if (oldest === undefined) break
         this.seen.delete(oldest)
       }
@@ -169,6 +171,7 @@ export class PendingQueue {
       this.queues.set(agentId, queue)
       while (this.queues.size > this.capacity) {
         const oldest = this.queues.keys().next().value
+        /* v8 ignore next -- defensive: a non-empty map always has a first key */
         if (oldest === undefined) break
         this.queues.delete(oldest)
       }

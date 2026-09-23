@@ -265,7 +265,7 @@ describe('JevBackend wire', () => {
     })
     const backend = new JevBackend(runtime({
       jevApiKeyEnv: 'TYPESAFE_API_KEY', jevEndpoint: 'https://api.typesafe.ai/v1/systemone', jevModel: 'jev-1.13.0', redactState: false,
-    } as Partial<System1RuntimeConfig>))
+    }))
     const shared = { messagePreview: 'hi' }
     await backend.decideMany([
       { ...question('triage'), prompt: 'Q1', context: shared },
@@ -398,8 +398,11 @@ function request(context: Context, agentId: string, step: number, turn = 1): Pro
   return context.waterfall('agent/request', payload, async () => ({ provider: 'p', model: 'base-model' }))
 }
 
-function exec(context: Context, agentId: string, name: string, callId: string, args: unknown = { a: 1 }): ToolExecution {
-  return { agent: agentRef(context, agentId), name, callId, arguments: args, signal: new AbortController().signal } as unknown as ToolExecution
+function exec(
+  context: Context, agentId: string, name: string, callId: string, args: unknown = { a: 1 },
+): ToolExecution {
+  const signal = new AbortController().signal
+  return { agent: agentRef(context, agentId), name, callId, arguments: args, signal } as unknown as ToolExecution
 }
 
 function hintTexts(messages: readonly UserMessage[]): string[] {

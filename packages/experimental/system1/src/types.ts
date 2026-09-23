@@ -11,6 +11,8 @@
  * @module @deepseek-ai/dsh-experimental-system1
  */
 
+import type { ContextFormed } from '@deepseek-ai/dsh-llm'
+
 /** Which fast-thinking backend answers System 1 questions. */
 export type System1BackendKind = 'laya' | 'jev' | 'none'
 
@@ -329,6 +331,6 @@ export interface LoopCheckVerdict {
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     /** System 1 injected guidance: triage strategy hints, loop nudges, retry hints. */
-    system1: { kind: 'system1' }
+    system1: { kind: 'system1' } & ContextFormed
   }
 }

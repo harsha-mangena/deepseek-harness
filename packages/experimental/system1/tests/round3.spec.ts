@@ -541,6 +541,36 @@ it('B1: an inbox insert while running is steering and does not reset', async () 
   expect(askedKinds.filter(kind => kind === 'retry-judgment')).toHaveLength(2)
 })
 
+it('G11: the first pre-step does not wipe inbox speculation task spending', async () => {
+  // budgetPerTask: 1 — the speculative triage posted at inbox insert spends
+  // the whole task budget. The inbox insert is the authoritative new-task
+  // reset; the first pre-step (no previous turn) must not reset again and
+  // erase that speculative spending.
+  const context = await boot({
+    backend: 'jev',
+    mode: 'enforce',
+    actuation: 'async',
+    budgetPerTurn: 8,
+    budgetPerTask: 1,
+    criticalReserve: 0,
+  })
+  context.emit('agent/inbox/inserted', {
+    agent: agentRef(context, 'spec-agent'),
+    message: createUserMessage({ content: [{ type: 'text', text: 'new task' }], source: { kind: 'user' } }),
+  })
+  await vi.waitFor(() => {
+    expect(askedKinds.filter(kind => kind === 'triage')).toHaveLength(1)
+  })
+  // First pre-step for this agent: turn 1 with no previous turn recorded.
+  const next = vi.fn(async () => ({ messages: [] }))
+  await context.waterfall('agent/pre-step', preStepPayload(context, 'spec-agent', 1), next)
+  // The task budget is still spent: a retry-judgment now falls back without
+  // asking. (With the old `prev === undefined` task reset, the budget would
+  // refresh here and the retry question would be asked.)
+  await failedToolCall(context, 'spec-agent', 1)
+  expect(askedKinds.filter(kind => kind === 'retry-judgment')).toHaveLength(0)
+})
+
 // ---------------------------------------------------------------------------
 // Composition: B2 delegation before the loop early return
 // ---------------------------------------------------------------------------

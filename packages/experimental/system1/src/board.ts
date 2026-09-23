@@ -65,6 +65,7 @@ export class JudgmentBoard {
     this.slots.set(key, slot)
     while (this.slots.size > this.capacity) {
       const oldest = this.slots.keys().next().value
+      /* v8 ignore next -- defensive: a non-empty map always has a first key */
       if (oldest === undefined) break
       this.slots.delete(oldest)
     }
@@ -112,13 +113,15 @@ export class JudgmentBoard {
       signal?.addEventListener('abort', onAbort, { once: true })
     })
     const ready = slot.promise.then(
-      value => ({ status: 'ready', value: value as T | null }) as BoardTake<T>,
-      () => ({ status: 'ready', value: null }) as BoardTake<T>,
+      (value): BoardTake<T> => ({ status: 'ready', value: value as T | null }),
+      (): BoardTake<T> => ({ status: 'ready', value: null }),
     )
     try {
       return await Promise.race([ready, late])
     } finally {
+      /* v8 ignore next -- defensive: the promise executor assigns the timer synchronously */
       if (timer !== undefined) clearTimeout(timer)
+      /* v8 ignore next -- defensive: the promise executor assigns the abort handler synchronously */
       if (onAbort !== undefined) signal?.removeEventListener('abort', onAbort)
     }
   }
