@@ -314,7 +314,11 @@ export function apply(ctx: Context, config: Config): void {
     trackTurn(payload.agent.id, payload.turn)
     const triage = await service.ask(buildTriageQuestion(payload.messages), 'turn', payload.signal, validateTriage)
     const decision = await next()
-    if (decision.kind === 'reject' || decision.messages.length === 0) return decision
+    // An empty first step owns a no-step turn: the loop discards the decision,
+    // so there is no model call to guide. Later steps with empty claims are
+    // normal tool continuations — the appended hint still reaches the model
+    // because the loop appends decision messages to the session.
+    if (decision.kind === 'reject' || (payload.step === 1 && decision.messages.length === 0)) return decision
     if (triage.value === null) return decision
     service.markActed(triage.trace.id)
     return { ...decision, messages: [...decision.messages, guidance(buildStrategyHint(triage.value))] }

@@ -223,6 +223,38 @@ it('passes a rejected step through untouched', async () => {
   expect(decision).toEqual({ kind: 'reject' })
 })
 
+it('skips the hint on an empty first step (no-step turn)', async () => {
+  jevTriage = 'complex'
+  const context = await boot({ backend: 'jev', mode: 'enforce' })
+  const payload = { ...preStepPayload(context, 'enforce-empty-first'), step: 1 }
+  const decision = await context.waterfall(
+    'agent/pre-step',
+    payload,
+    (): Promise<PreStepDecision> => Promise.resolve({ kind: 'enter', messages: [] }),
+  )
+  expect(decision.kind).toBe('enter')
+  if (decision.kind !== 'enter') return
+  // The loop discards an empty first-step decision: no model call to guide.
+  expect(decision.messages).toHaveLength(0)
+})
+
+it('injects the hint on an empty later step (tool continuation)', async () => {
+  jevTriage = 'trivial'
+  const context = await boot({ backend: 'jev', mode: 'enforce' })
+  const payload = { ...preStepPayload(context, 'enforce-empty-later'), step: 2 }
+  const decision = await context.waterfall(
+    'agent/pre-step',
+    payload,
+    (): Promise<PreStepDecision> => Promise.resolve({ kind: 'enter', messages: [] }),
+  )
+  expect(decision.kind).toBe('enter')
+  if (decision.kind !== 'enter') return
+  // Mid-turn steps legitimately claim nothing new; the hint still reaches the
+  // model because the loop appends decision messages to the session.
+  expect(decision.messages).toHaveLength(1)
+  expect(hintTexts(decision.messages)[0]).toContain('[System 1 triage: trivial]')
+})
+
 it('nudges via additionalContexts on a deterministic loop', async () => {
   const context = await boot({ backend: 'jev', mode: 'enforce' })
   const agentId = 'enforce-loop'
