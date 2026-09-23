@@ -10,12 +10,16 @@ Reasoning-model calls are expensive. Many loop decisions are small and typed ("i
 
 ## How it works
 
-The plugin observes four documented extension points:
+The plugin observes six documented extension points:
 
 - `agent/pre-step` → asks **triage** (`choice`) and step **delegability** (`choice`) in one batch, from the incoming messages.
 - `tools/pre-execute` → asks **tool-choice** (`choice`): should this call proceed, or is it clearly the wrong tool for the step's apparent goal?
-- `tools/post-execute` → tracks recent tool calls per agent, runs a **deterministic** loop check in code, and — only for ambiguous patterns — asks **loop-check** (`noul`) and **retry-judgment** (`choice`).
+- `tools/post-execute` → tracks recent tool calls per agent, runs a **deterministic** loop check in code (tool arguments are canonicalized — nested key order does not hide a repeat), and — only for ambiguous patterns — asks **loop-check** (`noul`) and **retry-judgment** (`choice`).
+- `agent/request` (enforce only) → **model routing**: the cached triage verdict from pre-step may replace the call config per the `modelRoute` table. No extra model call.
+- `agent/request-error` → asks **request-retry** (`choice`): does the failed model request look transient? Enforce owns one bounded retry; other modes delegate first and only observe.
 - `agent/turn-stopping` → asks **final-answer** (`choice`): does the closing answer address the request? Observe-only — the turn is already over, so there is no veto.
+
+Task boundaries come from the agent lifecycle, not turn numbers: a message inserted into the inbox (`agent/inbox/inserted`) while the agent is idle (`agent/status`) starts a new task and refreshes per-agent budgets and the loop-nudge allowance. Insertions while the agent is running are steering, not new tasks. This keeps long-lived agents from silently degrading to budget-exhausted fallbacks.
 
 Shadow/assist listeners always delegate first (`next()`) and observe afterwards, so a slow or failing backend can never change or delay loop behavior. Enforce listeners judge first (bounded by the service timeout; the service never rejects) and inject guidance, then delegate.
 
@@ -25,6 +29,7 @@ Efficiency is structural, not aspirational:
 - **Code does what code can compute.** Exact tool-call repetition is detected by `detectLoop()` locally — Jev is never asked to count. State sent per question is scoped to what that question needs.
 - **Timeouts abort the socket.** A timed-out batch aborts the underlying HTTP request instead of letting it linger.
 - **Budgets count questions, not batches**, because each question costs input tokens (output is free).
+- **Budgets are partitioned per agent.** Turn/task counters, loop history, the delegation registry, and cached triage verdicts are keyed by agent id — one chatty agent cannot starve another. The circuit breaker stays global: it represents backend health, not agent behavior.
 - **Observations outlive the turn.** Shadow observations run on the plugin's own lifetime signal, not the step/tool signals handed to the listeners — those may abort after the waterfall settles while a fire-and-forget observation is still in flight. Letting them cancel the observation would poison the circuit breaker with backend errors that say nothing about backend health.
 - **Agent tracking is bounded.** Loop history and turn markers are kept for at most 64 distinct agents; noting a new agent past the bound evicts the oldest agent's state, so long-running hosts cannot grow these maps without bound.
 - Node's global fetch keeps connections alive, so repeated calls reuse the TLS session.
@@ -56,6 +61,8 @@ Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay
   - **Tool-choice** is judge-before-act: a confident (≥ 0.85) wrong-tool verdict denies the dispatch with a model-facing reason so the agent self-corrects instead of spending a round-trip on a useless call. Anything else continues the waterfall untouched.
   - **Loop-check** injects a nudge when the agent looks stuck (bounded per task and per episode); **retry-judgment** advises on failed tool calls (`retry`, `retry-different`, `replan`, or `give-up`).
   - **Bounded STOP**: a hopeless trajectory — 5+ identical calls in a row *plus* Jev's stuck probability at/above `stopStuckThreshold` — ends the turn via pre-step `reject` instead of burning more tokens. Legitimate repetition (polling, retries) with a low stuck probability keeps going.
+  - **Model routing** reuses the cached triage verdict at `agent/request`: a configured `modelRoute` entry (e.g. `complex → { model: 'strong-model' }`) replaces that call's provider/model/reasoning-effort without spending another model call. Stale or missing verdicts, and unmapped verdicts, leave the config untouched. Shadow/assist never route.
+  - **Request-error recovery**: a confident (≥ 0.7) transient verdict on `agent/request-error` owns the retry — `{kind:'retry'}` without delegating — so a flaky provider does not kill the turn. Bounded by `maxRequestRetries` per step; anything else delegates to the loop default. Shadow/assist only observe.
   - **Delegation triage** advises the Lead on teammate spawns (see Orchestrator layer below).
   - The final-answer check stays observe-only in every mode.
 
@@ -66,7 +73,7 @@ Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay
 When the agent-team packages are installed, the Lead can delegate via the `spawn_teammate` tool. System 1 judges the delegation itself — an orchestration concern the per-step hooks cannot see:
 
 - **Delegation triage** (one Jev `delegation-triage` question per spawn, joining the post-execute batch): `complex`/`standard` verdicts advise the Lead through `additionalContexts` — which strategy the subtask deserves (the teammate, being an agent, receives the matching atom/chain/tree-of-thoughts hint on its own first step) and proportionate oversight. `trivial` stays silent; the Lead's context stays clean.
-- **Duplicate-purpose detection** (deterministic, no model call): a bounded registry of recent spawns flags same-name or similar-purpose teammates (Jaccard ≥ 0.5 within 30 minutes) so the Lead can interrupt or merge before two teammates burn tokens on the same work.
+- **Duplicate-purpose detection** (deterministic, no model call): a bounded registry of recent spawns flags same-name or similar-purpose teammates (Jaccard ≥ 0.5 within 30 minutes) so the Lead can interrupt or merge before two teammates burn tokens on the same work. Registry writes and duplicate warnings run before the loop early-return, so a repeated `spawn_teammate` cannot dodge bookkeeping by looking like a loop.
 
 Shadow traces the triage; assist warns; enforce injects. The branch only fires for `spawn_teammate`, so without the agent-team packages it is inert — no config flag needed. Delegations are never denied: the plugin advises, the Lead decides.
 
@@ -93,6 +100,8 @@ All tunables are Schemastery-validated with safe defaults:
 | `maxLoopNudgesPerTask` | `2` | Max loop nudges injected per agent task (enforce) |
 | `stopStuckThreshold` | `0.9` | Stuck probability at/above which a hopeless trajectory ends the turn (enforce). Stricter than `loopStuckThreshold`: the STOP also requires a 5+ identical-call streak |
 | `delegationWeights` | `{ novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 }` | Relative weights for the delegation composite (normalized in code; individual weights may be zero, the total must be positive) |
+| `modelRoute` | `{}` | Verdict→override table for model routing (enforce), e.g. `{ complex: { model: 'strong-model' } }`. Each override may set `provider`, `model`, and/or `reasoningEffort`; unset fields keep the loop's config. Inert by default: provider/model names are deployment-specific |
+| `maxRequestRetries` | `1` | Max System 1-owned retries per failed model request per step (enforce); further failures delegate to the loop default |
 
 ### Getting a Jev key
 
@@ -111,7 +120,8 @@ export TYPESAFE_API_KEY=<your key>
 - **Tool shortlist is not wired.** Hierarchical tool selection needs a tool-catalog seam the harness does not expose (verified against the tools package source); the dead `tool-shortlist` question kind was removed rather than left as a stub.
 - **Plan viability is not judged.** Plan mode is user-interactive (propose → human review → approve); there is no machine-judgment seam for plan viability, so none is invented.
 - **No session events.** Traces live in a per-plugin in-memory ring buffer and do not survive restarts. Durable `system1/*` session events are deferred (they carry persistence/versioning requirements).
-- **Budgets are guardrails, not accounting.** Per-agent turn tracking resets on observed turn changes; concurrent agents share the service counters.
+- **Budgets are guardrails, not accounting.** Task boundaries are detected from inbox insertions while the agent is idle; an agent that never goes idle keeps one task budget, by design.
+- **Model routing is only as good as the route table.** The plugin ships no provider/model names — routing is inert until the operator configures `modelRoute` for their deployment.
 
 ## Deferred Work
 

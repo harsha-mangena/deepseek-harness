@@ -29,6 +29,7 @@ export type System1QuestionKind =
   | 'final-answer'
   | 'delegation'
   | 'delegation-triage'
+  | 'request-retry'
 
 /**
  * One typed question for a System 1 backend, expressed in Jev's native
@@ -169,6 +170,20 @@ export interface System1RuntimeConfig {
   /** Max loop nudges injected per agent task; further stuck episodes only warn. */
   readonly maxLoopNudgesPerTask: number
   /**
+   * Model routing table: triage verdict to call-config override, applied at
+   * `agent/request` in enforce mode. Reuses the pre-step triage verdict, so
+   * routing costs no extra model call. Empty by default — model names are
+   * deployment-specific, so routing stays inert until the operator wires it
+   * (e.g. `trivial` to a cheap model, `complex` to a strong one).
+   */
+  readonly modelRoute: Partial<Record<TriageVerdict, ModelRouteOverride>>
+  /**
+   * Max Jev-owned request retries per agent step (`agent/request-error`).
+   * Bounds the retry judgment so a confidently-wrong "transient" verdict
+   * cannot loop forever; the adapter's own retry policy is unaffected.
+   */
+  readonly maxRequestRetries: number
+  /**
    * Stuck probability at or above which a hopeless trajectory ends the turn
    * (0..1). Stricter than `loopStuckThreshold`: the STOP fires only when the
    * deterministic detector also sees a long identical streak, so a high bar
@@ -182,6 +197,25 @@ export type TriageVerdict = 'trivial' | 'standard' | 'complex'
 
 /** Retry verdict for a failed tool call. */
 export type RetryVerdict = 'retry' | 'retry-different' | 'replan' | 'give-up'
+
+/**
+ * Retry verdict for a failed model request (`agent/request-error`). Unlike
+ * the tool-retry judgment, this actuates a real retry of the request, so it
+ * is owned per step and bounded by `maxRequestRetries`.
+ */
+export type RequestRetryVerdict = 'retry' | 'fail'
+
+/**
+ * One model-route override: where a triage verdict sends the step's model
+ * call. All fields optional; fields left unset keep the loop's own config.
+ * `reasoningEffort` is a plain string here (cordis.yml-friendly) and branded
+ * at the call boundary. An empty `modelRoute` map disables routing.
+ */
+export interface ModelRouteOverride {
+  readonly provider?: string
+  readonly model?: string
+  readonly reasoningEffort?: string
+}
 
 /**
  * Tool-choice verdict for one proposed tool call. `wrong-tool` means the

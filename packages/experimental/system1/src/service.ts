@@ -90,10 +90,15 @@ function withAbortTimeout<T>(
  * Runs System 1 questions through confidence, budget, timeout, and circuit
  * gates. Create one per plugin lifetime; call {@link resetTask} when a new
  * agent task starts.
+ *
+ * Budgets are partitioned per agent: each agent's turn/task counters are
+ * keyed by agent id, so one chatty agent cannot starve another's questions.
+ * The circuit breaker stays global — it measures backend health, which is
+ * shared across agents.
  */
 export class System1Service {
-  private turnUsed = 0
-  private taskUsed = 0
+  private readonly turnUsed = new Map<string, number>()
+  private readonly taskUsed = new Map<string, number>()
   private consecutiveFailures = 0
   private circuitOpenedAt: number | null = null
   private readonly traces: System1Trace[] = []
@@ -103,15 +108,26 @@ export class System1Service {
     private readonly config: System1RuntimeConfig,
   ) {}
 
-  /** Reset per-task budgets; call when a new agent task starts. */
-  resetTask(): void {
-    this.taskUsed = 0
-    this.turnUsed = 0
+  /** Cap a budget map; agents are bounded upstream, this is a backstop. */
+  private capBudgets(): void {
+    for (const map of [this.turnUsed, this.taskUsed]) {
+      while (map.size > 256) {
+        const oldest = map.keys().next().value
+        if (oldest === undefined) break
+        map.delete(oldest)
+      }
+    }
   }
 
-  /** Reset per-turn budgets; call when a new agent turn starts. */
-  resetTurn(): void {
-    this.turnUsed = 0
+  /** Reset per-task budgets for one agent; call when a new agent task starts. */
+  resetTask(agentId = ''): void {
+    this.taskUsed.delete(agentId)
+    this.turnUsed.delete(agentId)
+  }
+
+  /** Reset per-turn budgets for one agent; call when a new agent turn starts. */
+  resetTurn(agentId = ''): void {
+    this.turnUsed.delete(agentId)
   }
 
   /** Recent traces, newest last, up to `traceBufferSize`. */
@@ -240,12 +256,16 @@ export class System1Service {
    * @param validators - one answer validator per question, in the same order.
    * @param scope - which budget each question counts against.
    * @param signal - caller cancellation; also bounds the backend call.
+   * @param agentId - the agent the questions belong to; budgets are
+   * partitioned per agent. Defaults to a shared bucket; production call
+   * sites always pass the agent id.
    */
   async askMany<T>(
     questions: readonly System1Question[],
     validators: ReadonlyArray<(answer: unknown) => T | null>,
     scope: BudgetScope,
     signal: AbortSignal,
+    agentId = '',
   ): Promise<Array<System1Decision<T>>> {
     if (questions.length === 0) return []
     if (!this.config.enabled) {
@@ -256,11 +276,13 @@ export class System1Service {
     }
 
     // Budget counts questions, not batches: each question costs tokens.
+    // Counters are per agent, so agents never starve each other.
+    const usedMap = scope === 'turn' ? this.turnUsed : this.taskUsed
+    const budget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
     const askable: Array<{ index: number; question: System1Question; validate: (answer: unknown) => T | null }> = []
     const decisions = new Array<System1Decision<T> | undefined>(questions.length)
     questions.forEach((question, index) => {
-      const used = scope === 'turn' ? this.turnUsed : this.taskUsed
-      const budget = scope === 'turn' ? this.config.budgetPerTurn : this.config.budgetPerTask
+      const used = usedMap.get(agentId) ?? 0
       const validate = validators[index]
       if (validate === undefined) {
         decisions[index] = this.fallback<T>(question, 'backend-error', 'missing validator')
@@ -310,10 +332,10 @@ export class System1Service {
           decisions[index] = this.fallback<T>(question, 'backend-error', 'backend dropped a question')
           return
         }
-        if (scope === 'turn') this.turnUsed += 1
-        else this.taskUsed += 1
+        usedMap.set(agentId, (usedMap.get(agentId) ?? 0) + 1)
         decisions[index] = this.gate(question, judgment, validate)
       })
+      this.capBudgets()
       // A backend that answers short violates its contract (one judgment per
       // question, in order): count it as a failure for circuit purposes even
       // when the rest of the batch succeeded.
@@ -338,8 +360,9 @@ export class System1Service {
     scope: BudgetScope,
     signal: AbortSignal,
     validate: (answer: unknown) => T | null,
+    agentId = '',
   ): Promise<System1Decision<T>> {
-    const decisions = await this.askMany([question], [validate], scope, signal)
+    const decisions = await this.askMany([question], [validate], scope, signal, agentId)
     const first = decisions[0]
     if (first === undefined) throw new Error('system1: askMany returned no decisions')
     return first

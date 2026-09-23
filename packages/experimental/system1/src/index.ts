@@ -21,15 +21,26 @@
  * the agent looks stuck; retry-judgment advises the agent on failed tool
  * calls; a hopeless trajectory — long deterministic identical-call streak
  * plus Jev nearly certain the agent is stuck — ends the turn via pre-step
- * `reject` (turn `blocked`) instead of burning more tokens; and delegation
+ * `reject` (turn `blocked`) instead of burning more tokens; delegation
  * triage advises the Lead on teammate spawns (orchestrator layer:
- * judge-before-delegate). A failure signal (acted-on retry hint or loop
+ * judge-before-delegate); model routing reuses the cached triage verdict at
+ * `agent/request` to switch provider/model/effort per a configured
+ * verdict→override table (no extra model call); and request-error judgment
+ * owns one bounded retry of a transiently-failed model request so it does
+ * not kill the turn. A failure signal (acted-on retry hint or loop
  * nudge) escalates the next step's reasoning one level. Every actuation is
  * bounded (timeouts, budgets, nudge caps) and any failure falls back to
  * existing harness behavior. The final-answer check is observe-only in all
  * modes: the turn is already over at `agent/turn-stopping`, so there is no
  * veto — assist mode warns the operator when the closing answer clearly
  * misses the request.
+ *
+ * Task boundaries come from the agent lifecycle, not turn numbers: a
+ * message inserted into the inbox while the agent is idle (`agent/status`)
+ * starts a new task and refreshes per-agent budgets and the loop-nudge
+ * allowance, so long-lived agents cannot silently degrade to
+ * budget-exhausted fallbacks. Budgets, nudge state, the delegation
+ * registry, and triage verdicts are all partitioned per agent.
  *
  * Laya (local sidecar) is currently deferred — see README.
  *
@@ -38,7 +49,7 @@
 
 import type { Context, Events } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId, type LlmCallConfig, type UserMessage } from '@deepseek-ai/dsh-llm'
 import type {
   PostToolDecision,
   PreToolDecision,
@@ -57,6 +68,7 @@ import {
   buildFinalAnswerQuestion,
   buildLoopNudge,
   buildLoopQuestion,
+  buildRequestRetryQuestion,
   buildRetryHint,
   buildRetryQuestion,
   buildStrategyHint,
@@ -71,6 +83,7 @@ import {
   validateDelegationScore,
   validateFinalAnswer,
   validateLoopAnswer,
+  validateRequestRetry,
   validateRetry,
   validateToolChoice,
   validateTriage,
@@ -85,8 +98,10 @@ import {
   extractSpawnArgs,
   SPAWN_TOOL_NAME,
 } from './orchestrator.ts'
+import type { SpawnArgs } from './orchestrator.ts'
 import type {
   DelegationWeights,
+  ModelRouteOverride,
   RetryVerdict,
   System1BackendKind,
   System1Decision,
@@ -169,6 +184,20 @@ export interface Config {
   stopStuckThreshold: number
   /** Relative weights for the delegation composite (novelty/tool-risk/irreversibility); normalized in code. */
   delegationWeights: DelegationWeights
+  /**
+   * Model routing table: triage verdict to call-config override, applied at
+   * `agent/request` in enforce mode. Reuses the pre-step triage verdict, so
+   * routing costs no extra model call. Empty by default — model names are
+   * deployment-specific, so routing stays inert until wired (e.g. `trivial`
+   * to a cheap model, `complex` to a strong one or higher effort).
+   */
+  modelRoute: Partial<Record<TriageVerdict, ModelRouteOverride>>
+  /**
+   * Max Jev-owned request retries per agent step (`agent/request-error`).
+   * Bounds the retry judgment so a confidently-wrong "transient" verdict
+   * cannot loop forever; the adapter's own retry policy is unaffected.
+   */
+  maxRequestRetries: number
 }
 
 /** Runtime schema for {@link Config}. */
@@ -198,6 +227,12 @@ export const Config: z<Config> = z.object({
     toolRisk: z.number().min(0).default(0.35),
     irreversibility: z.number().min(0).default(0.25),
   }).default({}),
+  modelRoute: z.dict(z.object({
+    provider: z.union([z.string().min(1), z.const(undefined)]),
+    model: z.union([z.string().min(1), z.const(undefined)]),
+    reasoningEffort: z.union([z.string().min(1), z.const(undefined)]),
+  })).default({}),
+  maxRequestRetries: z.natural().default(1),
 })
 
 type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
@@ -205,6 +240,9 @@ type PreStepNext = Parameters<Events['agent/pre-step']>[1]
 type PreStepDecision = Awaited<ReturnType<PreStepNext>>
 type PreExecuteNext = Parameters<Events['tools/pre-execute']>[1]
 type PostExecuteNext = Parameters<Events['tools/post-execute']>[2]
+type RequestErrorPayload = Parameters<Events['agent/request-error']>[0]
+type RequestErrorNext = Parameters<Events['agent/request-error']>[1]
+type RequestErrorAction = Awaited<ReturnType<RequestErrorNext>>
 
 function toRuntimeConfig(config: Config): System1RuntimeConfig {
   return {
@@ -229,6 +267,8 @@ function toRuntimeConfig(config: Config): System1RuntimeConfig {
     maxLoopNudgesPerTask: config.maxLoopNudgesPerTask,
     stopStuckThreshold: config.stopStuckThreshold,
     delegationWeights: config.delegationWeights,
+    modelRoute: config.modelRoute,
+    maxRequestRetries: config.maxRequestRetries,
   }
 }
 
@@ -271,6 +311,12 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
    */
   readonly escalations: Map<string, boolean>
   /**
+   * Latest triage verdict per agent with its turn/step, so `agent/request`
+   * can route the model call without asking again. Stale entries (different
+   * turn/step) are ignored; `resetTask` clears them.
+   */
+  readonly triage: Map<string, { turn: number; step: number; verdict: TriageVerdict; traceId: string }>
+  /**
    * Ensure tracking state exists for `agentId`, evicting the oldest agent
    * when over budget. Returns the agent's loop history.
    */
@@ -281,18 +327,28 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
   noteEscalation(agentId: string): void
   /** Consume (and clear) the agent's pending escalation, if any. */
   consumeEscalation(agentId: string): boolean
+  /** Record a triage verdict for the agent's current turn/step. */
+  noteTriage(agentId: string, turn: number, step: number, verdict: TriageVerdict, traceId: string): void
+  /**
+   * Read the agent's triage verdict only when it belongs to `turn`/`step`;
+   * otherwise null. Never consumes: a retried request for the same step
+   * routes the same way.
+   */
+  takeTriage(agentId: string, turn: number, step: number): { verdict: TriageVerdict; traceId: string } | null
 } {
   const histories = new Map<string, ObservedToolCall[]>()
   const turns = new Map<string, number>()
   const loopNudges = new Map<string, number>()
   const lastNudgeKey = new Map<string, string>()
   const escalations = new Map<string, boolean>()
+  const triage = new Map<string, { turn: number; step: number; verdict: TriageVerdict; traceId: string }>()
   return {
     histories,
     turns,
     loopNudges,
     lastNudgeKey,
     escalations,
+    triage,
     note(agentId: string): ObservedToolCall[] {
       const existing = histories.get(agentId)
       if (existing !== undefined) return existing
@@ -304,6 +360,7 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
         loopNudges.delete(oldest)
         lastNudgeKey.delete(oldest)
         escalations.delete(oldest)
+        triage.delete(oldest)
       }
       const history: ObservedToolCall[] = []
       histories.set(agentId, history)
@@ -313,6 +370,7 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
       loopNudges.delete(agentId)
       lastNudgeKey.delete(agentId)
       escalations.delete(agentId)
+      triage.delete(agentId)
     },
     noteEscalation(agentId: string): void {
       escalations.set(agentId, true)
@@ -321,6 +379,14 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
       const escalated = escalations.get(agentId) === true
       escalations.delete(agentId)
       return escalated
+    },
+    noteTriage(agentId: string, turn: number, step: number, verdict: TriageVerdict, traceId: string): void {
+      triage.set(agentId, { turn, step, verdict, traceId })
+    },
+    takeTriage(agentId: string, turn: number, step: number): { verdict: TriageVerdict; traceId: string } | null {
+      const cached = triage.get(agentId)
+      if (cached === undefined || cached.turn !== turn || cached.step !== step) return null
+      return { verdict: cached.verdict, traceId: cached.traceId }
     },
   }
 }
@@ -357,17 +423,24 @@ export function apply(ctx: Context, config: Config): void {
   const lifetime = new AbortController()
   const enforce = config.mode === 'enforce'
   /**
-   * Orchestrator-level delegation memory: recent `spawn_teammate` calls for
-   * duplicate-purpose detection. Only consulted for that tool, which exists
-   * solely when the agent-team packages are installed — otherwise inert.
+   * Orchestrator-level delegation memory, per agent: recent `spawn_teammate`
+   * calls for duplicate-purpose detection. Only consulted for that tool,
+   * which exists solely when the agent-team packages are installed —
+   * otherwise inert. Per-agent so one Lead's spawns never warn another's.
    */
-  const delegations = createDelegationState()
+  const delegations = new Map<string, ReturnType<typeof createDelegationState>>()
   /**
-   * Whether this session has shown team tooling (`spawn_teammate`
-   * observed). The pre-step delegation hint only fires when true, so agents
-   * without teammates never see delegation noise.
+   * Agents that have shown team tooling (`spawn_teammate` observed). The
+   * pre-step delegation hint only fires for those agents, so agents without
+   * teammates never see delegation noise. Per-agent, not session-global.
    */
-  let teamToolsSeen = false
+  const teamToolsSeen = new Set<string>()
+  /**
+   * Jev-owned request retries per agent/turn/step (`agent/request-error`).
+   * Bounds the retry judgment so a confidently-wrong "transient" verdict
+   * cannot loop forever; the adapter's own retry policy is unaffected.
+   */
+  const requestRetries = new Map<string, number>()
   /**
    * Last pre-execute call per agent (`name` + args key). The tool-choice
    * gate skips exact consecutive duplicates — the loop machinery owns
@@ -398,19 +471,55 @@ export function apply(ctx: Context, config: Config): void {
 
   /**
    * Track the agent's turn; a new agent or a turn-number reset starts a new
-   * task, which refreshes budgets and the loop-nudge allowance. Also wires
-   * the service's per-task reset, which previously never fired.
+   * task, which refreshes budgets and the loop-nudge allowance. Budgets are
+   * partitioned per agent inside the service.
    */
   function trackTurn(agentId: string, turn: number): void {
     agents.note(agentId)
     const prev = agents.turns.get(agentId)
     agents.turns.set(agentId, turn)
     if (prev === undefined || turn < prev) {
-      service.resetTask()
+      service.resetTask(agentId)
       agents.resetTask(agentId)
     } else if (turn !== prev) {
-      service.resetTurn()
+      service.resetTurn(agentId)
     }
+  }
+
+  /** The delegation registry for one agent, created lazily and bounded. */
+  function delegationStateFor(agentId: string): ReturnType<typeof createDelegationState> {
+    const existing = delegations.get(agentId)
+    if (existing !== undefined) return existing
+    if (delegations.size >= MAX_TRACKED_AGENTS) {
+      const oldest = delegations.keys().next().value
+      if (oldest !== undefined) delegations.delete(oldest)
+    }
+    const state = createDelegationState()
+    delegations.set(agentId, state)
+    return state
+  }
+
+  /**
+   * Last seen `agent/status` per agent. Drives the inbox task-boundary
+   * reset: a message inserted while the agent is idle starts a new task.
+   * Unknown agents read as idle — the reset is idempotent, and a missed
+   * reset (the B1 bug: permanent budget exhaustion) is worse than an early
+   * one. Insertions fire before the wake, so the insert still sees `idle`.
+   */
+  const agentStatus = new Map<string, 'idle' | 'running'>()
+
+  /**
+   * Task-boundary reset: a message inserted while the agent is idle starts
+   * a new task, which refreshes budgets and the loop-nudge allowance. The
+   * turn-number heuristic in `trackTurn` cannot see this — turn numbers
+   * only increase within a session — so without this reset a long-lived
+   * agent silently degrades to budget-exhausted fallbacks after its first
+   * task. Inserts while running are steering, not new tasks.
+   */
+  function resetTaskOnFreshUserMessage(agentId: string): void {
+    if (agentStatus.get(agentId) === 'running') return
+    service.resetTask(agentId)
+    agents.resetTask(agentId)
   }
 
   /** One System 1 guidance message, sourced so the agent knows who is talking. */
@@ -480,7 +589,7 @@ export function apply(ctx: Context, config: Config): void {
       previewToolHistory(history),
       stepPreviews.get(agentId) ?? '',
     )
-    const [decision] = await service.askMany([question], [validateToolChoice], 'turn', signal)
+    const [decision] = await service.askMany([question], [validateToolChoice], 'turn', signal, agentId)
     if (decision === undefined || decision.value === null || decision.value === 'proceed') return null
     return {
       verdict: decision.value as ToolChoiceVerdict,
@@ -537,6 +646,7 @@ export function apply(ctx: Context, config: Config): void {
       [validateLoopAnswer],
       'turn',
       signal,
+      agentId,
     )
     if (decision === undefined || decision.value === null) return false
     return decision.value >= config.stopStuckThreshold
@@ -568,6 +678,7 @@ export function apply(ctx: Context, config: Config): void {
       [validateFinalAnswer],
       'turn',
       lifetime.signal,
+      agent.id,
     )
     if (decision === undefined || decision.value !== 'inadequate') return
     service.markActed(decision.trace.id)
@@ -587,7 +698,14 @@ export function apply(ctx: Context, config: Config): void {
     // alone, and the delegability answers accumulate a shadow-mode dataset.
     const questions = [buildTriageQuestion(payload.messages), buildDelegationQuestion(payload.messages)]
     const validators: Array<(answer: unknown) => unknown> = [validateTriage, validateDelegation]
-    await service.askMany(questions, validators, 'turn', lifetime.signal)
+    const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal, payload.agent.id)
+    const triage = decisions[0]
+    if (triage !== undefined) {
+      const verdict = triage.value
+      if (verdict === 'trivial' || verdict === 'standard' || verdict === 'complex') {
+        agents.noteTriage(payload.agent.id, payload.turn, payload.step, verdict, triage.trace.id)
+      }
+    }
   }
 
   /**
@@ -616,7 +734,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     const questions = [buildTriageQuestion(payload.messages), buildDelegationQuestion(payload.messages)]
     const validators: Array<(answer: unknown) => unknown> = [validateTriage, validateDelegation]
-    const judged = service.askMany(questions, validators, 'turn', payload.signal)
+    const judged = service.askMany(questions, validators, 'turn', payload.signal, payload.agent.id)
     const [decisions, decision] = await Promise.all([judged, next()])
     // An empty first step owns a no-step turn: the loop discards the decision,
     // so there is no model call to guide. Later steps with empty claims are
@@ -636,11 +754,14 @@ export function apply(ctx: Context, config: Config): void {
       const effective = escalated
         ? verdict === 'trivial' ? 'standard' : 'complex'
         : verdict
+      // Cache the effective verdict for model routing at `agent/request`:
+      // reusing the triage verdict costs no extra model call.
+      agents.noteTriage(payload.agent.id, payload.turn, payload.step, effective, triage.trace.id)
       service.markActed(triage.trace.id)
       messages.push(guidance(buildStrategyHint(effective, escalated)))
     }
     const delegation = decisions[1]
-    if (delegation !== undefined && delegation.value === true && teamToolsSeen) {
+    if (delegation !== undefined && delegation.value === true && teamToolsSeen.has(payload.agent.id)) {
       // The delegation validator passed, so the value is a boolean.
       service.markActed(delegation.trace.id)
       messages.push(guidance(buildDelegationHint()))
@@ -668,6 +789,12 @@ export function apply(ctx: Context, config: Config): void {
     while (history.length > 12) history.shift()
 
     const loop = detectLoop(history)
+
+    // Orchestrator layer: delegation observation runs before the loop
+    // early-return below, so a repeated `spawn_teammate` cannot dodge
+    // delegation triage and registry updates by looking like a loop.
+    await observeDelegation(exec, result)
+
     if (loop.looping) {
       // Deterministic signal: no model call needed, and in assist/enforce the
       // operator gets a hint in the style of the repeat-tool reminder.
@@ -678,10 +805,6 @@ export function apply(ctx: Context, config: Config): void {
       }
       return
     }
-
-    // Orchestrator layer: delegation observation is independent of the
-    // loop/retry batch below, so it runs before the empty-batch early return.
-    await observeDelegation(exec, result)
 
     const questions: System1Question[] = []
     const validators: Array<(answer: unknown) => unknown> = []
@@ -695,7 +818,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (questions.length === 0) return
 
-    const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal)
+    const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal, agentId)
     // `questions` is non-empty here (early return above) and `askMany`
     // resolves one decision per question in order, so both indexes are
     // defined; the casts below satisfy `noUncheckedIndexedAccess`.
@@ -714,18 +837,38 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * Deterministic delegation bookkeeping, shared by the shadow and enforce
+   * paths: mark team tooling seen, check the per-agent registry for a
+   * duplicate purpose, and record the spawn. Runs before any loop early
+   * return so a repeated `spawn_teammate` cannot dodge the registry. No
+   * model call, never rejects (pure).
+   */
+  function recordDelegation(exec: ToolExecution): { spawn: SpawnArgs | null; duplicateWarning: string | null } {
+    if (exec.name !== SPAWN_TOOL_NAME) return { spawn: null, duplicateWarning: null }
+    const spawn = extractSpawnArgs(exec.arguments)
+    if (spawn === null) return { spawn: null, duplicateWarning: null }
+    const agentId = exec.agent?.id ?? 'unknown-agent'
+    teamToolsSeen.add(agentId)
+    const registry = delegationStateFor(agentId)
+    const duplicate = registry.findDuplicate(spawn.name, spawn.description)
+    registry.noteSpawn(spawn.name, spawn.description)
+    return {
+      spawn,
+      duplicateWarning: duplicate === null ? null : buildDuplicateWarning(spawn.name, duplicate),
+    }
+  }
+
+  /**
    * Orchestrator layer, shadow/assist: judge the delegation itself. The
    * spawn is recorded for duplicate detection in every mode; the composite
    * (novelty/tool-risk/irreversibility) is traced always and additionally
    * warned in assist. Never injects.
    */
   async function observeDelegation(exec: ToolExecution, result: ToolExecutionResult): Promise<void> {
-    if (exec.name !== SPAWN_TOOL_NAME || result.isError) return
-    const spawn = extractSpawnArgs(exec.arguments)
+    if (result.isError) return
+    const { spawn, duplicateWarning } = recordDelegation(exec)
     if (spawn === null) return
-    teamToolsSeen = true
-    const duplicate = delegations.findDuplicate(spawn.name, spawn.description)
-    delegations.noteSpawn(spawn.name, spawn.description)
+    const agentId = exec.agent?.id ?? 'unknown-agent'
     // Composite scoring (TypeSafe's pattern): three atomic scores, combined
     // with weights in code — one Choice hiding several judgments is an
     // anti-pattern.
@@ -735,10 +878,11 @@ export function apply(ctx: Context, config: Config): void {
       [validateDelegationScore, validateDelegationScore, validateDelegationScore],
       'turn',
       lifetime.signal,
+      agentId,
     )
     if (config.mode === 'shadow') return
-    if (duplicate !== null) {
-      ctx.logger.warn(`system1: ${buildDuplicateWarning(spawn.name, duplicate)}`)
+    if (duplicateWarning !== null) {
+      ctx.logger.warn(`system1: ${duplicateWarning}`)
     }
     const scores = decisions.map(decided => decided.value).filter((value): value is number => typeof value === 'number')
     if (scores.length === 3) {
@@ -771,6 +915,18 @@ export function apply(ctx: Context, config: Config): void {
     while (history.length > 12) history.shift()
 
     const contexts: UserMessage[] = []
+    // Deterministic delegation bookkeeping runs before the loop branch so a
+    // looping `spawn_teammate` still records in the registry and the Lead
+    // still learns about the duplicate. The Jev composite joins the batch
+    // below; the duplicate warning leads the guidance.
+    const recorded = result.isError
+      ? { spawn: null as SpawnArgs | null, duplicateWarning: null as string | null }
+      : recordDelegation(exec)
+    const { spawn, duplicateWarning } = recorded
+    if (duplicateWarning !== null) {
+      ctx.logger.warn(`system1: ${duplicateWarning}`)
+      contexts.push(guidance(duplicateWarning))
+    }
     const loop = detectLoop(history)
     if (loop.looping) {
       // Deterministic signal: nudge without spending a model call.
@@ -801,20 +957,9 @@ export function apply(ctx: Context, config: Config): void {
     // Orchestrator layer: judge-before-delegate. The delegation composite
     // (novelty/tool-risk/irreversibility) joins the batch — Jev evaluates
     // questions in parallel, so it costs barely more than the loop/retry
-    // questions alone. The duplicate check is deterministic and runs before
-    // the spawn is recorded, so the candidate never matches itself.
-    const spawn = exec.name === SPAWN_TOOL_NAME && !result.isError
-      ? extractSpawnArgs(exec.arguments)
-      : null
-    let duplicateWarning: string | null = null
+    // questions alone. Deterministic recording happened above, before the
+    // loop branch, so the candidate never matches itself.
     if (spawn !== null) {
-      teamToolsSeen = true
-      const duplicate = delegations.findDuplicate(spawn.name, spawn.description)
-      delegations.noteSpawn(spawn.name, spawn.description)
-      if (duplicate !== null) {
-        duplicateWarning = buildDuplicateWarning(spawn.name, duplicate)
-        ctx.logger.warn(`system1: ${duplicateWarning}`)
-      }
       const scoreQuestions = buildDelegationScoreQuestions(spawn.name, spawn.description, spawn.prompt)
       for (const scoreQuestion of scoreQuestions) {
         questions.push(scoreQuestion)
@@ -823,12 +968,10 @@ export function apply(ctx: Context, config: Config): void {
       }
     }
     const decisions = questions.length > 0
-      ? await service.askMany(questions, validators, 'turn', exec.signal)
+      ? await service.askMany(questions, validators, 'turn', exec.signal, agentId)
       : []
 
     const decision = await next()
-    // The duplicate warning is the most urgent guidance: it leads.
-    if (duplicateWarning !== null) contexts.push(guidance(duplicateWarning))
     // Delegation scores accumulate across the three composite questions;
     // they resolve after the per-question loop below.
     const delegationScores: number[] = []
@@ -881,6 +1024,86 @@ export function apply(ctx: Context, config: Config): void {
     return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), ...contexts] }
   }
 
+  /**
+   * Model routing (enforce only): replace the step's call config from the
+   * cached triage verdict — no extra model call, the verdict was judged at
+   * pre-step. Returns null when the verdict is stale/absent, no route is
+   * configured for it, or the route would not change anything.
+   */
+  function routeModel(
+    agentId: string,
+    turn: number,
+    step: number,
+    current: LlmCallConfig,
+  ): LlmCallConfig | null {
+    const cached = agents.takeTriage(agentId, turn, step)
+    if (cached === null) return null
+    const override = config.modelRoute[cached.verdict]
+    if (override === undefined) return null
+    const routed: LlmCallConfig = {
+      ...current,
+      ...(override.provider !== undefined ? { provider: override.provider } : {}),
+      ...(override.model !== undefined ? { model: override.model } : {}),
+      ...(override.reasoningEffort !== undefined
+        ? { reasoningEffort: ReasoningEffortId(override.reasoningEffort) }
+        : {}),
+    }
+    if (
+      routed.provider === current.provider
+      && routed.model === current.model
+      && routed.reasoningEffort === current.reasoningEffort
+    ) return null
+    service.markActed(cached.traceId)
+    ctx.logger.info(
+      `system1: routing agent ${agentId} step to ${routed.provider}/${routed.model} (triage: ${cached.verdict})`,
+    )
+    return routed
+  }
+
+  /**
+   * Enforce: judge a failed model request before the loop retries or closes
+   * the step. A confident `retry` verdict owns recovery — `{kind:'retry'}`
+   * without delegating — so a transient provider failure does not kill the
+   * turn. Anything else delegates to the loop default. Bounded per step by
+   * `maxRequestRetries`: a confidently-wrong "transient" verdict cannot
+   * loop forever. Never rejects; any doubt reads as "delegate".
+   */
+  async function judgeRequestError(
+    payload: RequestErrorPayload,
+    next: RequestErrorNext,
+  ): Promise<RequestErrorAction> {
+    const agentId = payload.agent.id
+    const key = `${agentId}:${payload.turn}:${payload.step}`
+    const attempts = requestRetries.get(key) ?? 0
+    if (attempts >= config.maxRequestRetries) return await next()
+    const question = buildRequestRetryQuestion(payload.failure, payload.provider, attempts + 1)
+    const [decision] = await service.askMany([question], [validateRequestRetry], 'turn', payload.signal, agentId)
+    if (decision === undefined || decision.value !== 'retry') return await next()
+    requestRetries.set(key, attempts + 1)
+    capMap(requestRetries, 128)
+    service.markActed(decision.trace.id)
+    ctx.logger.warn(
+      `system1: retrying failed ${payload.provider} request for agent ${agentId} (request-retry judged transient, attempt ${attempts + 1})`,
+    )
+    return { kind: 'retry' }
+  }
+
+  /**
+   * Shadow/assist: the same request-retry question, trace-only (assist
+   * warns). Never owns recovery — the waterfall delegates first, then the
+   * observation runs fire-and-forget on the plugin's lifetime signal.
+   */
+  async function observeRequestError(payload: RequestErrorPayload): Promise<void> {
+    const agentId = payload.agent.id
+    const question = buildRequestRetryQuestion(payload.failure, payload.provider, 1)
+    const [decision] = await service.askMany([question], [validateRequestRetry], 'turn', lifetime.signal, agentId)
+    if (decision !== undefined && decision.value === 'retry' && config.mode === 'assist') {
+      ctx.logger.warn(
+        `system1: failed ${payload.provider} request for agent ${agentId} looks transient (request-retry judged retry)`,
+      )
+    }
+  }
+
   const disposeTriage = ctx.on('agent/pre-step', async (payload, next) => {
     if (enforce) return await enforceStep(payload, next)
     const decision = await next()
@@ -923,12 +1146,59 @@ export function apply(ctx: Context, config: Config): void {
     void observeFinalAnswer(payload.agent, payload.turn).catch(() => undefined)
   })
 
+  /**
+   * Model routing: in enforce mode the cached triage verdict may replace
+   * the call config (provider/model/effort) per `modelRoute`. Follows the
+   * documented pattern — `next()` yields the config the machine would use,
+   * return a replacement to switch. Shadow/assist only delegate: routing
+   * never actuates outside enforce.
+   */
+  const disposeRequest = ctx.on('agent/request', async (payload, next) => {
+    const current = await next()
+    if (!enforce) return current
+    return routeModel(payload.agent.id, payload.turn, payload.step, current) ?? current
+  })
+
+  /**
+   * Request-error recovery: in enforce mode a confident transient verdict
+   * owns the retry; otherwise — and always in shadow/assist — the loop
+   * default decides. Shadow/assist observe trace-only without delaying the
+   * waterfall.
+   */
+  const disposeRequestError = ctx.on('agent/request-error', async (payload, next) => {
+    if (enforce) return await judgeRequestError(payload, next)
+    const action = await next()
+    /* v8 ignore next -- defensive: System1Service.askMany never rejects */
+    void observeRequestError(payload).catch(() => undefined)
+    return action
+  })
+
+  /**
+   * Task-boundary reset: inbox traffic inserted while the agent is idle
+   * starts a new task — refresh budgets and the loop-nudge allowance before
+   * the turn wakes. Insertions fire before the wake, so the insert still
+   * sees `idle`; inserts while running are steering, not new tasks.
+   */
+  const disposeInbox = ctx.on('agent/inbox/inserted', (payload) => {
+    resetTaskOnFreshUserMessage(payload.agent.id)
+  })
+
+  /** Track running/idle per agent for the task-boundary reset. */
+  const disposeStatus = ctx.on('agent/status', (payload) => {
+    agentStatus.set(payload.agent.id, payload.status)
+    capMap(agentStatus, 128)
+  })
+
   ctx.effect(() => () => {
     lifetime.abort(new Error('system1: plugin disposed'))
     disposeTriage()
     disposeTools()
     disposePreExecute()
     disposeTurnStopping()
+    disposeRequest()
+    disposeRequestError()
+    disposeInbox()
+    disposeStatus()
     // Backend teardown is best-effort; a failure here must not break disposal.
     /* v8 ignore next -- defensive: teardown failures must not break disposal */
     void backend.dispose().catch(() => undefined)
