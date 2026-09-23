@@ -20,6 +20,7 @@
  * the decision path.
  */
 
+import type { InformationalEventIntent } from '@deepseek-ai/dsh-session'
 import type {
   System1BackendKind,
   System1FallbackReason,
@@ -78,11 +79,15 @@ export interface System1DecisionActedPayload {
 /**
  * The narrow session surface the telemetry helpers need. The real
  * `Session` satisfies this structurally; tests use a lightweight stub
- * instead of casting.
+ * instead of casting. The trailing marker is required (not optional):
+ * every telemetry append stamps `{ ignorable: true }` so builds that do
+ * not know the System 1 event types can still read the log, and the
+ * required parameter keeps `Session`'s generic conditional signature
+ * assignable under `exactOptionalPropertyTypes`.
  */
 export interface TelemetrySession {
-  append(type: 'system1/decision', data: System1DecisionPayload): unknown
-  append(type: 'system1/decision-acted', data: System1DecisionActedPayload): unknown
+  append(type: 'system1/decision', data: System1DecisionPayload, opts: InformationalEventIntent): unknown
+  append(type: 'system1/decision-acted', data: System1DecisionActedPayload, opts: InformationalEventIntent): unknown
 }
 
 /**
@@ -110,7 +115,7 @@ export function appendDecisionEvent(session: TelemetrySession, trace: System1Tra
       acted: trace.acted,
       ...(trace.model === undefined ? {} : { model: trace.model }),
       ...(trace.note === undefined ? {} : { note: trace.note }),
-    })
+    }, { ignorable: true })
     return true
   } catch {
     // A closed or foreign session must not break the harness.
@@ -127,7 +132,7 @@ export function appendDecisionEvent(session: TelemetrySession, trace: System1Tra
  */
 export function appendDecisionActedEvent(session: TelemetrySession, traceId: string): boolean {
   try {
-    session.append('system1/decision-acted', { traceId, at: Date.now() })
+    session.append('system1/decision-acted', { traceId, at: Date.now() }, { ignorable: true })
     return true
   } catch {
     return false

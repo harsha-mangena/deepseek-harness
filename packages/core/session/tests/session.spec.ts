@@ -31,6 +31,45 @@ describe('Session', () => {
     expect(surface).toBe(session.surface)
   })
 
+  describe('informational event intent', () => {
+    it('stamps ignorable on a non-surface event when requested', () => {
+      const session = Session.create(SessionId('ignorable-stamped'))
+      const event = session.append('turn/start', { turn: 1 }, { ignorable: true })
+      expect(event.ignorable).toBe(true)
+      // The marker is a plain JSON boolean on the persisted envelope.
+      const wire = JSON.parse(JSON.stringify(event)) as { ignorable?: unknown }
+      expect(wire.ignorable).toBe(true)
+    })
+
+    it('leaves non-surface events required by default', () => {
+      const session = Session.create(SessionId('ignorable-default'))
+      const bare = session.append('turn/start', { turn: 1 })
+      expect('ignorable' in bare).toBe(false)
+      const emptyOpts = session.append('turn/start', { turn: 2 }, {})
+      expect('ignorable' in emptyOpts).toBe(false)
+    })
+
+    it('keeps the marker through a seed round-trip', () => {
+      const session = Session.create(SessionId('ignorable-seed'))
+      session.append('turn/start', { turn: 1 }, { ignorable: true })
+      const seed = structuredClone(session.snapshotEvents())
+      const replayed = Session.create(SessionId('ignorable-seed-replay'), seed)
+      expect(replayed.snapshotEvents()[0]?.ignorable).toBe(true)
+    })
+
+    it('rejects the marker on surface events', () => {
+      const session = Session.create(SessionId('ignorable-surface'))
+      const message = createUserMessage({
+        content: [{ type: 'text', text: 'hi' }],
+        source: { kind: 'user' },
+      })
+      expect(() =>
+        // @ts-expect-error -- surface events can never be marked ignorable.
+        session.append('user/message', message, { ignorable: true }),
+      ).toThrow(/requires a surfaceOp marker/)
+    })
+  })
+
   it('derives message history from the event log', () => {
     const session = Session.create(SessionId('s1'))
     session.append('turn/start', { turn: 1 })

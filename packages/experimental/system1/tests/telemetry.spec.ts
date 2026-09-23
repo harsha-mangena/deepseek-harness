@@ -12,13 +12,14 @@ import type { System1Trace } from '../src/types.ts'
 interface AppendedEvent {
   type: string
   data: Record<string, unknown>
+  opts?: { ignorable?: true } | undefined
 }
 
 function mockSession(events: AppendedEvent[], throws = false): TelemetrySession {
   return {
-    append(type: string, data: Record<string, unknown>) {
+    append(type: string, data: Record<string, unknown>, opts?: { ignorable?: true }) {
       if (throws) throw new Error('session closed')
-      events.push({ type, data })
+      events.push({ type, data, opts })
       return { seq: events.length }
     },
   }
@@ -51,6 +52,13 @@ describe('appendDecisionEvent', () => {
     expect(events[0]?.data.acted).toBe(false)
   })
 
+  it('marks the decision event ignorable so foreign builds can read the log', () => {
+    const events: AppendedEvent[] = []
+    const session = mockSession(events)
+    appendDecisionEvent(session, trace())
+    expect(events[0]?.opts).toEqual({ ignorable: true })
+  })
+
   it('records fallbacks and models when present', () => {
     const events: AppendedEvent[] = []
     const session = mockSession(events)
@@ -76,6 +84,13 @@ describe('appendDecisionActedEvent', () => {
     expect(events[0]?.type).toBe('system1/decision-acted')
     expect(events[0]?.data.traceId).toBe('trace-1')
     expect(typeof events[0]?.data.at).toBe('number')
+  })
+
+  it('marks the decision-acted event ignorable so foreign builds can read the log', () => {
+    const events: AppendedEvent[] = []
+    const session = mockSession(events)
+    appendDecisionActedEvent(session, 'trace-1')
+    expect(events[0]?.opts).toEqual({ ignorable: true })
   })
 
   it('returns false instead of throwing on a closed session', () => {
