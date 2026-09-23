@@ -12,8 +12,12 @@
  * This integration runs shadow-first: every gate is evaluated against real
  * traffic and recorded as a structured trace, but the loop's behavior never
  * changes. In `assist` mode the plugin additionally logs loop hints in the
- * style of the repeat-tool reminder; `enforce` actuation is deferred (see
- * README "Deferred Work").
+ * style of the repeat-tool reminder. In `enforce` mode the judgments actuate:
+ * triage selects a reasoning strategy (atom/chain/tree of thoughts) injected
+ * as a hint before the step, loop-check injects a nudge when the agent looks
+ * stuck, and retry-judgment advises the agent on failed tool calls. Every
+ * actuation is bounded (timeouts, budgets, nudge caps) and any failure falls
+ * back to existing harness behavior.
  *
  * Laya (local sidecar) is currently deferred — see README.
  *
@@ -22,15 +26,19 @@
 
 import type { Context, Events } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
+import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
+import type { PostToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import type { System1Backend } from './backend.ts'
 import { JevBackend } from './backends/jev.ts'
 import { LayaBackend, type BackendLogger } from './backends/laya.ts'
 import { NullBackend } from './backends/null.ts'
 import {
   argsKeyOf,
+  buildLoopNudge,
   buildLoopQuestion,
+  buildRetryHint,
   buildRetryQuestion,
+  buildStrategyHint,
   buildTriageQuestion,
   detectLoop,
   validateLoopAnswer,
@@ -40,10 +48,12 @@ import {
 } from './gates.ts'
 import { System1Service } from './service.ts'
 import type {
+  RetryVerdict,
   System1BackendKind,
   System1Decision,
   System1Mode,
   System1Question,
+  System1QuestionKind,
   System1RuntimeConfig,
 } from './types.ts'
 
@@ -92,6 +102,10 @@ export interface Config {
   layaAutoStart: boolean
   /** Command used to start the local Laya sidecar. */
   layaCommand: string[]
+  /** Stuck probability at or above which a loop-check triggers a nudge (0..1). */
+  loopStuckThreshold: number
+  /** Max loop nudges injected per agent task; further stuck episodes only warn. */
+  maxLoopNudgesPerTask: number
 }
 
 /** Runtime schema for {@link Config}. */
@@ -112,12 +126,14 @@ export const Config: z<Config> = z.object({
   layaEndpoint: z.string().min(1).default('http://127.0.0.1:17840/decide'),
   layaAutoStart: z.boolean().default(true),
   layaCommand: z.array(z.string()).min(1).default(['python3', '-m', 'laya_serve']),
+  loopStuckThreshold: z.percent().default(0.7),
+  maxLoopNudgesPerTask: z.natural().default(2),
 })
 
 type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
-
-/** Probability above which a loop-check noul counts as "stuck". Lives in code, not the prompt. */
-const LOOP_STUCK_THRESHOLD = 0.7
+type PreStepNext = Parameters<Events['agent/pre-step']>[1]
+type PreStepDecision = Awaited<ReturnType<PreStepNext>>
+type PostExecuteNext = Parameters<Events['tools/post-execute']>[2]
 
 function toRuntimeConfig(config: Config): System1RuntimeConfig {
   return {
@@ -137,6 +153,8 @@ function toRuntimeConfig(config: Config): System1RuntimeConfig {
     layaEndpoint: config.layaEndpoint,
     layaAutoStart: config.layaAutoStart,
     layaCommand: config.layaCommand,
+    loopStuckThreshold: config.loopStuckThreshold,
+    maxLoopNudgesPerTask: config.maxLoopNudgesPerTask,
   }
 }
 
@@ -155,10 +173,10 @@ function createBackend(runtime: System1RuntimeConfig, logger: BackendLogger): Sy
 export const MAX_TRACKED_AGENTS = 64
 
 /**
- * Bounded per-agent tracking state for loop detection and turn resets.
- * Noting a new agent past `maxAgents` evicts the least-recently-noted
- * agent's history and turn marker, so long-running hosts cannot grow these
- * maps without bound. Exported for tests.
+ * Bounded per-agent tracking state for loop detection, turn resets, and
+ * loop-nudge budgets. Noting a new agent past `maxAgents` evicts the
+ * least-recently-noted agent's history, turn marker, and nudge state, so
+ * long-running hosts cannot grow these maps without bound. Exported for tests.
  *
  * @internal
  */
@@ -167,17 +185,27 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
   readonly histories: Map<string, ObservedToolCall[]>
   /** Last seen turn per agent; `note` eviction keeps this bounded. */
   readonly turns: Map<string, number>
+  /** Loop nudges injected this task per agent; reset by `resetTask`. */
+  readonly loopNudges: Map<string, number>
+  /** Last nudge episode key per agent; suppresses repeat nudges for the same streak. */
+  readonly lastNudgeKey: Map<string, string>
   /**
    * Ensure tracking state exists for `agentId`, evicting the oldest agent
    * when over budget. Returns the agent's loop history.
    */
   note(agentId: string): ObservedToolCall[]
+  /** Clear per-task nudge state; call when a new agent task starts. */
+  resetTask(agentId: string): void
 } {
   const histories = new Map<string, ObservedToolCall[]>()
   const turns = new Map<string, number>()
+  const loopNudges = new Map<string, number>()
+  const lastNudgeKey = new Map<string, string>()
   return {
     histories,
     turns,
+    loopNudges,
+    lastNudgeKey,
     note(agentId: string): ObservedToolCall[] {
       const existing = histories.get(agentId)
       if (existing !== undefined) return existing
@@ -186,18 +214,30 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
         const oldest = histories.keys().next().value as string
         histories.delete(oldest)
         turns.delete(oldest)
+        loopNudges.delete(oldest)
+        lastNudgeKey.delete(oldest)
       }
       const history: ObservedToolCall[] = []
       histories.set(agentId, history)
       return history
     },
+    resetTask(agentId: string): void {
+      loopNudges.delete(agentId)
+      lastNudgeKey.delete(agentId)
+    },
   }
 }
 
 /**
- * Install System 1 shadow observers on the agent loop. Listeners always
- * delegate first (`next()`) and observe afterwards, so a slow or failing
- * backend can never change or delay loop behavior.
+ * Install System 1 observers on the agent loop.
+ *
+ * Shadow/assist listeners always delegate first (`next()`) and observe
+ * afterwards, so a slow or failing backend can never change or delay loop
+ * behavior. Enforce listeners judge first (bounded by the service timeout;
+ * the service never rejects) and inject guidance — a triage strategy hint
+ * before the step, loop nudges and retry hints after tool calls — then
+ * delegate. Any fallback resolves to "no injection", so the loop always
+ * continues with existing behavior.
  *
  * Shadow observations run on the plugin's own lifetime signal, bounded by
  * the service timeout — not on the step/tool signals handed to the
@@ -205,7 +245,8 @@ export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
  * aborted after the waterfall settles while a fire-and-forget observation
  * is still in flight; letting them cancel the observation would poison the
  * circuit breaker with backend-error fallbacks that say nothing about
- * backend health.
+ * backend health. Enforce judgments use the step/tool signal instead: when
+ * the turn is cancelled, its guidance is moot.
  *
  * @param ctx - plugin context that owns the listeners and backend lifetime.
  * @param config - validated {@link Config}.
@@ -217,21 +258,66 @@ export function apply(ctx: Context, config: Config): void {
   const service = new System1Service(backend, runtime)
   const agents = createAgentState()
   const lifetime = new AbortController()
+  const enforce = config.mode === 'enforce'
 
-  if (config.mode === 'enforce') {
-    ctx.logger.warn('system1: enforce-mode actuation is deferred; running with assist behavior')
+  /**
+   * Track the agent's turn; a new agent or a turn-number reset starts a new
+   * task, which refreshes budgets and the loop-nudge allowance. Also wires
+   * the service's per-task reset, which previously never fired.
+   */
+  function trackTurn(agentId: string, turn: number): void {
+    agents.note(agentId)
+    const prev = agents.turns.get(agentId)
+    agents.turns.set(agentId, turn)
+    if (prev === undefined || turn < prev) {
+      service.resetTask()
+      agents.resetTask(agentId)
+    } else if (turn !== prev) {
+      service.resetTurn()
+    }
+  }
+
+  /** One System 1 guidance message, sourced so the agent knows who is talking. */
+  function guidance(text: string): UserMessage {
+    return createUserMessage({
+      content: [{ type: 'text', text }],
+      source: { kind: 'system1' },
+    })
+  }
+
+  /**
+   * Whether a loop nudge may be injected for this agent/episode: at most
+   * `maxLoopNudgesPerTask` per task, and never twice for the same streak.
+   */
+  function admitNudge(agentId: string, episodeKey: string): boolean {
+    if (agents.lastNudgeKey.get(agentId) === episodeKey) return false
+    const used = agents.loopNudges.get(agentId) ?? 0
+    if (used >= config.maxLoopNudgesPerTask) return false
+    agents.loopNudges.set(agentId, used + 1)
+    agents.lastNudgeKey.set(agentId, episodeKey)
+    return true
   }
 
   /** Classify the incoming step; shadow only, the decision always passes through. */
   async function observeStep(payload: PreStepPayload): Promise<void> {
-    const agentId = payload.agent.id
-    agents.note(agentId)
-    if (agents.turns.get(agentId) !== payload.turn) {
-      agents.turns.set(agentId, payload.turn)
-      service.resetTurn()
-    }
+    trackTurn(payload.agent.id, payload.turn)
     const question = buildTriageQuestion(payload.messages)
     await service.ask(question, 'turn', lifetime.signal, validateTriage)
+  }
+
+  /**
+   * Enforce: judge the step first (bounded; never rejects), then enter with
+   * a reasoning-strategy hint selected by the triage verdict — atom, chain,
+   * or tree of thoughts. No verdict, no hint.
+   */
+  async function enforceStep(payload: PreStepPayload, next: PreStepNext): Promise<PreStepDecision> {
+    trackTurn(payload.agent.id, payload.turn)
+    const triage = await service.ask(buildTriageQuestion(payload.messages), 'turn', payload.signal, validateTriage)
+    const decision = await next()
+    if (decision.kind === 'reject' || decision.messages.length === 0) return decision
+    if (triage.value === null) return decision
+    service.markActed(triage.trace.id)
+    return { ...decision, messages: [...decision.messages, guidance(buildStrategyHint(triage.value))] }
   }
 
   /**
@@ -285,7 +371,7 @@ export function apply(ctx: Context, config: Config): void {
     if (
       firstQuestion.kind === 'loop-check'
       && typeof loopDecision.value === 'number'
-      && loopDecision.value >= LOOP_STUCK_THRESHOLD
+      && loopDecision.value >= config.loopStuckThreshold
       && config.mode !== 'shadow'
     ) {
       ctx.logger.warn(
@@ -294,7 +380,90 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * Enforce: judge the tool result first (one batch, bounded), then accept
+   * with injected guidance — a loop nudge when the agent looks stuck, a
+   * retry hint when the call failed. A blocked call is returned untouched.
+   */
+  async function enforceToolCall(
+    exec: ToolExecution,
+    result: ToolExecutionResult,
+    next: PostExecuteNext,
+  ): Promise<PostToolDecision> {
+    const agentId = exec.agent?.id ?? 'unknown-agent'
+    const entry: ObservedToolCall = {
+      name: exec.name,
+      argsKey: argsKeyOf(exec.arguments),
+      isError: result.isError,
+      at: Date.now(),
+    }
+    const history = agents.note(agentId)
+    history.push(entry)
+    while (history.length > 12) history.shift()
+
+    const contexts: UserMessage[] = []
+    const loop = detectLoop(history)
+    if (loop.looping) {
+      // Deterministic signal: nudge without spending a model call.
+      if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#${loop.repetitions}`)) {
+        contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, null, loop.suggestion)))
+      }
+      ctx.logger.warn(
+        `system1: possible tool loop for agent ${agentId}: "${entry.name}" repeated ${loop.repetitions}x (suggestion: ${loop.suggestion})`,
+      )
+      const decision = await next()
+      return withContexts(decision, contexts)
+    }
+
+    const questions: System1Question[] = []
+    const validators: Array<(answer: unknown) => unknown> = []
+    const kinds: System1QuestionKind[] = []
+    if (loop.repetitions >= 2) {
+      questions.push(buildLoopQuestion(history))
+      validators.push(validateLoopAnswer)
+      kinds.push('loop-check')
+    }
+    if (result.isError) {
+      questions.push(buildRetryQuestion(entry.name, entry.argsKey, result.error.message))
+      validators.push(validateRetry)
+      kinds.push('retry-judgment')
+    }
+    const decisions = questions.length > 0
+      ? await service.askMany(questions, validators, 'turn', exec.signal)
+      : []
+
+    const decision = await next()
+    decisions.forEach((judged, index) => {
+      const kind = kinds[index]
+      if (judged.value === null || kind === undefined) return
+      if (kind === 'loop-check' && typeof judged.value === 'number' && judged.value >= config.loopStuckThreshold) {
+        ctx.logger.warn(
+          `system1: jev judges agent ${agentId} stuck (p=${judged.value.toFixed(2)}, model=${judged.trace.model ?? 'unknown'})`,
+        )
+        if (admitNudge(agentId, `${entry.name}:${entry.argsKey}#stuck:${judged.value.toFixed(2)}`)) {
+          contexts.push(guidance(buildLoopNudge(entry.name, loop.repetitions, judged.value, 'interrupt')))
+          service.markActed(judged.trace.id)
+        }
+        return
+      }
+      if (kind === 'retry-judgment' && typeof judged.value === 'string') {
+        // The retry validator passed, so the string is a RetryVerdict.
+        const verdict = judged.value as RetryVerdict
+        contexts.push(guidance(buildRetryHint(verdict, entry.name)))
+        service.markActed(judged.trace.id)
+      }
+    })
+    return withContexts(decision, contexts)
+  }
+
+  /** Fold injected guidance into an accepted tool decision; blocks pass through untouched. */
+  function withContexts(decision: PostToolDecision, contexts: UserMessage[]): PostToolDecision {
+    if (decision.kind === 'block' || contexts.length === 0) return decision
+    return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), ...contexts] }
+  }
+
   const disposeTriage = ctx.on('agent/pre-step', async (payload, next) => {
+    if (enforce) return await enforceStep(payload, next)
     const decision = await next()
     // Observation runs after delegation and never feeds back into the decision.
     // The service never rejects, so the catch is purely defensive: a
@@ -305,6 +474,7 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   const disposeTools = ctx.on('tools/post-execute', async (exec, result, next) => {
+    if (enforce) return await enforceToolCall(exec, result, next)
     const decision = await next()
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
     void observeToolCall(exec, result).catch(() => undefined)

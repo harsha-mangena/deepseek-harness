@@ -27,6 +27,8 @@ function testConfig(overrides: Partial<System1RuntimeConfig> = {}): System1Runti
     layaEndpoint: 'http://127.0.0.1:17840/decide',
     layaAutoStart: true,
     layaCommand: ['python3', '-m', 'laya_serve'],
+    loopStuckThreshold: 0.7,
+    maxLoopNudgesPerTask: 2,
     ...overrides,
   }
 }
@@ -394,5 +396,30 @@ describe('System1Service.askMany', () => {
     const service = new System1Service(backend, testConfig())
     expect(await service.askMany([], [], 'turn', new AbortController().signal)).toEqual([])
     expect(touched).toBe(false)
+  })
+})
+
+describe('markActed', () => {
+  it('flips acted on the recorded trace without mutating other fields', async () => {
+    const service = new System1Service(scriptedBackend([single('trivial', 0.9)]), testConfig())
+    const decision = await service.ask(question, 'turn', new AbortController().signal, (a) => {
+      return a === 'trivial' ? 'trivial' : null
+    })
+    expect(decision.trace.acted).toBe(false)
+    service.markActed(decision.trace.id)
+    const traces = service.getTraces()
+    expect(traces).toHaveLength(1)
+    expect(traces[0]!.acted).toBe(true)
+    expect(traces[0]!.id).toBe(decision.trace.id)
+    expect(traces[0]!.fallback).toBe(decision.trace.fallback)
+  })
+
+  it('ignores unknown trace ids', async () => {
+    const service = new System1Service(scriptedBackend([single('trivial', 0.9)]), testConfig())
+    await service.ask(question, 'turn', new AbortController().signal, (a) => {
+      return a === 'trivial' ? 'trivial' : null
+    })
+    expect(() => { service.markActed('no-such-trace') }).not.toThrow()
+    expect(service.getTraces()[0]!.acted).toBe(false)
   })
 })

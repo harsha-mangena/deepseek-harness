@@ -144,6 +144,10 @@ export interface System1RuntimeConfig {
   readonly layaAutoStart: boolean
   /** Command used to start a local Laya sidecar on demand. */
   readonly layaCommand: readonly string[]
+  /** Stuck probability at or above which a loop-check triggers a nudge (0..1). */
+  readonly loopStuckThreshold: number
+  /** Max loop nudges injected per agent task; further stuck episodes only warn. */
+  readonly maxLoopNudgesPerTask: number
 }
 
 /** Triage verdict for one proposed agent step. */
@@ -157,4 +161,11 @@ export interface LoopCheckVerdict {
   readonly looping: boolean
   readonly repetitions: number
   readonly suggestion: 'continue' | 'interrupt' | 'ask-user'
+}
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** System 1 injected guidance: triage strategy hints, loop nudges, retry hints. */
+    system1: { kind: 'system1' }
+  }
 }

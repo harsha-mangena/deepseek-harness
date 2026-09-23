@@ -119,6 +119,18 @@ export class System1Service {
     return this.traces
   }
 
+  /**
+   * Mark a previously recorded trace as acted-upon: the harness injected
+   * guidance because of this judgment. No-op for unknown ids; traces are
+   * replaced immutably so readers never see a half-updated record.
+   */
+  markActed(traceId: string): void {
+    const index = this.traces.findIndex(trace => trace.id === traceId)
+    if (index === -1) return
+    const trace = this.traces[index] as System1Trace
+    this.traces[index] = { ...trace, acted: true }
+  }
+
   private circuitOpen(): boolean {
     if (this.circuitOpenedAt === null) return false
     if (Date.now() - this.circuitOpenedAt < this.config.cooldownMs) return true

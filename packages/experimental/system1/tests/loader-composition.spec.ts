@@ -459,21 +459,28 @@ it('registers no listeners when disabled', async () => {
   expect(jevCalls).toHaveLength(0)
 })
 
-it('warns that enforce actuation is deferred but still observes', async () => {
+it('actuates in enforce mode instead of warning that actuation is deferred', async () => {
   const spies: Array<ReturnType<typeof vi.spyOn>> = []
   const context = await boot(
     { backend: 'jev', mode: 'enforce' },
     (fresh) => { spies.push(vi.spyOn(fresh.logger, 'warn')) },
   )
-  expect(spies[0]).toHaveBeenCalledWith(expect.stringContaining('enforce-mode actuation is deferred'))
-  await context.waterfall(
+  expect(spies[0]).not.toHaveBeenCalledWith(expect.stringContaining('enforce-mode actuation is deferred'))
+  const base = preStepPayload(context, 'synthetic-enforce', new AbortController().signal)
+  const userMessage = createUserMessage({ content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } })
+  const payload = { ...base, messages: [userMessage] }
+  const decision = await context.waterfall(
     'agent/pre-step',
-    preStepPayload(context, 'synthetic-enforce', new AbortController().signal),
-    () => Promise.resolve({ kind: 'enter', messages: [] }),
+    payload,
+    () => Promise.resolve({ kind: 'enter', messages: payload.messages }),
   )
+  // The stubbed triage answers 'trivial': the step enters with a strategy hint.
   await vi.waitFor(() => {
     expect(jevCalls).toHaveLength(1)
   })
+  expect(decision.kind).toBe('enter')
+  if (decision.kind !== 'enter') return
+  expect(decision.messages.length).toBeGreaterThan(payload.messages.length)
 })
 
 it('supports the none backend without any network call', async () => {

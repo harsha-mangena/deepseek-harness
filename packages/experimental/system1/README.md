@@ -47,7 +47,7 @@ Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay
 
 - `shadow` (default): trace only. The loop never changes.
 - `assist`: trace plus `warn`-level loop hints — both from the deterministic loop check and from high-probability Jev loop judgments.
-- `enforce`: currently behaves as `assist` with a one-time warning — actuation is deferred (see below).
+- `enforce`: judgments actuate. Triage injects a reasoning-strategy hint before each step (trivial → direct atomic answer, standard → step-by-step, complex → atomic decomposition with 2–3 alternative approaches), loop-check injects a nudge when the agent looks stuck (bounded per task and per episode), and retry-judgment advises on failed tool calls. Any fallback — abstention, low confidence, timeout, backend error, exhausted budget — injects nothing and the loop continues unchanged.
 
 ## Configuration
 
@@ -67,6 +67,8 @@ All tunables are Schemastery-validated with safe defaults:
 | `jevEndpoint` | `'https://api.typesafe.ai/v1/systemone'` | Jev endpoint |
 | `jevModel` | `'jev-latest'` | Model alias; pin (e.g. `jev-1.13.0`) once thresholds are tuned |
 | `layaEndpoint` / `layaAutoStart` / `layaCommand` | see `src/index.ts` | Laya sidecar wiring (deferred) |
+| `loopStuckThreshold` | `0.7` | Stuck probability at/above which a loop-check nudges (enforce) |
+| `maxLoopNudgesPerTask` | `2` | Max loop nudges injected per agent task (enforce) |
 
 ### Getting a Jev key
 
@@ -80,7 +82,7 @@ Pin `jevModel` to the versioned id from your traces once you tune `confidenceThr
 
 ## Known Limitations
 
-- **No live verification yet.** The wire format matches TypeSafe's documented `POST /v1/systemone` shape (`model` + `state` + typed `questions`; per-question `answers`; `model` echo), but it has not been exercised against the real API — that needs a waitlisted `TYPESAFE_API_KEY`.
+- **Live verification done (2026-09-23).** The wire format was exercised against the real `POST /v1/systemone` API: 6/6 direct judgments sensible (triage trivial/standard, loop stuck-p 0.86 on x4-identical history vs 0.15 healthy, retry→retry on timeout, give-up on bad args), plus real-model E2E benchmarks with/without Jev. See `~/workspace/system1-jev-validation-results.md`.
 - **Laya sidecar shape is provisional and deferred.** The `/health` + `POST /decide` contract in `src/sidecar.ts` is unverified; Laya is not the current focus.
 - **Tool shortlist is not wired.** Hierarchical tool selection needs the tool-catalog access point identified; only triage, loop-check, and retry-judgment run in this change.
 - **No session events.** Traces live in a per-plugin in-memory ring buffer and do not survive restarts. Durable `system1/*` session events are deferred (they carry persistence/versioning requirements).
@@ -88,7 +90,6 @@ Pin `jevModel` to the versioned id from your traces once you tune `confidenceThr
 
 ## Deferred Work
 
-- `enforce`-mode actuation (e.g. pre-step reject on high-confidence trivial triage, loop interruption) behind evaluation evidence.
 - Wiring the tool-shortlist gate into request preparation.
 - Secure Vault settings UI for the Jev API key (currently env-var only).
 - Durable trace persistence and a shadow-replay benchmark harness.

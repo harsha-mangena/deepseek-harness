@@ -164,6 +164,50 @@ export function validateDelegation(answer: unknown): boolean | null {
 }
 
 /**
+ * Strategy hint for a triage verdict: System 1 (fast thinking) telling the
+ * agent how much slow thinking the step deserves. This is where the
+ * atom/chain/tree-of-thoughts strategies plug in — the verdict selects the
+ * reasoning shape, the agent loop executes it.
+ */
+export function buildStrategyHint(verdict: TriageVerdict): string {
+  switch (verdict) {
+    case 'trivial':
+      return '[System 1 triage: trivial] This step looks routine. Answer directly with minimal deliberation — a single atomic step, no extended reasoning.'
+    case 'complex':
+      return '[System 1 triage: complex] This step needs full reasoning. Break it into atomic sub-steps, and before committing to an approach, consider 2–3 alternative approaches and pick the most promising one.'
+    case 'standard':
+      return '[System 1 triage: standard] Proceed with normal step-by-step reasoning.'
+  }
+}
+
+/**
+ * Nudge for a suspected tool loop. `stuckProbability` is the Jev loop-check
+ * noul when available; null when the nudge comes from the deterministic
+ * detector alone.
+ */
+export function buildLoopNudge(
+  toolName: string,
+  repetitions: number,
+  stuckProbability: number | null,
+  suggestion: string,
+): string {
+  const probability = stuckProbability === null ? 'unknown' : stuckProbability.toFixed(2)
+  return `[System 1 loop-check] You appear to be repeating the same tool call ("${toolName}" ×${repetitions}, stuck probability ${probability}). Stop and reconsider before acting again: try a different approach, check your assumptions, or summarize what you have learned so far. Suggested next move: ${suggestion}.`
+}
+
+/** Hint carrying a retry-judgment verdict to the agent after a tool failure. */
+export function buildRetryHint(verdict: RetryVerdict, toolName: string): string {
+  switch (verdict) {
+    case 'retry':
+      return `[System 1 retry-judgment] The "${toolName}" failure looks transient — retrying the identical call is reasonable.`
+    case 'retry-different':
+      return `[System 1 retry-judgment] The "${toolName}" call itself looks wrong — retry with different arguments rather than repeating this one.`
+    case 'give-up':
+      return `[System 1 retry-judgment] Retrying "${toolName}" looks futile — do not retry this call; surface the failure and move on.`
+  }
+}
+
+/**
  * Stable string key for tool arguments, used for repetition comparison.
  * Falls back to String() when JSON serialization fails.
  */

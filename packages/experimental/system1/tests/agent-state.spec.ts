@@ -37,3 +37,27 @@ describe('createAgentState', () => {
     expect(agents.histories.has(`agent-${MAX_TRACKED_AGENTS}`)).toBe(true)
   })
 })
+
+describe('nudge state', () => {
+  it('tracks and resets per-task nudge state', () => {
+    const agents = createAgentState(2)
+    agents.note('a1')
+    agents.loopNudges.set('a1', 2)
+    agents.lastNudgeKey.set('a1', 'read#3')
+    agents.resetTask('a1')
+    expect(agents.loopNudges.has('a1')).toBe(false)
+    expect(agents.lastNudgeKey.has('a1')).toBe(false)
+    expect(agents.histories.has('a1')).toBe(true)
+  })
+
+  it('evicts nudge state with the oldest agent', () => {
+    const agents = createAgentState(2)
+    agents.note('a1')
+    agents.loopNudges.set('a1', 1)
+    agents.lastNudgeKey.set('a1', 'read#3')
+    agents.note('a2')
+    agents.note('a3')
+    expect(agents.loopNudges.has('a1')).toBe(false)
+    expect(agents.lastNudgeKey.has('a1')).toBe(false)
+  })
+})
