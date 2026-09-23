@@ -124,7 +124,7 @@ export interface System1RuntimeConfig {
   readonly budgetPerTurn: number
   /** Max System 1 questions per agent task. */
   readonly budgetPerTask: number
-  /** Per-batch backend timeout in milliseconds. */
+  /** Per-batch backend timeout in milliseconds. 0 disables the timeout (not recommended for network backends). */
   readonly timeoutMs: number
   /** Consecutive backend failures before the circuit opens. */
   readonly failureThreshold: number

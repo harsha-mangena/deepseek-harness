@@ -56,6 +56,11 @@ describe('detectLoop', () => {
     expect(verdict.looping).toBe(false)
     expect(verdict.repetitions).toBe(2)
   })
+
+  it('reports no loop for a sparse history with no last entry', () => {
+    const sparse = Array.from({ length: 1 }) as ObservedToolCall[]
+    expect(detectLoop(sparse)).toEqual({ looping: false, repetitions: 0, suggestion: 'continue' })
+  })
 })
 
 describe('question builders', () => {
@@ -65,6 +70,13 @@ describe('question builders', () => {
     expect(q.primitive).toBe('choice')
     expect(Object.keys(q.options ?? {}).sort()).toEqual(['complex', 'standard', 'trivial'])
     expect(q.prompt.length).toBeGreaterThan(0)
+  })
+
+  it('skips messages that fail JSON serialization', () => {
+    const circular: Record<string, unknown> = {}
+    circular['self'] = circular
+    const q = buildTriageQuestion([circular])
+    expect(q.kind).toBe('triage')
   })
 
   it('builds a loop-check noul over recent history', () => {
@@ -131,5 +143,9 @@ describe('argsKeyOf', () => {
     const circular: Record<string, unknown> = {}
     circular['self'] = circular
     expect(typeof argsKeyOf(circular)).toBe('string')
+  })
+
+  it('stringifies values JSON cannot represent', () => {
+    expect(argsKeyOf(undefined)).toBe('undefined')
   })
 })

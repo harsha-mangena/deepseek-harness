@@ -21,17 +21,19 @@ Efficiency is structural, not aspirational:
 - **Code does what code can compute.** Exact tool-call repetition is detected by `detectLoop()` locally — Jev is never asked to count. State sent per question is scoped to what that question needs.
 - **Timeouts abort the socket.** A timed-out batch aborts the underlying HTTP request instead of letting it linger.
 - **Budgets count questions, not batches**, because each question costs input tokens (output is free).
+- **Observations outlive the turn.** Shadow observations run on the plugin's own lifetime signal, not the step/tool signals handed to the listeners — those may abort after the waterfall settles while a fire-and-forget observation is still in flight. Letting them cancel the observation would poison the circuit breaker with backend errors that say nothing about backend health.
+- **Agent tracking is bounded.** Loop history and turn markers are kept for at most 64 distinct agents; noting a new agent past the bound evicts the oldest agent's state, so long-running hosts cannot grow these maps without bound.
 - Node's global fetch keeps connections alive, so repeated calls reuse the TLS session.
 
 `System1Service` runs every question through the same gates:
 
 1. **Disabled** → fallback when the plugin is off.
-2. **Circuit** → fallback while the backend is failing repeatedly (HTTP 429s included).
+2. **Circuit** → fallback while the backend is failing repeatedly (HTTP 429s included). A batch that comes back short — fewer judgments than questions — fills the gaps with `backend-error` fallbacks and counts once toward the failure threshold, so a silently dropping backend still trips the breaker.
 3. **Budget** → fallback when the per-turn/per-task question budget is spent.
 4. **Backend** → timeout converts to a fallback; errors never throw.
-5. **Abstention** → the backend may decline to answer.
+5. **Abstention** → the backend may decline to answer. A `noul` judgment that is missing, non-numeric, or non-finite is also an abstention — it never degrades into a fully-confident "not stuck" answer.
 6. **Confidence** → judgments below `confidenceThreshold` are dropped. For `noul` answers the confidence is `max(p, 1-p)`, so fence-sitting probabilities near 0.5 fail the gate.
-7. **Validation** → the raw answer must parse into the expected typed shape.
+7. **Validation** → the raw answer must parse into the expected typed shape. A throwing validator is contained: it produces a `backend-error` fallback instead of rejecting the batch.
 
 Every evaluation appends a `System1Trace` to an in-memory ring buffer for replay and tuning. The trace records the versioned `model` id Jev reports (e.g. `jev-1.13.0`), so threshold tuning can be pinned to a model version.
 
@@ -58,7 +60,7 @@ All tunables are Schemastery-validated with safe defaults:
 | `mode` | `'shadow'` | `'shadow' \| 'assist' \| 'enforce'` |
 | `confidenceThreshold` | `0.7` | Minimum judgment confidence (0..1) |
 | `budgetPerTurn` / `budgetPerTask` | `4` / `12` | Max System 1 questions |
-| `timeoutMs` | `1200` | Per-batch backend timeout (Jev answers in 70–500ms) |
+| `timeoutMs` | `1200` | Per-batch backend timeout (Jev answers in 70–500ms). `0` disables the timeout (not recommended for network backends) |
 | `failureThreshold` / `cooldownMs` | `3` / `30000` | Circuit breaker |
 | `traceBufferSize` | `200` | In-memory trace ring buffer |
 | `jevApiKeyEnv` | `'TYPESAFE_API_KEY'` | Env var naming the Jev key |

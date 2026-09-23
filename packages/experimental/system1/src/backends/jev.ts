@@ -81,7 +81,8 @@ function clamp01(value: unknown): number {
 /**
  * Map one Jev wire answer to a {@link System1Judgment}. For `noul` the answer
  * is the probability itself and confidence is `max(p, 1 - p)`, so wishy-washy
- * probabilities near 0.5 fail the service's confidence gate.
+ * probabilities near 0.5 fail the service's confidence gate. A missing or
+ * non-numeric `noul` abstains instead of degrading to a confident zero.
  */
 function toJudgment(
   question: System1Question,
@@ -104,6 +105,12 @@ function toJudgment(
     case 'score':
       return { ...base, answer: raw.score ?? null, confidence: clamp01(raw.confidence) }
     case 'noul': {
+      // A missing or non-numeric noul is a non-answer: abstain. Treating it
+      // as p=0 would manufacture a fully-confident "not stuck" judgment
+      // (confidence would be max(0, 1) = 1) that sails through the gate.
+      if (typeof raw.noul !== 'number' || !Number.isFinite(raw.noul)) {
+        return { ...base, answer: null, confidence: 0, abstained: true }
+      }
       const p = clamp01(raw.noul)
       return { ...base, answer: p, confidence: Math.max(p, 1 - p) }
     }

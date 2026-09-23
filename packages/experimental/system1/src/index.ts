@@ -41,6 +41,7 @@ import {
 import { System1Service } from './service.ts'
 import type {
   System1BackendKind,
+  System1Decision,
   System1Mode,
   System1Question,
   System1RuntimeConfig,
@@ -71,7 +72,7 @@ export interface Config {
   budgetPerTurn: number
   /** Max System 1 questions per agent task. */
   budgetPerTask: number
-  /** Per-batch backend timeout in milliseconds. Jev answers in 70-500ms. */
+  /** Per-batch backend timeout in milliseconds. 0 disables the timeout (not recommended for network backends). Jev answers in 70-500ms. */
   timeoutMs: number
   /** Consecutive backend failures before the circuit opens. */
   failureThreshold: number
@@ -150,10 +151,61 @@ function createBackend(runtime: System1RuntimeConfig, logger: BackendLogger): Sy
   }
 }
 
+/** Max distinct agents tracked for loop history and turn state. */
+export const MAX_TRACKED_AGENTS = 64
+
+/**
+ * Bounded per-agent tracking state for loop detection and turn resets.
+ * Noting a new agent past `maxAgents` evicts the least-recently-noted
+ * agent's history and turn marker, so long-running hosts cannot grow these
+ * maps without bound. Exported for tests.
+ *
+ * @internal
+ */
+export function createAgentState(maxAgents: number = MAX_TRACKED_AGENTS): {
+  /** Loop history per agent; `note` keeps this bounded. */
+  readonly histories: Map<string, ObservedToolCall[]>
+  /** Last seen turn per agent; `note` eviction keeps this bounded. */
+  readonly turns: Map<string, number>
+  /**
+   * Ensure tracking state exists for `agentId`, evicting the oldest agent
+   * when over budget. Returns the agent's loop history.
+   */
+  note(agentId: string): ObservedToolCall[]
+} {
+  const histories = new Map<string, ObservedToolCall[]>()
+  const turns = new Map<string, number>()
+  return {
+    histories,
+    turns,
+    note(agentId: string): ObservedToolCall[] {
+      const existing = histories.get(agentId)
+      if (existing !== undefined) return existing
+      if (histories.size >= Math.max(1, maxAgents)) {
+        // Non-empty here: size >= max(1, maxAgents) >= 1, so a key exists.
+        const oldest = histories.keys().next().value as string
+        histories.delete(oldest)
+        turns.delete(oldest)
+      }
+      const history: ObservedToolCall[] = []
+      histories.set(agentId, history)
+      return history
+    },
+  }
+}
+
 /**
  * Install System 1 shadow observers on the agent loop. Listeners always
  * delegate first (`next()`) and observe afterwards, so a slow or failing
  * backend can never change or delay loop behavior.
+ *
+ * Shadow observations run on the plugin's own lifetime signal, bounded by
+ * the service timeout — not on the step/tool signals handed to the
+ * listeners. Those belong to the turn and the tool execution and may be
+ * aborted after the waterfall settles while a fire-and-forget observation
+ * is still in flight; letting them cancel the observation would poison the
+ * circuit breaker with backend-error fallbacks that say nothing about
+ * backend health.
  *
  * @param ctx - plugin context that owns the listeners and backend lifetime.
  * @param config - validated {@link Config}.
@@ -163,8 +215,8 @@ export function apply(ctx: Context, config: Config): void {
   const runtime = toRuntimeConfig(config)
   const backend = createBackend(runtime, ctx.logger)
   const service = new System1Service(backend, runtime)
-  const recentCalls = new Map<string, ObservedToolCall[]>()
-  const lastTurn = new Map<string, number>()
+  const agents = createAgentState()
+  const lifetime = new AbortController()
 
   if (config.mode === 'enforce') {
     ctx.logger.warn('system1: enforce-mode actuation is deferred; running with assist behavior')
@@ -173,12 +225,13 @@ export function apply(ctx: Context, config: Config): void {
   /** Classify the incoming step; shadow only, the decision always passes through. */
   async function observeStep(payload: PreStepPayload): Promise<void> {
     const agentId = payload.agent.id
-    if (lastTurn.get(agentId) !== payload.turn) {
-      lastTurn.set(agentId, payload.turn)
+    agents.note(agentId)
+    if (agents.turns.get(agentId) !== payload.turn) {
+      agents.turns.set(agentId, payload.turn)
       service.resetTurn()
     }
     const question = buildTriageQuestion(payload.messages)
-    await service.ask(question, 'turn', payload.signal, validateTriage)
+    await service.ask(question, 'turn', lifetime.signal, validateTriage)
   }
 
   /**
@@ -195,10 +248,9 @@ export function apply(ctx: Context, config: Config): void {
       isError: result.isError,
       at: Date.now(),
     }
-    const history = recentCalls.get(agentId) ?? []
+    const history = agents.note(agentId)
     history.push(entry)
     while (history.length > 12) history.shift()
-    recentCalls.set(agentId, history)
 
     const loop = detectLoop(history)
     if (loop.looping) {
@@ -224,11 +276,15 @@ export function apply(ctx: Context, config: Config): void {
     }
     if (questions.length === 0) return
 
-    const decisions = await service.askMany(questions, validators, 'turn', exec.signal)
-    const loopDecision = decisions[0]
+    const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal)
+    // `questions` is non-empty here (early return above) and `askMany`
+    // resolves one decision per question in order, so both indexes are
+    // defined; the casts below satisfy `noUncheckedIndexedAccess`.
+    const firstQuestion = questions[0] as System1Question
+    const loopDecision = decisions[0] as System1Decision<unknown>
     if (
-      questions[0]?.kind === 'loop-check'
-      && typeof loopDecision?.value === 'number'
+      firstQuestion.kind === 'loop-check'
+      && typeof loopDecision.value === 'number'
       && loopDecision.value >= LOOP_STUCK_THRESHOLD
       && config.mode !== 'shadow'
     ) {
@@ -241,19 +297,26 @@ export function apply(ctx: Context, config: Config): void {
   const disposeTriage = ctx.on('agent/pre-step', async (payload, next) => {
     const decision = await next()
     // Observation runs after delegation and never feeds back into the decision.
+    // The service never rejects, so the catch is purely defensive: a
+    // fire-and-forget observation must not surface an unhandled rejection.
+    /* v8 ignore next -- defensive: System1Service.ask/askMany never reject */
     void observeStep(payload).catch(() => undefined)
     return decision
   })
 
   const disposeTools = ctx.on('tools/post-execute', async (exec, result, next) => {
     const decision = await next()
+    /* v8 ignore next -- defensive: System1Service.askMany never rejects */
     void observeToolCall(exec, result).catch(() => undefined)
     return decision
   })
 
   ctx.effect(() => () => {
+    lifetime.abort(new Error('system1: plugin disposed'))
     disposeTriage()
     disposeTools()
+    // Backend teardown is best-effort; a failure here must not break disposal.
+    /* v8 ignore next -- defensive: teardown failures must not break disposal */
     void backend.dispose().catch(() => undefined)
   }, 'system1: dispose listeners and backend')
 }

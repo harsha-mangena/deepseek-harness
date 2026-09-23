@@ -1,1 +1,37 @@
-{"devDependencies":{"@deepseek-ai/cordis":"workspace:^","@deepseek-ai/cosmokit":"workspace:^","@deepseek-ai/dsh-agent":"workspace:^","@deepseek-ai/dsh-llm":"workspace:^","@deepseek-ai/dsh-tools":"workspace:^","@deepseek-ai/schemastery":"workspace:^"},"exports":{".":{"default":"./lib/index.js","types":"./lib/types/index.d.ts"}},"files":["lib"],"main":"lib/index.js","name":"@deepseek-ai/dsh-experimental-system1","peerDependencies":{"@deepseek-ai/cordis":"workspace:^"},"publishConfig":{"access":"public"},"sideEffects":false,"type":"module","types":"lib/types/index.d.ts","version":"0.1.7-alpha.2"}
+{
+  "devDependencies": {
+    "@deepseek-ai/cordis": "workspace:^",
+    "@deepseek-ai/cordis-plugin-include": "workspace:^",
+    "@deepseek-ai/cordis-plugin-loader": "workspace:^",
+    "@deepseek-ai/cosmokit": "workspace:^",
+    "@deepseek-ai/dsh-agent": "workspace:^",
+    "@deepseek-ai/dsh-agent-loop": "workspace:^",
+    "@deepseek-ai/dsh-llm": "workspace:^",
+    "@deepseek-ai/dsh-session": "workspace:^",
+    "@deepseek-ai/dsh-session-projection": "workspace:^",
+    "@deepseek-ai/dsh-system-prompt": "workspace:^",
+    "@deepseek-ai/dsh-tools": "workspace:^",
+    "@deepseek-ai/schemastery": "workspace:^"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js",
+      "types": "./lib/types/index.d.ts"
+    }
+  },
+  "files": [
+    "lib"
+  ],
+  "main": "lib/index.js",
+  "name": "@deepseek-ai/dsh-experimental-system1",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:^"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "type": "module",
+  "types": "lib/types/index.d.ts",
+  "version": "0.1.7-alpha.2"
+}

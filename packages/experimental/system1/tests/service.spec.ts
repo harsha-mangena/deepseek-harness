@@ -186,6 +186,45 @@ describe('System1Service', () => {
     expect(decision.fallback).toBe('disabled')
   })
 
+  it('converts a throwing validator into a backend-error fallback', async () => {
+    const service = new System1Service(
+      scriptedBackend([single('trivial', 0.9), single('trivial', 0.9)]),
+      testConfig(),
+    )
+    const signal = new AbortController().signal
+    const throwing = await service.ask(question, 'turn', signal, (): string => {
+      throw new Error('validator blew up')
+    })
+    expect(throwing.fallback).toBe('backend-error')
+    expect(throwing.value).toBeNull()
+    expect(throwing.trace.note).toContain('validator threw: validator blew up')
+    const nonError = await service.ask(question, 'turn', signal, (): string => {
+      throw { code: 42 }
+    })
+    expect(nonError.fallback).toBe('backend-error')
+    expect(nonError.trace.note).toContain('validator threw')
+  })
+
+  it('treats timeoutMs 0 as no timeout', async () => {
+    const slow: System1Backend = {
+      kind: 'none',
+      async decide(): Promise<System1Judgment> {
+        throw new Error('unreachable')
+      },
+      async decideMany(): Promise<System1Judgment[]> {
+        await new Promise(resolve => setTimeout(resolve, 50))
+        return [judgment('trivial', 0.9)]
+      },
+      async dispose(): Promise<void> {},
+    }
+    const service = new System1Service(slow, testConfig({ timeoutMs: 0 }))
+    const decision = await service.ask(question, 'turn', new AbortController().signal, (a) => {
+      return a as string
+    })
+    expect(decision.fallback).toBeNull()
+    expect(decision.value).toBe('trivial')
+  })
+
   it('keeps a bounded trace ring buffer', async () => {
     const service = new System1Service(new NullBackend(), testConfig({ traceBufferSize: 3 }))
     const signal = new AbortController().signal
@@ -312,6 +351,31 @@ describe('System1Service.askMany', () => {
     )
     expect(decisions).toHaveLength(2)
     expect(decisions.every(d => d.fallback === 'backend-error')).toBe(true)
+  })
+
+  it('counts backend-dropped questions toward the circuit breaker', async () => {
+    const short: System1Backend = {
+      kind: 'none',
+      async decide(): Promise<System1Judgment> {
+        throw new Error('unreachable')
+      },
+      async decideMany(): Promise<System1Judgment[]> {
+        return []
+      },
+      async dispose(): Promise<void> {},
+    }
+    const service = new System1Service(short, testConfig({ failureThreshold: 2, cooldownMs: 60_000 }))
+    const signal = new AbortController().signal
+    const validate = (a: unknown): string => a as string
+    const first = await service.ask(question, 'turn', signal, validate)
+    expect(first.fallback).toBe('backend-error')
+    expect(first.trace.note).toBe('backend dropped a question')
+    const second = await service.ask(question, 'turn', signal, validate)
+    expect(second.fallback).toBe('backend-error')
+    // Two short batches opened the circuit: the backend is not consulted again.
+    const third = await service.ask(question, 'turn', signal, validate)
+    expect(third.fallback).toBe('backend-error')
+    expect(third.trace.note).toBe('circuit open')
   })
 
   it('returns an empty array for no questions without touching the backend', async () => {

@@ -129,6 +129,32 @@ describe('JevBackend wire format', () => {
     expect(judgment?.confidence).toBe(0.85)
   })
 
+  it('abstains on a missing noul instead of judging a confident zero', async () => {
+    process.env[KEY_ENV] = 'test-key'
+    stubFetch(() => jsonResponse({
+      model: 'jev-1.13.0',
+      answers: { 'loop-check#0': { confidence: 0.9 } },
+    }))
+    const backend = new JevBackend(testConfig())
+    const [judgment] = await backend.decideMany([loopCheck], new AbortController().signal)
+    expect(judgment?.answer).toBeNull()
+    expect(judgment?.abstained).toBe(true)
+    expect(judgment?.confidence).toBe(0)
+  })
+
+  it('abstains on a non-numeric noul', async () => {
+    process.env[KEY_ENV] = 'test-key'
+    stubFetch(() => jsonResponse({
+      model: 'jev-1.13.0',
+      answers: { 'loop-check#0': { noul: 'high' } },
+    }))
+    const backend = new JevBackend(testConfig())
+    const [judgment] = await backend.decideMany([loopCheck], new AbortController().signal)
+    expect(judgment?.answer).toBeNull()
+    expect(judgment?.abstained).toBe(true)
+    expect(judgment?.confidence).toBe(0)
+  })
+
   it('abstains when an answer is missing or malformed', async () => {
     process.env[KEY_ENV] = 'test-key'
     stubFetch(() => jsonResponse({ model: 'jev-1.13.0', answers: {} }))

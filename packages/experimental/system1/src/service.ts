@@ -36,9 +36,28 @@ function clampConfidence(value: unknown): number {
 }
 
 /**
+ * Run an answer validator without letting it break the service's never-reject
+ * contract: a throwing validator resolves to a backend-error fallback, not a
+ * rejected `askMany`.
+ */
+function safeValidate<T>(
+  validate: (answer: unknown) => T | null,
+  answer: unknown,
+): { ok: true; value: T | null } | { ok: false; message: string } {
+  try {
+    return { ok: true, value: validate(answer) }
+  } catch (error: unknown) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
  * Race a promise against a timeout that also aborts the underlying work:
  * the timeout fires `controller.abort()`, so a hung backend call releases
  * its socket instead of lingering after the race is lost.
+ *
+ * @param ms - timeout in milliseconds. Values <= 0 disable the timeout
+ * entirely; the call is then bounded only by the caller's `signal`.
  */
 function withAbortTimeout<T>(
   run: (signal: AbortSignal) => Promise<T>,
@@ -168,8 +187,16 @@ export class System1Service {
         trace: this.recordTrace(question, judgment, 'low-confidence', false),
       }
     }
-    const value = validate(judgment.answer)
-    if (value === null) {
+    const validated = safeValidate(validate, judgment.answer)
+    if (!validated.ok) {
+      return {
+        judgment,
+        value: null,
+        fallback: 'backend-error',
+        trace: this.recordTrace(question, judgment, 'backend-error', false, `validator threw: ${validated.message}`),
+      }
+    }
+    if (validated.value === null) {
       return {
         judgment,
         value: null,
@@ -179,7 +206,7 @@ export class System1Service {
     }
     return {
       judgment,
-      value,
+      value: validated.value,
       fallback: null,
       trace: this.recordTrace(question, judgment, null, false),
     }
@@ -247,10 +274,11 @@ export class System1Service {
         })
         return decisions as Array<System1Decision<T>>
       }
-      this.consecutiveFailures = 0
+      let dropped = 0
       askable.forEach(({ index, question, validate }, batchIndex) => {
         const judgment = judgments[batchIndex]
         if (judgment === undefined) {
+          dropped += 1
           decisions[index] = this.fallback<T>(question, 'backend-error', 'backend dropped a question')
           return
         }
@@ -258,6 +286,17 @@ export class System1Service {
         else this.taskUsed += 1
         decisions[index] = this.gate(question, judgment, validate)
       })
+      // A backend that answers short violates its contract (one judgment per
+      // question, in order): count it as a failure for circuit purposes even
+      // when the rest of the batch succeeded.
+      if (dropped > 0) {
+        this.consecutiveFailures += 1
+        if (this.consecutiveFailures >= this.config.failureThreshold) {
+          this.circuitOpenedAt = Date.now()
+        }
+      } else {
+        this.consecutiveFailures = 0
+      }
     }
     return decisions as Array<System1Decision<T>>
   }
