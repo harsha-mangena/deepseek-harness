@@ -237,6 +237,15 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
+    // Durable evidence: the verification record enters the session log
+    // before the terminal event, so getEvidence can retrieve it later.
+    session.append('system1/verification', {
+      schemaVersion: 1,
+      requestId,
+      checkId: verification.checkId,
+      passed: verification.passed,
+      evidence: `tool-call:${dispatched.receiptRef}`,
+    })
     if (!verification.passed) {
       finalizeTerminal({
         session,

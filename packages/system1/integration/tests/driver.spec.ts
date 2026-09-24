@@ -266,6 +266,14 @@ describe('ReadOnlyProductionDriver', () => {
       expect(recorded).toHaveLength(1)
       expect(recorded[0].outcome).toBe('success')
       expect(recorded[0].verifiedBy).toEqual(['verify:tool-call:call-test'])
+
+      // The verification evidence is durable in the session log.
+      const verifications = setup.session
+        .snapshotEvents()
+        .filter((event) => event.type === 'system1/verification')
+      expect(verifications).toHaveLength(1)
+      expect(verifications[0].data.checkId).toBe('verify:tool-call:call-test')
+      expect(verifications[0].data.passed).toBe(true)
     } finally {
       await setup.dispose()
     }

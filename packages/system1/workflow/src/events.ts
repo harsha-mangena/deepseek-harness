@@ -14,6 +14,7 @@
  */
 
 import type { System1RequestId } from './types.ts'
+import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 
 /** Every System 1 event payload carries a schema version so replay can migrate. */
 export interface System1EventBase {
@@ -137,6 +138,18 @@ export interface System1ContextSelectionData extends System1EventBase {
   selectors: string[]
 }
 
+/** Inbox: a message entered the coordinator's pending-work queue. */
+export interface System1InboxData {
+  /** Payload schema version; currently always 1. */
+  schemaVersion: 1
+  /** Which pending list received the message. */
+  target: 'next-turn' | 'next-step'
+  /** The appended message, as a JSON snapshot. */
+  message: UserMessage
+  /** Epoch milliseconds when the append was recorded. */
+  appendedAt: number
+}
+
 /** Terminal: the workflow request reached a final outcome. */
 export type System1TerminalData = System1EventBase & (
   | {
@@ -185,6 +198,8 @@ declare module '@deepseek-ai/dsh-session/types' {
     'system1/context-selection': System1ContextSelectionData
     /** The workflow request reached a final outcome. */
     'system1/terminal': System1TerminalData
+    /** A message entered the coordinator's inbox queue. */
+    'system1/inbox': System1InboxData
   }
 }
 
@@ -201,6 +216,7 @@ export const SYSTEM1_EVENT_TYPES = [
   'system1/handoff',
   'system1/context-selection',
   'system1/terminal',
+  'system1/inbox',
 ] as const
 
 /** One of the reserved System 1 session event types. */

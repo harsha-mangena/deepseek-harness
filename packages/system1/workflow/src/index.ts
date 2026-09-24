@@ -162,6 +162,7 @@ export type {
   System1HandoffData,
   System1ContextSelectionData,
   System1TerminalData,
+  System1InboxData,
   System1EventType,
 } from './events.ts'
 export { SYSTEM1_EVENT_TYPES } from './events.ts'

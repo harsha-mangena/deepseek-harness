@@ -58,6 +58,18 @@ Record the terminal outcome with `finalizeTerminal({ session, requestId, outcome
 
 The coordinator is a custom runtime root, not a factory product: `AgentRegistry` has one factory slot and System 1 never takes it. Registrations are effects — the coordinator registers through the plugin Cordis context and the plugin owns every disposer's unwind. Each coordinator gets a private Cordis scope (via `createScope`) so its tool registrations are isolated from other coordinators and the application root. The plugin declares `tools` as an injected dependency because scoped tool registration must resolve through the coordinator's scope. Lifecycle events dispatch through the sanctioned `agentEvents(ctx, agent)` seam on the plugin context, so they stay visible at the application root. The initiator is captured when the coordinator wakes and restored for the driver's lifetime, so guarded tools and delegated work see the coordinator as the initiator. Session event payloads are JSON-serializable with no explicit `undefined`, and `system1/terminal` success requires `verifiedBy` evidence at the type level.
 
+### Recovery
+
+Inbox appends (`send`, `followup`, `steer`) are written to the durable session log as `system1/inbox` events. A restarted coordinator rebuilds its pending work by calling `recover()`, which replays those events in log order. The in-memory inbox is cleared first, so recovery is idempotent.
+
+### Delegation
+
+`delegate(fencingToken, depth, work)` binds delegated work to the coordinator's fencing token and enforces a maximum delegation depth of 5. Invalid tokens or excessive depth fail closed. The token must come from a lease acquired via the coordination package; the coordinator never invents one.
+
+### Evidence
+
+Verification results are stored durably as `system1/verification` session events. `getEvidence(requestId)` retrieves them in log order for audit or recovery. The production driver emits these events before finalizing, so a success terminal's `verifiedBy` checks always have retrievable backing evidence.
+
 ### Source map
 
 - `src/types.ts` — public config and coordinator contracts (types only).

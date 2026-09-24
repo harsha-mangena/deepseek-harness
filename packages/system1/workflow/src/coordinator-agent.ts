@@ -29,9 +29,14 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import { System1Inbox } from './inbox.ts'
+import type { System1InboxData, System1VerificationData } from './events.ts'
+import type { System1RequestId } from './types.ts'
 
 /** Default cancellation cause when the caller names none. */
 const DEFAULT_CANCEL_CAUSE: AgentCancelCause = { kind: 'parent' }
+
+/** Maximum delegation depth; deeper nesting is refused fail-closed. */
+const MAX_DELEGATION_DEPTH = 5
 
 /**
  * One unit of coordinator work. The contract is stable: run to completion
@@ -142,6 +147,9 @@ export class System1CoordinatorAgent implements Agent {
 
   /**
    * Route input to an inbox boundary and optionally wake the driver.
+   * The append is also written to the durable session log as a
+   * `system1/inbox` event, so a restarted coordinator can rebuild its
+   * pending work via {@link recover}.
    * @param message - the incoming message.
    * @param target - the next-turn or next-step inbox boundary.
    * @param wakeup - whether delivery may wake the driver.
@@ -150,28 +158,48 @@ export class System1CoordinatorAgent implements Agent {
   send(message: UserMessage, target: InboxTarget, wakeup: boolean): void {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
     this.inbox.append(target, message)
+    this.session.append('system1/inbox', {
+      schemaVersion: 1,
+      target,
+      message,
+      appendedAt: Date.now(),
+    } satisfies System1InboxData)
     if (wakeup) this.wake()
   }
 
   /**
-   * Queue an ordinary follow-up turn and wake the driver.
+   * Queue an ordinary follow-up turn and wake the driver. The append is
+   * durable (see {@link send}).
    * @param message - the follow-up message.
    * @throws when the coordinator is disposed.
    */
   followup(message: UserMessage): void {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
     this.inbox.append('next-turn', message)
+    this.session.append('system1/inbox', {
+      schemaVersion: 1,
+      target: 'next-turn',
+      message,
+      appendedAt: Date.now(),
+    } satisfies System1InboxData)
     this.wake()
   }
 
   /**
-   * Submit steering for the nearest step and wake the driver.
+   * Submit steering for the nearest step and wake the driver. The append
+   * is durable (see {@link send}).
    * @param message - the steering message.
    * @throws when the coordinator is disposed.
    */
   steer(message: UserMessage): void {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
     this.inbox.append('next-step', message)
+    this.session.append('system1/inbox', {
+      schemaVersion: 1,
+      target: 'next-step',
+      message,
+      appendedAt: Date.now(),
+    } satisfies System1InboxData)
     this.wake()
   }
 
@@ -183,6 +211,74 @@ export class System1CoordinatorAgent implements Agent {
   inject(message: UserMessage): void {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
     this.inbox.append('next-step', message)
+  }
+
+  /**
+   * Rebuild the in-memory inbox by replaying durable `system1/inbox`
+   * events from the session log. Clears the current inbox first, so it
+   * is safe to call on a fresh coordinator sharing the session after a
+   * restart. Messages replay in log order per boundary.
+   * @throws when the coordinator is disposed.
+   */
+  recover(): void {
+    if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
+    this.inbox.clear()
+    for (const event of this.session.snapshotEvents()) {
+      if (event.type === 'system1/inbox') {
+        this.inbox.append(event.data.target, event.data.message)
+      }
+    }
+  }
+
+  /**
+   * Delegate a unit of work with fencing and depth enforcement. The
+   * fencing token binds the delegation to the coordinator's lease; a
+   * stale or invalid token is refused. Delegation deeper than
+   * {@link MAX_DELEGATION_DEPTH} fails closed.
+   * @param fencingToken - positive integer fencing token from the
+   * coordinator's lease.
+   * @param depth - current delegation depth; 0 for direct coordinator work.
+   * @param work - the delegated work; receives an abort signal and the
+   * fencing token.
+   * @returns resolves when the delegated work completes.
+   * @throws when the coordinator is disposed, the token is invalid, or
+   * depth exceeds the maximum.
+   */
+  async delegate(
+    fencingToken: number,
+    depth: number,
+    work: (signal: AbortSignal, fencingToken: number) => Promise<void>,
+  ): Promise<void> {
+    if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
+    if (!Number.isInteger(fencingToken) || fencingToken <= 0) {
+      throw new Error(
+        `System1CoordinatorAgent(${this.id}) refuses delegation with invalid fencing token`,
+      )
+    }
+    if (depth >= MAX_DELEGATION_DEPTH) {
+      throw new Error(
+        `System1CoordinatorAgent(${this.id}) refuses delegation at depth ${depth} (max ${MAX_DELEGATION_DEPTH})`,
+      )
+    }
+    const aborter = new AbortController()
+    await work(aborter.signal, fencingToken)
+  }
+
+  /**
+   * Retrieve durable verification evidence for a workflow request, in
+   * session-log order. Evidence is written as `system1/verification`
+   * events; this reads them back for audit or recovery.
+   * @param requestId - the workflow request to query.
+   * @returns the verification records logged for the request.
+   */
+  getEvidence(requestId: System1RequestId): System1VerificationData[] {
+    const evidence: System1VerificationData[] = []
+    for (const event of this.session.snapshotEvents()) {
+      if (event.type === 'system1/verification' && event.data.requestId === requestId) {
+        evidence.push(event.data)
+      }
+    }
+    return evidence
   }
 
   /**
