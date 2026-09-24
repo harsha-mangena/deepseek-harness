@@ -61,6 +61,8 @@ export const KNOWN_SESSION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'subagent/descriptor',
   'subagent/model-selection-policy',
   'system/message',
+  'system1/decision',
+  'system1/decision-acted',
   'team/member',
   'team/message/delivered',
   'team/message/queued',

@@ -38,6 +38,7 @@
       "@deepseek-ai/dsh-deepseek-account": ["./packages/credentials/deepseek-account/src/index.ts"],
       "@deepseek-ai/dsh-deepseek-account/types": ["./packages/credentials/deepseek-account/src/types.ts"],
       "@deepseek-ai/dsh-experimental-speech-to-text": ["./packages/experimental/speech-to-text/src/index.ts"],
+      "@deepseek-ai/dsh-experimental-system1": ["./packages/experimental/system1/src/index.ts"],
       "@deepseek-ai/dsh-experimental-speech-to-text-sensevoice": ["./packages/experimental/speech-to-text-sensevoice/src/index.ts"],
       "@deepseek-ai/dsh-experimental-api-speech-to-text": ["./packages/experimental/api-speech-to-text/src/index.ts"],
       "@deepseek-ai/dsh-experimental-client-ui-voice-input": ["./packages/experimental/client-ui-voice-input/src/index.ts"],

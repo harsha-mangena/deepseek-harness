@@ -478,6 +478,33 @@ export type SurfaceIntent<T extends SurfaceEventType = SurfaceEventType> = {
 })
 
 /**
+ * Writer-declared envelope intent for non-surface session events, accepted
+ * as the trailing `Session.append()` argument for event types outside
+ * {@link SurfaceEventType}.
+ *
+ * Setting `ignorable: true` stamps the persisted envelope's
+ * {@link SessionEvent.ignorable} marker: a reader that does not recognize
+ * the event type skips the record instead of refusing to reconstruct the
+ * session. A writer sets it only on purely informational records whose loss
+ * cannot change reconstruction or model-visible history — telemetry,
+ * diagnostics, advisory notes. Absent means required: an unrecognized type
+ * without the marker makes foreign readers refuse the log rather than
+ * silently resume a gutted session.
+ *
+ * The marker is never settable on surface types: surface events are
+ * model-visible, so their loss always changes the session. The compiler
+ * enforces this at `Session.append()` call sites.
+ */
+export interface InformationalEventIntent {
+  /**
+   * Mark the event ignorable: foreign readers may skip it when they do not
+   * recognize its type. Only `true` is meaningful; any other value is
+   * ignored and the event stays required.
+   */
+  ignorable?: true
+}
+
+/**
  * One immutable entry in the session log.
  *
  * A proper discriminated union over `type` (not independent `type`/`data`
