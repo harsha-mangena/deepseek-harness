@@ -48,6 +48,10 @@ Call `ctx.system1Workflows.create(session, driver)` with a session and a driver.
 
 Creating while `mode` is `off` throws. Creating for a session that already has a coordinator throws a collision error. A driver that rejects on abort is contained; a driver that rejects for any other reason is recorded on the coordinator and does not take down the plugin.
 
+### Finalizing a request
+
+Record the terminal outcome with `finalizeTerminal({ session, requestId, outcome, summary, verifiedBy, verifications })`. It is the only supported way to append `system1/terminal`: success requires a non-empty `verifiedBy` list where every cited check has a passing verification record, and throws `TerminalInvariantError` otherwise. Other outcomes record without evidence. Appending `system1/terminal` directly bypasses this check and is unsupported.
+
 ## Understand the implementation
 
 ### Design decisions
@@ -60,6 +64,7 @@ The coordinator is a custom runtime root, not a factory product: `AgentRegistry`
 - `src/events.ts` — the `system1/*` session event vocabulary and `SessionEventMap` augmentation.
 - `src/inbox.ts` — the coordinator's real `Inbox` implementation.
 - `src/coordinator-agent.ts` — `System1CoordinatorAgent`, the custom runtime root.
+- `src/finalizer.ts` — `finalizeTerminal`: the supported terminal-event writer and its invariant.
 - `src/plugin.ts` — `System1Workflows` service: kill-switched creation, lifecycle ownership, lookup.
 - `src/index.ts` — public surface.
 

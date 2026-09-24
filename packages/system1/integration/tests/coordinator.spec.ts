@@ -65,13 +65,9 @@ function testDecision(selectedId: string, vendorConfidence: number | null = 0.9)
 
 function testOutcome(): ExecutionOutcome {
   return {
-    schemaVersion: 1,
-    outcomeId: 'o1',
-    decisionId: 'd1',
-    status: 'succeeded',
-    result: { ciStatus: 'passing' },
-    verified: true,
-    verificationEvidence: null,
+    kind: 'succeeded',
+    receiptRef: 'receipt-o1',
+    evidenceRefs: ['evidence-o1'],
   }
 }
 
@@ -110,7 +106,7 @@ describe('ReadOnlyCoordinator', () => {
     )
 
     expect(result.decision.selectedId).toBe('c1')
-    expect(result.outcome?.status).toBe('succeeded')
+    expect(result.outcome?.kind).toBe('succeeded')
     expect(executed).toHaveLength(1)
     expect(executed[0].effect).toBe('read')
     // Write candidates are filtered from the menu.

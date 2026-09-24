@@ -24,8 +24,6 @@ import type { CoordinatorDriver } from './coordinator-agent.ts'
 import type {
   ResolvedSystem1WorkflowConfig,
   System1CoordinatorHandle,
-  System1Mode,
-  System1Provider,
   System1WorkflowConfig,
 } from './types.ts'
 
@@ -131,6 +129,14 @@ export class System1Workflows extends Service {
 export default System1Workflows
 
 export { System1RequestId } from './request-id.ts'
+export {
+  TerminalInvariantError,
+  finalizeTerminal,
+} from './finalizer.ts'
+export type {
+  FinalizeTerminalRequest,
+  FinalizerVerification,
+} from './finalizer.ts'
 export type {
   System1Mode,
   System1Provider,

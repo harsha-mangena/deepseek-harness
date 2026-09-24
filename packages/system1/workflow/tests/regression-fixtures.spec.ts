@@ -24,7 +24,11 @@ import type {
   System1TerminalData,
   System1VerificationData,
 } from '@deepseek-ai/dsh-system1-workflow'
-import { System1RequestId } from '@deepseek-ai/dsh-system1-workflow'
+import {
+  System1RequestId,
+  TerminalInvariantError,
+  finalizeTerminal,
+} from '@deepseek-ai/dsh-system1-workflow'
 
 const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures')
 
@@ -70,16 +74,6 @@ function guardBlocks(evaluations: GuardEvaluation[], requiredGuards: string[]): 
   )
 }
 
-/**
- * Phase-0 expression of the terminal invariant: success is only legal when
- * at least one verifier check passed. The phase 1 policy engine owns this
- * rule; the fixture pins it here so the contract cannot regress before the
- * engine exists.
- */
-function mayDeclareSuccess(verifications: Array<{ passed: boolean }>): boolean {
-  return verifications.some(verification => verification.passed)
-}
-
 describe('regression fixture: false guard blocks', () => {
   it('a required guard answering false blocks the candidate', () => {
     const fixture = loadFixture('false-guard-blocks.json') as GuardFixture
@@ -117,14 +111,92 @@ describe('regression fixture: false guard blocks', () => {
 })
 
 describe('regression fixture: repeated FINISH with unmet goal', () => {
-  it('never yields a success terminal while no verifier passed', () => {
+  it('the finalizer refuses a success terminal while no verifier passed', () => {
     const fixture = loadFixture('repeated-finish-unmet-goal.json') as FinishFixture
     expect(fixture.hazard).toBe('repeated-finish-unmet-goal')
     expect(fixture.decisions.every(decision => decision.choice === 'FINISH')).toBe(true)
 
-    expect(mayDeclareSuccess(fixture.verifications)).toBe(false)
+    const session = Session.create(SessionId('fixture-finish-finalizer'))
+    expect(() =>
+      finalizeTerminal({
+        session,
+        requestId: System1RequestId(fixture.requestId),
+        outcome: 'success',
+        summary: 'forbidden success',
+        verifiedBy: [],
+        verifications: fixture.verifications,
+      }),
+    ).toThrow(TerminalInvariantError)
     expect(fixture.forbiddenTerminalOutcome).toBe('success')
     expect(fixture.expectedTerminalOutcome).not.toBe('success')
+    expect(
+      session.snapshotEvents().some(event => event.type === 'system1/terminal'),
+    ).toBe(false)
+  })
+
+  it('the finalizer records a failure terminal without verification evidence', () => {
+    const fixture = loadFixture('repeated-finish-unmet-goal.json') as FinishFixture
+    const session = Session.create(SessionId('fixture-finish-failure'))
+    const requestId = System1RequestId(fixture.requestId)
+    finalizeTerminal({
+      session,
+      requestId,
+      outcome: 'failure',
+      summary: 'goal unmet',
+      verifiedBy: [],
+      verifications: fixture.verifications,
+    })
+    const terminals = session.snapshotEvents().filter(event => event.type === 'system1/terminal')
+    expect(terminals).toHaveLength(1)
+    expect(terminals[0].type === 'system1/terminal' && terminals[0].data.outcome).toBe('failure')
+  })
+
+  it('the finalizer refuses success citing a failed verifier check', () => {
+    const fixture = loadFixture('repeated-finish-unmet-goal.json') as FinishFixture
+    const session = Session.create(SessionId('fixture-finish-failed-check'))
+    expect(() =>
+      finalizeTerminal({
+        session,
+        requestId: System1RequestId(fixture.requestId),
+        outcome: 'success',
+        summary: 'cites a failed check',
+        verifiedBy: [fixture.verifications[0].checkId],
+        verifications: fixture.verifications,
+      }),
+    ).toThrow(TerminalInvariantError)
+  })
+
+  it('the finalizer refuses success citing a check with no record', () => {
+    const session = Session.create(SessionId('fixture-finish-missing-check'))
+    expect(() =>
+      finalizeTerminal({
+        session,
+        requestId: System1RequestId('fixture-finish-missing-check'),
+        outcome: 'success',
+        summary: 'cites an unrecorded check',
+        verifiedBy: ['verify-never-ran'],
+        verifications: [{ checkId: 'verify-row-counts', passed: true, evidence: 'rows=42' }],
+      }),
+    ).toThrow(TerminalInvariantError)
+  })
+
+  it('the finalizer accepts success backed by a passing verifier check', () => {
+    const session = Session.create(SessionId('fixture-finish-success'))
+    const requestId = System1RequestId('fixture-finish-success')
+    finalizeTerminal({
+      session,
+      requestId,
+      outcome: 'success',
+      summary: 'verified',
+      verifiedBy: ['verify-row-counts'],
+      verifications: [{ checkId: 'verify-row-counts', passed: true, evidence: 'rows=42' }],
+    })
+    const terminals = session.snapshotEvents().filter(event => event.type === 'system1/terminal')
+    expect(terminals).toHaveLength(1)
+    expect(
+      terminals[0].type === 'system1/terminal'
+        && (terminals[0].data as { verifiedBy: readonly string[] }).verifiedBy,
+    ).toEqual(['verify-row-counts'])
   })
 
   it('records the decision and verification trail in the session log', () => {
