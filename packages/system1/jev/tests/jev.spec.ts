@@ -50,10 +50,14 @@ function mockFetch(response: unknown, ok = true, status = 200): typeof fetch {
 describe('normalizeJevResponse', () => {
   it('normalizes a choice response', () => {
     const raw = {
-      choice: 'c1',
-      probabilities: { c1: 0.8, c2: 0.2 },
-      confidence: 0.9,
-      model: 'jev-1-rev3',
+      answers: {
+        q1: {
+          choice: 'c1',
+          probabilities: { c1: 0.8, c2: 0.2 },
+          confidence: 0.9,
+        },
+      },
+      model: 'jev-1.13.0',
       requestId: 'req-123',
       usage: { inputTokens: 150, outputTokens: 0 },
     }
@@ -62,7 +66,7 @@ describe('normalizeJevResponse', () => {
     expect(decision.selectedProbability).toBe(0.8)
     expect(decision.vendorConfidence).toBe(0.9)
     expect(decision.modelRequested).toBe('jev-1')
-    expect(decision.modelResolved).toBe('jev-1-rev3')
+    expect(decision.modelResolved).toBe('jev-1.13.0')
     expect(decision.requestId).toBe('req-123')
     expect(decision.usage).toEqual({ inputTokens: 150, outputTokens: 0 })
     expect(decision.reasonCode).toBe('accepted')
@@ -71,7 +75,7 @@ describe('normalizeJevResponse', () => {
   })
 
   it('normalizes a noul response as uncertain', () => {
-    const raw = { noul: true, model: 'jev-1-rev3' }
+    const raw = { answers: { q1: { noul: 0.99 } }, model: 'jev-1.13.0' }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.selectedId).toBe('escalate-none')
     expect(decision.reasonCode).toBe('uncertain')
@@ -79,9 +83,13 @@ describe('normalizeJevResponse', () => {
 
   it('normalizes a score response by selecting the top candidate', () => {
     const raw = {
-      score: { c1: 0.3, c2: 0.7 },
-      probabilities: { c1: 0.3, c2: 0.7 },
-      confidence: 0.75,
+      answers: {
+        q1: {
+          score: 1.0,
+          probabilities: { c1: 0.3, c2: 0.7 },
+          confidence: 0.75,
+        },
+      },
     }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.selectedId).toBe('c2')
@@ -89,35 +97,38 @@ describe('normalizeJevResponse', () => {
   })
 
   it('uses score directly when probabilities are absent', () => {
-    const raw = { score: { c1: 0.4, c2: 0.6 } }
+    const raw = { answers: { q1: { score: { c1: 0.4, c2: 0.6 } } } }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.selectedId).toBe('c2')
     // Missing candidates default to 0.
-    const rawPartial = { score: { c2: 0.6 } }
+    const rawPartial = { answers: { q1: { score: { c2: 0.6 } } } }
     const decisionPartial = normalizeJevResponse(rawPartial, input, 'jev-1')
     expect(decisionPartial.selectedId).toBe('c2')
   })
 
   it('rejects score responses with no valid candidate', () => {
-    expect(() => normalizeJevResponse({ score: { c99: 0.5 } }, input, 'jev-1')).toThrow(
-      /no valid candidate/,
-    )
+    expect(() =>
+      normalizeJevResponse({ answers: { q1: { score: { c99: 0.5 } } } }, input, 'jev-1'),
+    ).toThrow(/no valid candidate/)
   })
 
   it('ignores probabilities for unknown candidates', () => {
-    const raw = { choice: 'c1', probabilities: { c1: 0.6, c99: 0.4 } }
+    const raw = { answers: { q1: { choice: 'c1', probabilities: { c1: 0.6, c99: 0.4 } } } }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.probabilities).toEqual({ c1: 0.6 })
   })
 
   it('accepts snake_case request_id', () => {
-    const raw = { choice: 'c1', probabilities: { c1: 1 }, request_id: 'snake-123' }
+    const raw = {
+      answers: { q1: { choice: 'c1', probabilities: { c1: 1 } } },
+      request_id: 'snake-123',
+    }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.requestId).toBe('snake-123')
   })
 
   it('handles missing request ID and model', () => {
-    const raw = { choice: 'c1', probabilities: { c1: 1 } }
+    const raw = { answers: { q1: { choice: 'c1', probabilities: { c1: 1 } } } }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.requestId).toBeNull()
     expect(decision.modelResolved).toBeNull()
@@ -125,7 +136,7 @@ describe('normalizeJevResponse', () => {
 
   it('defaults selected probability to 0 when absent', () => {
     // Choice is valid but probabilities omit it.
-    const raw = { choice: 'c1', probabilities: { c2: 0.5 } }
+    const raw = { answers: { q1: { choice: 'c1', probabilities: { c2: 0.5 } } } }
     const decision = normalizeJevResponse(raw, input, 'jev-1')
     expect(decision.selectedId).toBe('c1')
     expect(decision.selectedProbability).toBe(0)
@@ -133,21 +144,40 @@ describe('normalizeJevResponse', () => {
 
   it('rejects malformed responses', () => {
     expect(() => normalizeJevResponse(null, input, 'jev-1')).toThrow(/not an object/)
-    expect(() => normalizeJevResponse({}, input, 'jev-1')).toThrow(/no choice, score, or noul/)
-    expect(() => normalizeJevResponse({ choice: 'c99' }, input, 'jev-1')).toThrow(/not a valid candidate/)
-    expect(() =>
-      normalizeJevResponse({ choice: 'c1', probabilities: { c1: 1.5 } }, input, 'jev-1'),
-    ).toThrow(/Invalid probability/)
-    expect(() => normalizeJevResponse({ choice: 'c1', probabilities: 'nope' }, input, 'jev-1')).toThrow(
-      /not an object/,
+    expect(() => normalizeJevResponse({}, input, 'jev-1')).toThrow(/has no answers/)
+    expect(() => normalizeJevResponse({ answers: {} }, input, 'jev-1')).toThrow(
+      /missing the answer/,
     )
+    expect(() =>
+      normalizeJevResponse({ answers: { q1: { choice: 'c99' } } }, input, 'jev-1'),
+    ).toThrow(/not a valid candidate/)
+    expect(() =>
+      normalizeJevResponse(
+        { answers: { q1: { choice: 'c1', probabilities: { c1: 1.5 } } } },
+        input,
+        'jev-1',
+      ),
+    ).toThrow(/Invalid probability/)
+    expect(() =>
+      normalizeJevResponse({ answers: { q1: { choice: 'c1', probabilities: 'nope' } } }, input, 'jev-1'),
+    ).toThrow(/not an object/)
+    expect(() =>
+      normalizeJevResponse({ answers: { q1: { bogus: true } } }, input, 'jev-1'),
+    ).toThrow(/no choice, score, or noul/)
   })
 
   it('handles null-safe usage accounting', () => {
-    const decision = normalizeJevResponse({ choice: 'c1', probabilities: { c1: 1 } }, input, 'jev-1')
+    const decision = normalizeJevResponse(
+      { answers: { q1: { choice: 'c1', probabilities: { c1: 1 } } } },
+      input,
+      'jev-1',
+    )
     expect(decision.usage).toEqual({ inputTokens: null, outputTokens: null })
     const withSnake = normalizeJevResponse(
-      { choice: 'c1', probabilities: { c1: 1 }, usage: { input_tokens: 50 } },
+      {
+        answers: { q1: { choice: 'c1', probabilities: { c1: 1 } } },
+        usage: { input_tokens: 50 },
+      },
       input,
       'jev-1',
     )
@@ -180,16 +210,48 @@ describe('JevDecisionProvider', () => {
 
   it('decides via the TypeSafe API', async () => {
     const fetchFn = mockFetch({
-      choice: 'c2',
-      probabilities: { c1: 0.2, c2: 0.8 },
-      confidence: 0.85,
-      model: 'jev-1-rev3',
+      answers: {
+        q1: {
+          choice: 'c2',
+          probabilities: { c1: 0.2, c2: 0.8 },
+          confidence: 0.85,
+        },
+      },
+      model: 'jev-1.13.0',
       usage: { inputTokens: 120, outputTokens: 0 },
     })
     const provider = new JevDecisionProvider({ apiKey: 'test-key', model: 'jev-1', fetchFn })
     const decision = await provider.decide(input, new AbortController().signal)
     expect(decision.selectedId).toBe('c2')
     expect(decision.decisionId).toBe('d1')
+  })
+
+  it('sends instructions and criteria in the documented wire format', async () => {
+    let capturedBody = ''
+    const fetchFn = (async (_url: string, init: { body?: unknown }) => {
+      capturedBody = init.body as string
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          answers: { q1: { choice: 'c1', probabilities: { c1: 1 }, confidence: 0.9 } },
+          model: 'jev-1.13.0',
+        }),
+      }
+    }) as typeof fetch
+    const provider = new JevDecisionProvider({ apiKey: 'test-key', model: 'jev-1', fetchFn })
+    await provider.decide(input, new AbortController().signal)
+    const body = JSON.parse(capturedBody) as {
+      state: string
+      model: string
+      questions: Record<string, { type: string; instructions: string; criteria: Record<string, string> }>
+    }
+    expect(body.state).toBe('test state')
+    expect(body.model).toBe('jev-1')
+    // Question key follows the input question family.
+    expect(body.questions.q1.type).toBe('choice')
+    expect(body.questions.q1.instructions).toContain('t1')
+    expect(body.questions.q1.criteria).toEqual({ c1: 'First', c2: 'Second' })
   })
 
   it('retries transport failures once, then throws', async () => {
@@ -270,7 +332,9 @@ describe('JevDecisionProvider', () => {
       return { ok: true, status: 200, json: async () => ({ bogus: true }) }
     }) as typeof fetch
     const provider = new JevDecisionProvider({ apiKey: 'k', model: 'jev-1', fetchFn })
-    await expect(provider.decide(input, new AbortController().signal)).rejects.toThrow(/no choice/)
+    await expect(provider.decide(input, new AbortController().signal)).rejects.toThrow(
+      /has no answers/,
+    )
     expect(calls).toBe(1)
   })
 

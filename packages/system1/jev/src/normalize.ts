@@ -17,16 +17,21 @@ import type {
 
 /** Raw Jev API response shape (partial). */
 interface JevRawResponse {
+  readonly answers?: unknown
+  readonly model?: unknown
+  readonly requestId?: unknown
+  readonly request_id?: unknown
+  readonly usage?: unknown
+}
+
+/** Raw per-question answer shape (partial). */
+interface JevRawAnswer {
   readonly choice?: unknown
   readonly score?: unknown
   readonly noul?: unknown
   readonly probabilities?: unknown
   readonly confidence?: unknown
   readonly legend?: unknown
-  readonly model?: unknown
-  readonly requestId?: unknown
-  readonly request_id?: unknown
-  readonly usage?: unknown
 }
 
 /**
@@ -46,10 +51,22 @@ export function normalizeJevResponse(
     throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev response is not an object', {})
   }
   const response = raw as JevRawResponse
-  const candidateIds = new Set(input.candidates.map((c) => c.id))
+  const candidateIds = new Set(input.candidates.map(c => c.id))
+
+  // Answers are keyed by question ID under `answers`.
+  if (typeof response.answers !== 'object' || response.answers === null) {
+    throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev response has no answers', {})
+  }
+  const answer = (response.answers as Record<string, unknown>)[input.questionFamily]
+  if (typeof answer !== 'object' || answer === null) {
+    throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev response is missing the answer', {
+      questionId: input.questionFamily,
+    })
+  }
+  const result = answer as JevRawAnswer
 
   // Noul: the model abstained.
-  if (response.noul !== undefined) {
+  if (result.noul !== undefined) {
     return {
       decisionId: input.decisionId,
       selectedId: 'escalate-none',
@@ -67,20 +84,20 @@ export function normalizeJevResponse(
   }
 
   // Choice: the model selected one candidate.
-  if (response.choice !== undefined) {
-    const choice = response.choice
+  if (result.choice !== undefined) {
+    const choice = result.choice
     if (typeof choice !== 'string' || !candidateIds.has(choice)) {
       throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev choice is not a valid candidate ID', {
         choice,
       })
     }
-    const probabilities = parseProbabilities(response.probabilities, candidateIds)
+    const probabilities = parseProbabilities(result.probabilities, candidateIds)
     return {
       decisionId: input.decisionId,
       selectedId: choice,
       probabilities,
       selectedProbability: probabilities[choice] ?? 0,
-      vendorConfidence: asNumberOrNull(response.confidence),
+      vendorConfidence: asNumberOrNull(result.confidence),
       calibratedCorrectness: null,
       calibrationVersion: null,
       modelRequested,
@@ -92,8 +109,8 @@ export function normalizeJevResponse(
   }
 
   // Score: the model scored candidates; select the highest.
-  if (response.score !== undefined) {
-    const probabilities = parseProbabilities(response.probabilities ?? response.score, candidateIds)
+  if (result.score !== undefined) {
+    const probabilities = parseProbabilities(result.probabilities ?? result.score, candidateIds)
     const top = topCandidate(probabilities, candidateIds)
     if (!top) {
       throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev score has no valid candidate', {})
@@ -103,7 +120,7 @@ export function normalizeJevResponse(
       selectedId: top.id,
       probabilities,
       selectedProbability: top.probability,
-      vendorConfidence: asNumberOrNull(response.confidence),
+      vendorConfidence: asNumberOrNull(result.confidence),
       calibratedCorrectness: null,
       calibrationVersion: null,
       modelRequested,
@@ -114,7 +131,7 @@ export function normalizeJevResponse(
     }
   }
 
-  throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev response has no choice, score, or noul', {})
+  throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev answer has no choice, score, or noul', {})
 }
 
 /** Parse probabilities, validating against candidate IDs. */

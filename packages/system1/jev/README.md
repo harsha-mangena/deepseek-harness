@@ -4,8 +4,8 @@ Jev decision provider for System 1: TypeSafe API adapter (Jev-only).
 
 ## What it provides
 
-- **JevDecisionProvider**: calls `POST https://api.typesafe.ai/v1/systemone` with the shared state, pinned model, and keyed choice questions. Authenticates via `Authorization: Bearer <API_KEY>` (key supplied by caller from Secure Vault; never logged).
-- **Response normalization**: maps choice, score, and noul responses to `NormalizedDecision`. The selected candidate ID must be valid; raw probabilities, vendor confidence, and calibrated correctness remain distinct. Noul maps to `escalate-none` with `reasonCode: 'uncertain'`.
+- **JevDecisionProvider**: calls `POST https://api.typesafe.ai/v1/systemone` with the shared state, pinned model, and a single choice question keyed by the input question family. The question uses the documented wire format (`instructions` + `criteria` mapping candidate IDs to labels). Authenticates via `Authorization: Bearer <API_KEY>` (key supplied by caller from Secure Vault; never logged).
+- **Response normalization**: reads the per-question answer from `answers.<questionId>` and maps choice, score, and noul answers to `NormalizedDecision`. The selected candidate ID must be valid; raw probabilities, vendor confidence, and calibrated correctness remain distinct. Noul maps to `escalate-none` with `reasonCode: 'uncertain'`.
 - **Retry policy**: one transport retry (per plan §8); no retries for cancellations or malformed responses. Timeouts, rate limits (429), and auth failures (401/403) map to structured `System1Error` codes.
 - **Usage accounting**: parses input/output tokens (null-safe) for the cost ledger.
 

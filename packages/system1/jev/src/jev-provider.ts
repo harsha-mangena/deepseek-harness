@@ -73,20 +73,24 @@ export class JevDecisionProvider implements DecisionProvider {
   }
 
   async decide(input: DecisionInput, signal: AbortSignal): Promise<NormalizedDecision> {
-    // Map candidates to a single choice question. The options are candidate
-    // IDs; labels are included for the model's context but the response must
-    // contain a valid candidate ID.
-    const options = input.candidates.map((c) => c.id)
-    const optionLabels = input.candidates.map((c) => `${c.id}: ${c.label}`).join('\n')
+    // Map candidates to a single choice question keyed by the question
+    // family. The criteria map option IDs to labels for the model's context;
+    // the response must contain a valid candidate ID. This matches the
+    // documented TypeSafe wire format (instructions + criteria).
+    const questionId = input.questionFamily
+    const criteria: Record<string, string> = {}
+    for (const c of input.candidates) {
+      criteria[c.id] = c.label
+    }
 
     const requestBody = {
       state: input.state,
       model: this.config.model,
       questions: {
-        'select-candidate': {
+        [questionId]: {
           type: 'choice',
-          question: `Which candidate should be selected for task ${input.taskId}?\n${optionLabels}`,
-          options,
+          instructions: `Which candidate should be selected for task ${input.taskId}?`,
+          criteria,
         },
       },
     }
