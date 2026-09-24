@@ -21,6 +21,8 @@ import { Context, FiberState } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
 import { AgentRegistry } from '@deepseek-ai/dsh-agent'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import * as System1Module from '../src/index.ts'
 import type { CoordinatorDriver, System1Workflows } from '../src/index.ts'
@@ -62,6 +64,8 @@ async function bootComposition(mode: string): Promise<Booted> {
   await ctx.plugin(Loader)
   ctx.loader.builtins.include = Include
   await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
   await ctx.loader.create({
     name: 'cordis:include',
     config: { path: pathToFileURL(join(dir, 'cordis.yml')).href },

@@ -1,6 +1,9 @@
 /** Coordination store tests: budgets, leases, deduplication, determinism. */
 
 import { afterEach, describe, expect, it } from 'vitest'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   CoordinationStore,
   ManualClock,
@@ -118,6 +121,56 @@ describe('leases and fencing', () => {
     store.acquireLease('t1', 'tenant-a', 'holder-1', 60_000)
     expect(() => store.acquireLease('t1', 'tenant-b', 'holder-1', 60_000)).toThrow(/another tenant/)
   })
+
+  it('keeps the fencing epoch monotonic across release (R21)', () => {
+    store = makeStore()
+    const first = store.acquireLease('t1', 'tenant-a', 'holder-1', 60_000)
+    expect(first.fencingToken).toBe(1)
+    store.releaseLease('t1', first.fencingToken)
+    const second = store.acquireLease('t1', 'tenant-a', 'holder-2', 60_000)
+    expect(second.fencingToken).toBeGreaterThan(first.fencingToken)
+    expect(second.fencingToken).toBe(2)
+  })
+
+  it('rejects a stale token releasing a replacement lease (R22)', () => {
+    store = makeStore()
+    const old = store.acquireLease('t1', 'tenant-a', 'holder-old', 60_000)
+    store.releaseLease('t1', old.fencingToken)
+    const current = store.acquireLease('t1', 'tenant-a', 'holder-new', 60_000)
+    expect(current.fencingToken).toBeGreaterThan(old.fencingToken)
+    expect(() => store.releaseLease('t1', old.fencingToken)).toThrow(/Stale fencing token/)
+    // The current holder can still release with the current token.
+    store.releaseLease('t1', current.fencingToken)
+  })
+
+  it('persists the fencing epoch across restarts with a file-backed store', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coordination-lease-'))
+    const path = join(dir, 'coordination.sqlite')
+    const first = new CoordinationStore({ path, clock: new ManualClock(1_000_000), ids: new SequentialIdGenerator() })
+    const lease = first.acquireLease('t1', 'tenant-a', 'holder-old', 60_000)
+    first.releaseLease('t1', lease.fencingToken)
+    first.close()
+
+    const second = new CoordinationStore({ path, clock: new ManualClock(2_000_000), ids: new SequentialIdGenerator() })
+    try {
+      // The epoch survived the restart: no reset to 1.
+      const reacquired = second.acquireLease('t1', 'tenant-a', 'holder-new', 60_000)
+      expect(reacquired.fencingToken).toBe(2)
+      // A delayed stale worker holding the pre-release token cannot release
+      // the replacement lease.
+      expect(() => second.releaseLease('t1', lease.fencingToken)).toThrow(/Stale fencing token/)
+      second.releaseLease('t1', reacquired.fencingToken)
+      // Tenant binding survives release too.
+      expect(() => second.acquireLease('t1', 'tenant-b', 'holder-new', 60_000)).toThrow(/another tenant/)
+    } finally {
+      second.close()
+    }
+  })
+
+  it('silently returns when releasing a task with no active lease', () => {
+    store = makeStore()
+    expect(() => store.releaseLease('unknown-task', 1)).not.toThrow()
+  })
 })
 
 describe('deduplication', () => {
@@ -130,6 +183,10 @@ describe('deduplication', () => {
     // Result refs round-trip.
     store.attachIdempotencyResult('tenant-a', 'key-1', 'result://r1')
     expect(store.getIdempotencyResult('tenant-a', 'key-1')).toBe('result://r1')
+    // Unknown keys and keys without an attached result return null.
+    expect(store.getIdempotencyResult('tenant-a', 'unknown-key')).toBeNull()
+    store.recordIdempotencyKey('tenant-a', 'key-2', 'req-2')
+    expect(store.getIdempotencyResult('tenant-a', 'key-2')).toBeNull()
   })
 
   it('rejects duplicate decision and attempt IDs', () => {
@@ -270,6 +327,8 @@ describe('recorded decision provider', () => {
     const provider = new RecordedDecisionProvider()
     const decision = {
       decisionId: 'd1',
+        questionFamily: 'select-candidate',
+        promptVersion: 'p1',
       selectedId: 'c1',
       probabilities: { c1: 1 },
       selectedProbability: 1,

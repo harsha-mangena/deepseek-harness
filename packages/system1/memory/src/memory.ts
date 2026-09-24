@@ -5,10 +5,45 @@
  * Context selection: relevance-scored selection with character budgeting.
  * Long-term memory is out of scope (host provides via observations).
  *
+ * All character budgets in this module count Unicode code points, not UTF-16
+ * code units or bytes, and truncation never splits a surrogate pair.
+ *
  * @module @deepseek-ai/dsh-system1-memory/memory
  */
 
 import { system1Error } from '@deepseek-ai/dsh-system1-contracts'
+
+/** Marker appended when content is shortened to fit a character budget. */
+const TRUNCATION_MARKER = '...[TRUNCATED]'
+
+/**
+ * Count Unicode code points (characters), not UTF-16 code units.
+ * @param text - text to measure.
+ * @returns number of characters.
+ */
+function countChars(text: string): number {
+  return Array.from(text).length
+}
+
+/**
+ * Truncate text to a character budget, reserving space for the truncation
+ * marker so the returned text never exceeds the budget. When the budget is
+ * smaller than the marker, the marker itself is cut to the budget so
+ * truncation stays visible.
+ * @param text - text to truncate.
+ * @param maxChars - maximum characters in the returned text; must be >= 0.
+ * @returns text bounded to maxChars characters.
+ */
+function truncateToBudget(text: string, maxChars: number): string {
+  const chars = Array.from(text)
+  if (chars.length <= maxChars) {
+    return text
+  }
+  if (maxChars <= TRUNCATION_MARKER.length) {
+    return Array.from(TRUNCATION_MARKER).slice(0, maxChars).join('')
+  }
+  return chars.slice(0, maxChars - TRUNCATION_MARKER.length).join('') + TRUNCATION_MARKER
+}
 
 /** A memory entry with provenance. */
 export interface MemoryEntry {
@@ -48,7 +83,12 @@ export class WorkingMemory {
   }
 
   /**
-   * Store an entry.
+   * Store an entry, enforcing the per-task budgets.
+   *
+   * Evicts the oldest entries first until the new entry fits. When a single
+   * entry is larger than the whole character budget, the entry is kept but
+   * its content is truncated to the budget with a truncation marker, so
+   * `retrieve` never returns more than `maxCharsPerTask` characters.
    * @param taskId - task ID.
    * @param kind - entry kind.
    * @param content - entry content.
@@ -68,19 +108,20 @@ export class WorkingMemory {
       taskEntries.shift()
     }
 
-    // Enforce character limit (drop oldest until under limit).
-    let totalChars = taskEntries.reduce((sum, e) => sum + e.content.length, 0)
-    while (taskEntries.length > 0 && totalChars + content.length > this.maxChars) {
+    // Enforce character limit (drop oldest until the new entry fits).
+    const contentChars = countChars(content)
+    let totalChars = taskEntries.reduce((sum, e) => sum + countChars(e.content), 0)
+    while (taskEntries.length > 0 && totalChars + contentChars > this.maxChars) {
       // length > 0 guarantees shift() returns an element.
       const removed = taskEntries.shift() as MemoryEntry
-      totalChars -= removed.content.length
+      totalChars -= countChars(removed.content)
     }
 
     const entry: MemoryEntry = {
       id: this.newEntryId(),
       taskId,
       kind,
-      content,
+      content: truncateToBudget(content, this.maxChars),
       timestampMs,
       relevance: 1.0,
     }
@@ -91,6 +132,10 @@ export class WorkingMemory {
 
   /**
    * Retrieve entries for a task.
+   *
+   * The returned entries total at most `maxCharsPerTask` characters: the
+   * bound is enforced at store time (oldest evicted first, oversized newest
+   * entry truncated with a marker).
    * @param taskId - task ID.
    * @returns entries in insertion order.
    */
@@ -131,6 +176,12 @@ export class ContextSelector {
 
   /**
    * Select context from entries, scored by recency and kind.
+   *
+   * The returned string never exceeds `maxChars` characters, separators
+   * included. Entries that fit whole are kept verbatim; the first entry
+   * that does not fit is truncated to the remaining budget with a
+   * truncation marker (an oversized single entry is therefore shortened,
+   * never dropped silently), and selection stops there.
    * @param entries - memory entries.
    * @param query - query for relevance (currently recency-based).
    * @returns selected context string (bounded).
@@ -140,7 +191,7 @@ export class ContextSelector {
     const scored = entries.map((entry) => {
       const kindBoost = entry.kind === 'decision' ? 0.3 : entry.kind === 'observation' ? 0.2 : 0.1
       // Recency: normalize by max timestamp.
-      const maxTs = Math.max(...entries.map((e) => e.timestampMs), 1)
+      const maxTs = Math.max(...entries.map(e => e.timestampMs), 1)
       const recency = entry.timestampMs / maxTs
       return { entry, score: recency * 0.7 + kindBoost }
     })
@@ -148,18 +199,25 @@ export class ContextSelector {
     // Sort by score descending.
     scored.sort((a, b) => b.score - a.score)
 
-    // Take until char budget.
-    const selected: string[] = []
-    let chars = 0
+    // Render within the character budget, counting separators.
+    const separator = '\n\n'
+    const rendered: string[] = []
+    let usedChars = 0
     for (const { entry } of scored) {
       const text = `[${entry.kind}] ${entry.content}`
-      if (chars + text.length > this.maxChars && selected.length > 0) break
-      selected.push(text)
-      chars += text.length
-      // Account for separator.
-      chars += 2
+      const full = (rendered.length === 0 ? '' : separator) + text
+      if (usedChars + countChars(full) <= this.maxChars) {
+        rendered.push(full)
+        usedChars += countChars(full)
+        continue
+      }
+      const remaining = this.maxChars - usedChars
+      if (remaining > 0) {
+        rendered.push(truncateToBudget(full, remaining))
+      }
+      break
     }
 
-    return selected.join('\n\n')
+    return rendered.join('')
   }
 }

@@ -6,6 +6,9 @@
  * - Correctness-only: trained on (vendor_confidence, was_correct) pairs.
  * - Monotone non-decreasing: higher vendor confidence never maps to lower
  *   calibrated correctness.
+ * - Order-invariant: identical vendor confidence values are pooled into one
+ *   weighted observation before PAVA runs, so the fit does not depend on the
+ *   input order of tied samples.
  * - Opaque: the fitted function is a stepwise constant; no intercepts, slopes,
  *   or vendor internals are exposed or reconstructible.
  * - Versioned: each fit produces a versioned record; no online updates.
@@ -21,10 +24,22 @@ export interface CalibrationObservation {
   readonly correct: 0 | 1
 }
 
+/** Identity binding a calibration fit to the decision context it was approved for. */
+export interface CalibrationIdentity {
+  /** Model the fit was approved for (pinned model id). */
+  readonly model: string
+  /** Prompt version the fit was approved for. */
+  readonly promptVersion: string
+  /** Question family the fit was approved for. */
+  readonly questionFamily: string
+}
+
 /** A fitted isotonic calibration. */
 export interface IsotonicCalibration {
   /** Version identifier for this fit. */
   readonly version: string
+  /** Identity binding this fit to its approved decision context. Null when unbound. */
+  readonly identity: CalibrationIdentity | null
   /** Sorted breakpoints: [threshold, calibratedValue] pairs. */
   readonly breakpoints: ReadonlyArray<readonly [number, number]>
   /** Number of observations used. */
@@ -35,12 +50,14 @@ export interface IsotonicCalibration {
  * Fit an isotonic regression using the Pool Adjacent Violators Algorithm.
  * @param observations - calibration observations.
  * @param version - version identifier for this fit.
+ * @param identity - identity binding the fit to its approved decision context.
  * @returns the fitted calibration.
  * @throws if fewer than 2 observations or invalid values.
  */
 export function fitIsotonic(
   observations: readonly CalibrationObservation[],
   version: string,
+  identity?: CalibrationIdentity,
 ): IsotonicCalibration {
   if (observations.length < 2) {
     throw new Error('Isotonic calibration requires at least 2 observations')
@@ -54,8 +71,22 @@ export function fitIsotonic(
   // Sort by vendor confidence.
   const sorted = [...observations].sort((a, b) => a.vendorConfidence - b.vendorConfidence)
 
+  // Pool tied scores first: identical vendor confidence values become a single
+  // weighted observation (label sum / count), so the fit is order-invariant.
+  // Insertion order follows the sorted order above.
+  const tied = new Map<number, { sum: number; count: number }>()
+  for (const obs of sorted) {
+    const existing = tied.get(obs.vendorConfidence)
+    if (existing === undefined) {
+      tied.set(obs.vendorConfidence, { sum: obs.correct, count: 1 })
+    } else {
+      existing.sum += obs.correct
+      existing.count += 1
+    }
+  }
+
   // PAVA: pool adjacent violators to enforce monotonicity.
-  // Each block is { sum, count, values }.
+  // Each block is { sum, count, minX, maxX }.
   interface Block {
     sum: number
     count: number
@@ -63,8 +94,8 @@ export function fitIsotonic(
     maxX: number
   }
   const blocks: Block[] = []
-  for (const obs of sorted) {
-    blocks.push({ sum: obs.correct, count: 1, minX: obs.vendorConfidence, maxX: obs.vendorConfidence })
+  for (const [x, weight] of tied) {
+    blocks.push({ sum: weight.sum, count: weight.count, minX: x, maxX: x })
     // Merge while the last two blocks violate monotonicity.
     // Invariant: blocks.length >= 2, so both indices are valid.
     while (blocks.length >= 2) {
@@ -93,6 +124,7 @@ export function fitIsotonic(
 
   return {
     version,
+    identity: identity ?? null,
     breakpoints,
     observationCount: observations.length,
   }

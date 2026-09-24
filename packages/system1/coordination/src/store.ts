@@ -11,6 +11,11 @@
  * - (tenant_id, idempotency_key) for deduplication
  * - (task_id, decision_id) and (task_id, attempt_id) for decisions/attempts
  * - task_id for leases (one active lease per task)
+ * - task_id for lease_epochs (one durable fencing epoch per task)
+ *
+ * Fencing epochs are durable: releasing a lease removes only the active lease
+ * row and never resets the epoch, so a stale worker holding an old token can
+ * never be mistaken for the current holder after release, expiry, or restart.
  *
  * @module @deepseek-ai/dsh-system1-coordination/store
  */
@@ -76,6 +81,11 @@ CREATE TABLE IF NOT EXISTS leases (
   holder TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_leases_expiry ON leases(expires_at);
+CREATE TABLE IF NOT EXISTS lease_epochs (
+  task_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  fencing_token INTEGER NOT NULL CHECK (fencing_token > 0)
+);
 CREATE TABLE IF NOT EXISTS idempotency_keys (
   tenant_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL,
@@ -293,46 +303,55 @@ export class CoordinationStore {
 
   /**
    * Acquire (or re-acquire) a task lease. Each acquisition bumps the fencing
-   * token monotonically. A lease held by another holder that has not expired
-   * cannot be taken.
+   * token monotonically from a durable per-task epoch that survives release,
+   * expiry, and process restart. A lease held by another holder that has not
+   * expired cannot be taken.
    * @param taskId - task to lease.
    * @param tenantId - owning tenant.
    * @param holder - identity of the acquirer.
    * @param ttlMs - lease time-to-live in milliseconds.
    * @returns the lease with the new fencing token.
+   * @throws System1Error CROSS_TENANT_DENIED when another tenant owns the task epoch.
    * @throws System1Error LEASE_CONFLICT when held by another live holder.
    */
   acquireLease(taskId: string, tenantId: string, holder: string, ttlMs: number): Lease {
     return this.transaction(() => {
       const now = this.clock.now()
-      const existing = this.db
-        .prepare('SELECT tenant_id, fencing_token, expires_at, holder FROM leases WHERE task_id = ?')
-        .get(taskId) as
-        | { tenant_id: string; fencing_token: number; expires_at: number; holder: string }
-        | undefined
-      if (existing) {
-        if (existing.tenant_id !== tenantId) {
-          throw system1Error('CROSS_TENANT_DENIED', `Task ${taskId} is leased to another tenant`, {
-            taskId,
-          })
-        }
-        if (existing.holder !== holder && existing.expires_at > now) {
-          throw system1Error('LEASE_CONFLICT', `Task ${taskId} is leased to ${existing.holder}`, {
-            taskId,
-            holder: existing.holder,
-          })
-        }
-        const fencingToken = existing.fencing_token + 1
-        const expiresAt = now + ttlMs
-        this.db
-          .prepare('UPDATE leases SET fencing_token = ?, expires_at = ?, holder = ? WHERE task_id = ?')
-          .run(fencingToken, expiresAt, holder, taskId)
-        return { taskId, tenantId, fencingToken, expiresAt, holder }
+      const epoch = this.db
+        .prepare('SELECT tenant_id, fencing_token FROM lease_epochs WHERE task_id = ?')
+        .get(taskId) as { tenant_id: string; fencing_token: number } | undefined
+      if (epoch && epoch.tenant_id !== tenantId) {
+        throw system1Error('CROSS_TENANT_DENIED', `Task ${taskId} is leased to another tenant`, {
+          taskId,
+        })
       }
-      const fencingToken = 1
+      const existing = this.db
+        .prepare('SELECT fencing_token, expires_at, holder FROM leases WHERE task_id = ?')
+        .get(taskId) as { fencing_token: number; expires_at: number; holder: string } | undefined
+      if (existing && existing.holder !== holder && existing.expires_at > now) {
+        throw system1Error('LEASE_CONFLICT', `Task ${taskId} is leased to ${existing.holder}`, {
+          taskId,
+          holder: existing.holder,
+        })
+      }
+      const fencingToken = (epoch?.fencing_token ?? 0) + 1
       const expiresAt = now + ttlMs
       this.db
-        .prepare('INSERT INTO leases (task_id, tenant_id, fencing_token, expires_at, holder) VALUES (?, ?, ?, ?, ?)')
+        .prepare(
+          `INSERT INTO lease_epochs (task_id, tenant_id, fencing_token)
+           VALUES (?, ?, ?)
+           ON CONFLICT(task_id) DO UPDATE SET fencing_token = excluded.fencing_token`,
+        )
+        .run(taskId, tenantId, fencingToken)
+      this.db
+        .prepare(
+          `INSERT INTO leases (task_id, tenant_id, fencing_token, expires_at, holder)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(task_id) DO UPDATE SET
+             fencing_token = excluded.fencing_token,
+             expires_at = excluded.expires_at,
+             holder = excluded.holder`,
+        )
         .run(taskId, tenantId, fencingToken, expiresAt, holder)
       return { taskId, tenantId, fencingToken, expiresAt, holder }
     })
@@ -380,8 +399,13 @@ export class CoordinationStore {
 
   /**
    * Release a lease. Only the current fencing-token holder may release.
+   * Release relinquishes ownership only: the durable fencing epoch is kept,
+   * so the next acquisition continues the token sequence instead of
+   * restarting at 1. A stale token (for example from a worker whose lease
+   * was already released and re-acquired) is rejected.
    * @param taskId - leased task.
    * @param fencingToken - fencing token the caller holds.
+   * @throws System1Error STALE_FENCING_TOKEN when the token is not the current one.
    */
   releaseLease(taskId: string, fencingToken: number): void {
     this.transaction(() => {
@@ -394,6 +418,8 @@ export class CoordinationStore {
           taskId,
         })
       }
+      // Delete the active lease row only; the epoch row in lease_epochs is
+      // retained so fencing tokens stay monotonic across releases.
       this.db.prepare('DELETE FROM leases WHERE task_id = ?').run(taskId)
     })
   }

@@ -1,9 +1,11 @@
-/** MCP adapter tests. */
+/** MCP adapter tests: controlled execution, namespaced identity, resilience. */
 
 import { describe, expect, it } from 'vitest'
 import { McpAdapter } from '@deepseek-ai/dsh-system1-mcp'
 import type { McpExecutor, McpToolDefinition } from '@deepseek-ai/dsh-system1-mcp'
+import { System1Error, system1Error } from '@deepseek-ai/dsh-system1-contracts'
 import type { Candidate } from '@deepseek-ai/dsh-system1-contracts'
+import { checkSchemaSupport, validateJsonSchemaArgs } from '../src/json-schema.ts'
 
 const readDef: McpToolDefinition = {
   name: 'read-file',
@@ -19,7 +21,23 @@ const writeDef: McpToolDefinition = {
   inputSchema: { type: 'object' },
 }
 
-function testCandidate(operationRef: string, effect: 'read' | 'write' = 'read'): Candidate {
+const ciDef: McpToolDefinition = {
+  name: 'ci',
+  description: 'CI',
+  mutates: false,
+  inputSchema: {
+    type: 'object',
+    required: ['repo'],
+    properties: { repo: { type: 'string' } },
+    additionalProperties: false,
+  },
+}
+
+function testCandidate(
+  operationRef: string,
+  effect: 'read' | 'write' | 'external' = 'read',
+  verificationPolicyId = 'v1',
+): Candidate {
   return {
     id: 'c1',
     label: 'Test',
@@ -27,8 +45,20 @@ function testCandidate(operationRef: string, effect: 'read' | 'write' = 'read'):
     effect,
     operationRef,
     preconditionHash: 'h1',
-    verificationPolicyId: 'v1',
+    verificationPolicyId,
   }
+}
+
+function rejectedWithCode(promise: Promise<unknown>, code: string): Promise<void> {
+  return promise.then(
+    () => {
+      throw new Error(`expected rejection with ${code}`)
+    },
+    (error: unknown) => {
+      expect(error).toBeInstanceOf(System1Error)
+      expect((error as System1Error).code).toBe(code)
+    },
+  )
 }
 
 describe('McpAdapter', () => {
@@ -38,11 +68,38 @@ describe('McpAdapter', () => {
     })
     const readTool = adapter.adaptTool(readDef, 'verify:read:v1')
     expect(readTool.toolId).toBe('mcp:read-file')
+    expect(readTool.operationRef).toBe('op:mcp:read-file:v1')
     expect(readTool.effect).toBe('read')
 
     const writeTool = adapter.adaptTool(writeDef, 'verify:write:v1')
     expect(writeTool.toolId).toBe('mcp:write-file')
+    expect(writeTool.operationRef).toBe('op:mcp:write-file:v1')
     expect(writeTool.effect).toBe('write')
+  })
+
+  it('namespaces tool identity by server and catalog generation', () => {
+    const adapter = new McpAdapter({
+      executor: { execute: async () => null },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1', {
+      serverId: 'github',
+      catalogVersion: 'c7',
+    })
+    expect(tool.toolId).toBe('mcp:github:read-file')
+    expect(tool.operationRef).toBe('op:mcp:github:read-file:c7')
+
+    const serverOnly = adapter.adaptTool(readDef, 'verify:read:v1', { serverId: 'github' })
+    expect(serverOnly.toolId).toBe('mcp:github:read-file')
+    expect(serverOnly.operationRef).toBe('op:mcp:github:read-file:v1')
+  })
+
+  it('rejects tools whose inputSchema the adapter cannot validate', () => {
+    const adapter = new McpAdapter({
+      executor: { execute: async () => null },
+    })
+    expect(() =>
+      adapter.adaptTool({ ...readDef, inputSchema: { $ref: '#/$defs/tool' } }, 'verify:read:v1'),
+    ).toThrow(/cannot validate/)
   })
 
   it('executes candidates via MCP', async () => {
@@ -55,12 +112,193 @@ describe('McpAdapter', () => {
     expect(result).toEqual({ toolName: 'read-file', args: { path: '/tmp' }, ok: true })
   })
 
+  it('dispatches namespaced tools under their tool name', async () => {
+    let seenName: string | null = null
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async (toolName) => {
+          seenName = toolName
+          return 'ok'
+        },
+      },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1', { serverId: 'github', catalogVersion: 'c7' })
+    const result = await adapter.executeCandidate(
+      testCandidate(tool.operationRef),
+      {},
+      new AbortController().signal,
+    )
+    expect(result).toBe('ok')
+    expect(seenName).toBe('read-file')
+  })
+
   it('rejects non-MCP candidates', async () => {
     const adapter = new McpAdapter({ executor: { execute: async () => null } })
     const candidate = testCandidate('op:other:v1')
     await expect(
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
     ).rejects.toThrow(/Not an MCP candidate/)
+  })
+
+  it('R26: never dispatches an already-cancelled MCP call', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return null
+        },
+      },
+    })
+    const controller = new AbortController()
+    controller.abort()
+    const candidate = testCandidate('op:mcp:read-file:v1')
+    await rejectedWithCode(adapter.executeCandidate(candidate, {}, controller.signal), 'TASK_CANCELLED')
+    expect(executed).toBe(false)
+  })
+
+  it('R27: rejects write dispatch without a verification policy', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'changed'
+        },
+      },
+    })
+    const candidate = testCandidate('op:mcp:write-file:v1', 'write', '')
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, {}, new AbortController().signal),
+      'EFFECT_NOT_ALLOWED',
+    )
+    expect(executed).toBe(false)
+  })
+
+  it('R27: rejects external-effect dispatch without a verification policy', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'changed'
+        },
+      },
+    })
+    const candidate = testCandidate('op:mcp:notify:v1', 'external', '   ')
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, {}, new AbortController().signal),
+      'EFFECT_NOT_ALLOWED',
+    )
+    expect(executed).toBe(false)
+  })
+
+  it('R27: dispatches writes carrying a verification policy', async () => {
+    const adapter = new McpAdapter({ executor: { execute: async () => 'written' } })
+    const tool = adapter.adaptTool(writeDef, 'verify:write:v1')
+    const result = await adapter.executeCandidate(
+      testCandidate(tool.operationRef, 'write', 'verify:write:v1'),
+      {},
+      new AbortController().signal,
+    )
+    expect(result).toBe('written')
+  })
+
+  it('R28: rejects invalid MCP arguments before dispatch', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'ran'
+        },
+      },
+    })
+    const tool = adapter.adaptTool(ciDef, 'verify-ci')
+    const candidate = testCandidate(tool.operationRef)
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, { repo: 42 }, new AbortController().signal),
+      'SCHEMA_VALIDATION_FAILED',
+    )
+    expect(executed).toBe(false)
+  })
+
+  it('R28: rejects missing required and unexpected arguments', async () => {
+    const adapter = new McpAdapter({ executor: { execute: async () => 'ran' } })
+    const tool = adapter.adaptTool(ciDef, 'verify-ci')
+    const candidate = testCandidate(tool.operationRef)
+    const signal = (): AbortSignal => new AbortController().signal
+    await rejectedWithCode(adapter.executeCandidate(candidate, {}, signal()), 'SCHEMA_VALIDATION_FAILED')
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, { repo: 'x', extra: 1 }, signal()),
+      'SCHEMA_VALIDATION_FAILED',
+    )
+  })
+
+  it('R28: dispatches arguments that satisfy the input schema', async () => {
+    const adapter = new McpAdapter({ executor: { execute: async (_tool, args) => args } })
+    const tool = adapter.adaptTool(ciDef, 'verify-ci')
+    const result = await adapter.executeCandidate(
+      testCandidate(tool.operationRef),
+      { repo: 'deepseek-harness' },
+      new AbortController().signal,
+    )
+    expect(result).toEqual({ repo: 'deepseek-harness' })
+  })
+
+  it('reports failed writes as unknown outcomes, never exactly-once', async () => {
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          throw new Error('disk on fire')
+        },
+      },
+    })
+    const tool = adapter.adaptTool(writeDef, 'verify:write:v1')
+    const error: unknown = await adapter
+      .executeCandidate(
+        testCandidate(tool.operationRef, 'write', 'verify:write:v1'),
+        {},
+        new AbortController().signal,
+      )
+      .catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(System1Error)
+    expect((error as System1Error).code).toBe('EXECUTION_UNKNOWN')
+    expect((error as System1Error).message).toMatch(/reconcile/)
+  })
+
+  it('rethrows read failures unchanged', async () => {
+    const failure = new Error('MCP down')
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          throw failure
+        },
+      },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1')
+    await expect(
+      adapter.executeCandidate(testCandidate(tool.operationRef), {}, new AbortController().signal),
+    ).rejects.toBe(failure)
+  })
+
+  it('preserves structured errors thrown by the executor', async () => {
+    const inner = system1Error('PROVIDER_TRANSPORT_FAILED', 'client exploded')
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          throw inner
+        },
+      },
+    })
+    const tool = adapter.adaptTool(writeDef, 'verify:write:v1')
+    await expect(
+      adapter.executeCandidate(
+        testCandidate(tool.operationRef, 'write', 'verify:write:v1'),
+        {},
+        new AbortController().signal,
+      ),
+    ).rejects.toBe(inner)
   })
 
   it('opens circuit after threshold failures', async () => {
@@ -78,13 +316,13 @@ describe('McpAdapter', () => {
     await expect(
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
     ).rejects.toThrow(/MCP down/)
-    expect(adapter.getCircuitState('failing-tool')).toBe('closed')
+    expect(adapter.getCircuitState('mcp:failing-tool')).toBe('closed')
 
     // Second failure: circuit opens.
     await expect(
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
     ).rejects.toThrow(/MCP down/)
-    expect(adapter.getCircuitState('failing-tool')).toBe('open')
+    expect(adapter.getCircuitState('mcp:failing-tool')).toBe('open')
     expect(calls).toBe(2)
 
     // Third call: rejected without executing.
@@ -92,6 +330,34 @@ describe('McpAdapter', () => {
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
     ).rejects.toThrow(/Circuit open/)
     expect(calls).toBe(2)
+  })
+
+  it('isolates circuits by namespaced tool identity', async () => {
+    let calls = 0
+    const executor: McpExecutor = {
+      execute: async () => {
+        calls++
+        throw new Error('MCP down')
+      },
+    }
+    const adapter = new McpAdapter({ executor, failureThreshold: 1 })
+    const defA: McpToolDefinition = { ...readDef, name: 'deploy' }
+    const toolA = adapter.adaptTool(defA, 'v', { serverId: 'a' })
+    const toolB = adapter.adaptTool(defA, 'v', { serverId: 'b' })
+    const signal = (): AbortSignal => new AbortController().signal
+
+    await expect(
+      adapter.executeCandidate(testCandidate(toolA.operationRef), {}, signal()),
+    ).rejects.toThrow(/MCP down/)
+    expect(adapter.getCircuitState('mcp:a:deploy')).toBe('open')
+    // Same tool name on another server keeps its own closed circuit.
+    expect(adapter.getCircuitState('mcp:b:deploy')).toBe('closed')
+
+    await expect(
+      adapter.executeCandidate(testCandidate(toolB.operationRef), {}, signal()),
+    ).rejects.toThrow(/MCP down/)
+    expect(calls).toBe(2)
+    expect(adapter.getCircuitState('mcp:b:deploy')).toBe('open')
   })
 
   it('half-opens after reset timeout', async () => {
@@ -114,7 +380,7 @@ describe('McpAdapter', () => {
     await expect(
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
     ).rejects.toThrow(/down/)
-    expect(adapter.getCircuitState('flaky')).toBe('open')
+    expect(adapter.getCircuitState('mcp:flaky')).toBe('open')
 
     // Before timeout: still open.
     now = 500
@@ -127,7 +393,7 @@ describe('McpAdapter', () => {
     shouldFail = false
     const result = await adapter.executeCandidate(candidate, {}, new AbortController().signal)
     expect(result).toBe('recovered')
-    expect(adapter.getCircuitState('flaky')).toBe('closed')
+    expect(adapter.getCircuitState('mcp:flaky')).toBe('closed')
   })
 
   it('propagates abort to MCP execution', async () => {
@@ -175,6 +441,156 @@ describe('McpAdapter', () => {
 
   it('returns closed for unknown tools', () => {
     const adapter = new McpAdapter({ executor: { execute: async () => null } })
-    expect(adapter.getCircuitState('unknown')).toBe('closed')
+    expect(adapter.getCircuitState('mcp:unknown')).toBe('closed')
+  })
+})
+
+describe('checkSchemaSupport', () => {
+  it('accepts boolean schemas', () => {
+    expect(checkSchemaSupport(true)).toEqual([])
+    expect(checkSchemaSupport(false)).toEqual([])
+  })
+
+  it('rejects non-object schemas', () => {
+    expect(checkSchemaSupport('nope')).toHaveLength(1)
+  })
+
+  it('accepts the supported subset and ignores annotations', () => {
+    expect(
+      checkSchemaSupport({
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
+        title: 't',
+        description: 'd',
+        default: 1,
+        examples: [1],
+        type: 'object',
+        properties: { n: { type: 'integer' } },
+        required: ['n'],
+        additionalProperties: false,
+      }),
+    ).toEqual([])
+  })
+
+  it('rejects unsupported keywords at the top level and nested', () => {
+    expect(checkSchemaSupport({ type: 'object', $ref: '#/$defs/x' })).toHaveLength(1)
+    expect(
+      checkSchemaSupport({ type: 'object', properties: { n: { allOf: [] } } }),
+    ).toHaveLength(1)
+    expect(checkSchemaSupport({ type: 'array', items: { $ref: '#/$defs/x' } })).toHaveLength(1)
+  })
+
+  it('inspects nested boolean and absent item schemas without failing', () => {
+    expect(
+      checkSchemaSupport({ type: 'object', properties: { flag: true } }),
+    ).toEqual([])
+    expect(checkSchemaSupport({ type: 'array' })).toEqual([])
+  })
+})
+
+describe('validateJsonSchemaArgs', () => {
+  it('fails closed on unsupported schemas', () => {
+    expect(validateJsonSchemaArgs({ $ref: '#/$defs/x' }, {})).toHaveLength(1)
+  })
+
+  it('handles boolean and malformed schemas', () => {
+    expect(validateJsonSchemaArgs(true, { anything: 1 })).toEqual([])
+    expect(validateJsonSchemaArgs(false, { anything: 1 })).toHaveLength(1)
+    expect(validateJsonSchemaArgs('nope', {})).toHaveLength(1)
+  })
+
+  it('accepts schemas without a type', () => {
+    expect(validateJsonSchemaArgs({}, 42)).toEqual([])
+  })
+
+  it('validates const and enum', () => {
+    expect(validateJsonSchemaArgs({ const: 'a' }, 'a')).toEqual([])
+    expect(validateJsonSchemaArgs({ const: 'a' }, 'b')).toHaveLength(1)
+    expect(validateJsonSchemaArgs({ enum: ['a', 'b'] }, 'b')).toEqual([])
+    expect(validateJsonSchemaArgs({ enum: ['a', 'b'] }, 'c')).toHaveLength(1)
+    expect(validateJsonSchemaArgs({ enum: 'a' }, 'a')).toHaveLength(1)
+  })
+
+  it('validates primitive types', () => {
+    const cases: Array<[unknown, unknown, boolean]> = [
+      [{ type: 'string' }, 'x', true],
+      [{ type: 'string' }, 42, false],
+      [{ type: 'number' }, 1.5, true],
+      [{ type: 'number' }, 'x', false],
+      [{ type: 'boolean' }, true, true],
+      [{ type: 'boolean' }, 1, false],
+      [{ type: 'integer' }, 3, true],
+      [{ type: 'integer' }, 1.5, false],
+      [{ type: 'integer' }, 'x', false],
+      [{ type: 'null' }, null, true],
+      [{ type: 'null' }, 0, false],
+      [{ type: 'weird' }, 1, false],
+    ]
+    for (const [schema, value, valid] of cases) {
+      expect(validateJsonSchemaArgs(schema, value)).toHaveLength(valid ? 0 : 1)
+    }
+  })
+
+  it('validates objects', () => {
+    const schema = {
+      type: 'object',
+      required: ['repo'],
+      properties: { repo: { type: 'string' }, count: { type: 'integer' } },
+      additionalProperties: false,
+    }
+    expect(validateJsonSchemaArgs(schema, { repo: 'x', count: 2 })).toEqual([])
+    expect(validateJsonSchemaArgs(schema, { repo: 'x' })).toEqual([])
+    expect(validateJsonSchemaArgs(schema, { count: 2 })).toHaveLength(1)
+    expect(validateJsonSchemaArgs(schema, { repo: 'x', extra: true })).toHaveLength(1)
+    expect(validateJsonSchemaArgs(schema, { repo: 42 })).toHaveLength(1)
+    expect(validateJsonSchemaArgs(schema, [1])).toHaveLength(1)
+    expect(validateJsonSchemaArgs(schema, null)).toHaveLength(1)
+  })
+
+  it('validates objects with open additional properties', () => {
+    expect(validateJsonSchemaArgs({ type: 'object' }, { anything: 1 })).toEqual([])
+    expect(
+      validateJsonSchemaArgs({ type: 'object', additionalProperties: false }, { a: 1 }),
+    ).toHaveLength(1)
+    expect(
+      validateJsonSchemaArgs({ type: 'object', additionalProperties: false }, {}),
+    ).toEqual([])
+  })
+
+  it('tolerates malformed object keywords without crashing', () => {
+    expect(validateJsonSchemaArgs({ type: 'object', required: 'repo' }, {})).toEqual([])
+    expect(validateJsonSchemaArgs({ type: 'object', required: [42] }, {})).toEqual([])
+    expect(validateJsonSchemaArgs({ type: 'object', properties: 42 }, { a: 1 })).toEqual([])
+  })
+
+  it('rejects malformed nested schemas', () => {
+    expect(
+      validateJsonSchemaArgs({ type: 'object', properties: { x: 'nope' } }, { x: 1 }),
+    ).toHaveLength(1)
+    expect(
+      validateJsonSchemaArgs({ type: 'object', properties: { x: false } }, { x: 1 }),
+    ).toHaveLength(1)
+    expect(
+      validateJsonSchemaArgs({ type: 'object', properties: { x: true } }, { x: 1 }),
+    ).toEqual([])
+  })
+
+  it('validates arrays', () => {
+    expect(validateJsonSchemaArgs({ type: 'array', items: { type: 'string' } }, ['a', 'b'])).toEqual([])
+    expect(
+      validateJsonSchemaArgs({ type: 'array', items: { type: 'string' } }, ['a', 1]),
+    ).toHaveLength(1)
+    expect(validateJsonSchemaArgs({ type: 'array' }, [1, 'a'])).toEqual([])
+    expect(validateJsonSchemaArgs({ type: 'array' }, [])).toEqual([])
+    expect(validateJsonSchemaArgs({ type: 'array' }, {})).toHaveLength(1)
+  })
+
+  it('validates nested structures with paths', () => {
+    const schema = {
+      type: 'object',
+      properties: { tags: { type: 'array', items: { type: 'string' } } },
+    }
+    const violations = validateJsonSchemaArgs(schema, { tags: ['ok', 42] })
+    expect(violations).toHaveLength(1)
+    expect(violations[0]).toMatch(/tags\[1\]/)
   })
 })

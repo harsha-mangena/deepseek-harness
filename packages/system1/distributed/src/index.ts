@@ -11,6 +11,7 @@ export { WorkQueue, CheckpointManager } from './distributed.ts'
 export type {
   WorkItem,
   WorkQueueConfig,
+  ClaimRecord,
   Checkpoint,
   CheckpointManagerConfig,
 } from './distributed.ts'

@@ -7,7 +7,8 @@
 /** Package version marker (ensures the barrel has executable statements). */
 export const INTEGRATION_PACKAGE_VERSION = '0.1.7-alpha.2'
 
-export { ReadOnlyCoordinator } from './coordinator.ts'
+export { ReadOnlyCoordinator, admitDecision } from './coordinator.ts'
+export type { AdmissionContext, AdmissionVerdict } from './coordinator.ts'
 export type {
   ReadOnlyExecutor,
   CoordinatorConfig,

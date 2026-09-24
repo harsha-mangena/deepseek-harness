@@ -82,6 +82,10 @@ export type DecisionReasonCode = z.infer<typeof DecisionReasonCodeSchema>
 export const NormalizedDecisionSchema = z
   .object({
     decisionId: z.string().min(1),
+    /** Echo of the DecisionInput question family; admission checks exact equality. */
+    questionFamily: z.string().min(1),
+    /** Echo of the DecisionInput prompt version; admission checks exact equality. */
+    promptVersion: z.string().min(1),
     selectedId: z.string().min(1),
     probabilities: z.record(z.string(), z.number().finite().min(0).max(1)),
     selectedProbability: z.number().finite().min(0).max(1),

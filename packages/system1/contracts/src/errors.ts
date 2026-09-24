@@ -28,6 +28,7 @@ export type System1ErrorCode =
   | 'DUPLICATE_REQUEST_ID'
   | 'CORRUPT_RECORD'
   | 'MIGRATION_FAILED'
+  | 'INVALID_CONFIG'
   // Policy denials (not retryable without change)
   | 'GUARD_BLOCKED'
   | 'GUARD_UNKNOWN'
@@ -35,6 +36,8 @@ export type System1ErrorCode =
   | 'EFFECT_NOT_ALLOWED'
   | 'CAPABILITY_NOT_GRANTED'
   | 'CANDIDATE_NOT_ADMISSIBLE'
+  | 'NO_ADMISSIBLE_CANDIDATES'
+  | 'DECISION_NOT_ADMITTED'
   | 'BUDGET_EXHAUSTED'
   | 'DELEGATION_DEPTH_EXCEEDED'
   | 'CONCURRENCY_LIMIT_EXCEEDED'
@@ -99,12 +102,15 @@ export const ERROR_RETRY_CLASSES: Readonly<Record<System1ErrorCode, ErrorRetryCl
   DUPLICATE_REQUEST_ID: 'none',
   CORRUPT_RECORD: 'none',
   MIGRATION_FAILED: 'none',
+  INVALID_CONFIG: 'none',
   GUARD_BLOCKED: 'none',
   GUARD_UNKNOWN: 'escalate',
   GUARD_MISSING: 'escalate',
   EFFECT_NOT_ALLOWED: 'none',
   CAPABILITY_NOT_GRANTED: 'none',
   CANDIDATE_NOT_ADMISSIBLE: 'none',
+  NO_ADMISSIBLE_CANDIDATES: 'none',
+  DECISION_NOT_ADMITTED: 'none',
   BUDGET_EXHAUSTED: 'escalate',
   DELEGATION_DEPTH_EXCEEDED: 'none',
   CONCURRENCY_LIMIT_EXCEEDED: 'backoff',
@@ -150,6 +156,7 @@ export function system1Error(
     'DUPLICATE_REQUEST_ID',
     'CORRUPT_RECORD',
     'MIGRATION_FAILED',
+    'INVALID_CONFIG',
   ])
   return new System1Error(code, message, {
     retryClass: ERROR_RETRY_CLASSES[code],

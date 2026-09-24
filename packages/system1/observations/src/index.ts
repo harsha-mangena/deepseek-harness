@@ -9,6 +9,7 @@ export const OBSERVATIONS_PACKAGE_VERSION = '0.1.7-alpha.2'
 
 export {
   MAX_OBSERVATION_CHARS,
+  boundChars,
   filterSecrets,
   synthesizeObservations,
   describeProvenance,

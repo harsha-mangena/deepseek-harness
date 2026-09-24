@@ -58,6 +58,8 @@ describe('recorded provider edge cases', () => {
 
   const decision = {
     decisionId: 'd1',
+      questionFamily: 'select-candidate',
+      promptVersion: 'p1',
     selectedId: 'c1',
     probabilities: { c1: 1 },
     selectedProbability: 1,

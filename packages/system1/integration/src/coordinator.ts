@@ -2,9 +2,14 @@
  * System 1 read-only coordinator: end-to-end viable integration.
  *
  * Orchestrates the full decision loop for read-only work:
- * observations → candidate menu → policy → Jev decision → calibration →
- * read-only execution. Write/mutate candidates are rejected at the
- * coordinator boundary (Phase 7 unlocks controlled mutations).
+ * observations → candidate menu → policy filter → Jev decision →
+ * admission → calibration gate → policy recheck → read-only execution.
+ *
+ * Write/mutate candidates are rejected at the coordinator boundary.
+ * Every concrete selection passes through {@link admitDecision} before
+ * execution: correlation, model pinning, menu membership, and the
+ * calibration gate are all enforced. Unsupported mutation routes stay
+ * disabled.
  *
  * @module @deepseek-ai/dsh-system1-integration/coordinator
  */
@@ -44,7 +49,20 @@ export interface CoordinatorConfig {
   readonly capabilityProfile: CapabilityProfile
   readonly provider: DecisionProvider
   readonly executor: ReadOnlyExecutor
-  readonly calibration: IsotonicCalibration | null
+  /**
+   * Calibration used to gate execution. Required: a concrete selection
+   * cannot be admitted without a bound calibration to gate it against.
+   */
+  readonly calibration: IsotonicCalibration
+  /** Pinned model id; the decision's modelResolved must match exactly. */
+  readonly expectedModel: string
+  /** Tenant id used for policy evaluation. Never defaults. */
+  readonly tenantId: string
+  /**
+   * Minimum calibrated correctness for execution. Defaults to 0.5.
+   * Decisions below this threshold are rejected, not executed.
+   */
+  readonly minCalibratedConfidence?: number
   /** Task ID generator (injectable for tests). */
   readonly newTaskId?: () => string
   /** Decision ID generator (injectable for tests). */
@@ -67,21 +85,129 @@ export interface CoordinatorResult {
   readonly calibratedCorrectness: number | null
 }
 
+/** Context for decision admission. */
+export interface AdmissionContext {
+  /** The decision returned by the provider. */
+  readonly decision: NormalizedDecision
+  /** The input that was sent to the provider. */
+  readonly input: DecisionInput
+  /** The policy-filtered candidate menu the provider chose from. */
+  readonly admittedCandidates: readonly Candidate[]
+  /** Calibration used for gating. */
+  readonly calibration: IsotonicCalibration
+  /** Pinned model id the decision must resolve to. */
+  readonly expectedModel: string
+  /** Minimum calibrated correctness for admission. */
+  readonly minCalibratedConfidence: number
+}
+
+/** Verdict of decision admission. */
+export interface AdmissionVerdict {
+  readonly admitted: boolean
+  /** Machine-readable reason when not admitted. */
+  readonly reason: string | null
+  /** Calibrated correctness, when computable. */
+  readonly calibratedCorrectness: number | null
+}
+
+/**
+ * Authoritative decision admission: validate a provider decision before it
+ * may be executed. Checks, in order:
+ *
+ * 1. Correlation: decisionId, questionFamily, and promptVersion must exactly
+ *    equal the input they were requested with.
+ * 2. Model pinning: modelResolved must exactly equal the pinned model id
+ *    (exact equality, never prefix matching).
+ * 3. Menu membership: the selected id must be in the admitted menu, or be
+ *    the escalate-none sentinel.
+ * 4. Calibration gate: the calibration must be bound to this exact
+ *    model/prompt/question identity, and the calibrated correctness must
+ *    meet the threshold. A concrete selection with no vendor confidence
+ *    cannot be gated and is rejected.
+ *
+ * @param ctx - admission context.
+ * @returns the admission verdict.
+ */
+export function admitDecision(ctx: AdmissionContext): AdmissionVerdict {
+  const { decision, input } = ctx
+  const reject = (reason: string, calibratedCorrectness: number | null = null): AdmissionVerdict => ({
+    admitted: false,
+    reason,
+    calibratedCorrectness,
+  })
+
+  // 1. Correlation: exact equality with the requesting input.
+  if (decision.decisionId !== input.decisionId) {
+    return reject('correlation: decisionId mismatch')
+  }
+  if (decision.questionFamily !== input.questionFamily) {
+    return reject('correlation: questionFamily mismatch')
+  }
+  if (decision.promptVersion !== input.promptVersion) {
+    return reject('correlation: promptVersion mismatch')
+  }
+
+  // 2. Model pinning: exact equality with the pinned model.
+  if (decision.modelResolved !== ctx.expectedModel) {
+    return reject('model: modelResolved does not match pinned model')
+  }
+
+  // 3. Menu membership.
+  const isEscalation = decision.selectedId === 'escalate-none'
+  if (!isEscalation && !ctx.admittedCandidates.some((c) => c.id === decision.selectedId)) {
+    return reject('menu: selected candidate not in admitted menu')
+  }
+
+  // 4. Calibration gate.
+  const identity = ctx.calibration.identity
+  if (identity === null) {
+    return reject('calibration: fit is not bound to a decision identity')
+  }
+  if (
+    identity.model !== ctx.expectedModel ||
+    identity.questionFamily !== input.questionFamily ||
+    identity.promptVersion !== input.promptVersion
+  ) {
+    return reject('calibration: identity does not match this decision context')
+  }
+  if (isEscalation) {
+    // Escalation carries no selection to gate; admit without a score.
+    return { admitted: true, reason: null, calibratedCorrectness: null }
+  }
+  if (decision.vendorConfidence === null) {
+    return reject('calibration: no vendor confidence to gate on')
+  }
+  const calibratedCorrectness = calibrate(ctx.calibration, decision.vendorConfidence)
+  if (calibratedCorrectness < ctx.minCalibratedConfidence) {
+    return reject('calibration: below confidence threshold', calibratedCorrectness)
+  }
+  return { admitted: true, reason: null, calibratedCorrectness }
+}
+
 /** The read-only coordinator. */
 export class ReadOnlyCoordinator {
-  private readonly config: Required<Pick<CoordinatorConfig, 'newTaskId' | 'newDecisionId'>> &
-    Omit<CoordinatorConfig, 'newTaskId' | 'newDecisionId'>
+  private readonly config: Required<Pick<CoordinatorConfig, 'newTaskId' | 'newDecisionId' | 'minCalibratedConfidence'>> &
+    Omit<CoordinatorConfig, 'newTaskId' | 'newDecisionId' | 'minCalibratedConfidence'>
 
   /**
    * @param config - coordinator configuration.
    */
   constructor(config: CoordinatorConfig) {
+    if (!config.tenantId) {
+      throw system1Error('INVALID_CONFIG', 'Coordinator requires an explicit tenantId', {})
+    }
+    if (!config.expectedModel) {
+      throw system1Error('INVALID_CONFIG', 'Coordinator requires a pinned expectedModel', {})
+    }
     this.config = {
       policy: config.policy,
       capabilityProfile: config.capabilityProfile,
       provider: config.provider,
       executor: config.executor,
       calibration: config.calibration,
+      expectedModel: config.expectedModel,
+      tenantId: config.tenantId,
+      minCalibratedConfidence: config.minCalibratedConfidence ?? 0.5,
       newTaskId: config.newTaskId ?? (() => `task-${Date.now()}-${Math.random().toString(36).slice(2)}`),
       newDecisionId: config.newDecisionId ?? (() => `dec-${Date.now()}-${Math.random().toString(36).slice(2)}`),
     }
@@ -96,73 +222,108 @@ export class ReadOnlyCoordinator {
   async run(input: CoordinatorInput, signal: AbortSignal): Promise<CoordinatorResult> {
     const taskId = this.config.newTaskId()
     const decisionId = this.config.newDecisionId()
+    const policyVersion = input.policyVersion ?? 'p1'
 
     // 1. Synthesize observations.
     const state = synthesizeObservations(input.observations)
     const observationHash = hashObservations(input.observations)
 
-    // 2. Generate candidate menu, filtered to read-only.
+    // 2. Generate the candidate menu, filtered to read-only.
     const readOnlyCatalog = input.catalog.filter((tool) => tool.effect === 'read')
-    const candidates = generateCandidateMenu(readOnlyCatalog)
+    const menu = generateCandidateMenu(readOnlyCatalog)
 
-    // 3. Policy check: all candidates must be allowed.
-    for (const candidate of candidates) {
+    // 3. Policy filter BEFORE prediction: only admitted candidates are
+    // presented to the provider. Fail closed when nothing is admissible.
+    const admittedCandidates: Candidate[] = []
+    for (const candidate of menu) {
       const policyDecision = await this.config.policy.evaluate(
         candidate,
         this.config.capabilityProfile,
         {
           taskId,
-          tenantId: 'default',
-          policyVersion: input.policyVersion ?? 'p1',
+          tenantId: this.config.tenantId,
+          policyVersion,
         },
       )
-      if (!policyDecision.allowed) {
-        throw system1Error('CANDIDATE_NOT_ADMISSIBLE', `Candidate ${candidate.id} denied by policy`, {
-          candidateId: candidate.id,
-          reason: policyDecision.reason,
-        })
+      if (policyDecision.allowed) {
+        admittedCandidates.push(candidate)
       }
     }
+    if (admittedCandidates.length === 0) {
+      throw system1Error('NO_ADMISSIBLE_CANDIDATES', 'Policy denied every candidate in the menu', {
+        taskId,
+        menuSize: menu.length,
+      })
+    }
 
-    // 4. Jev decision.
+    // 4. Jev decision over the admitted menu only.
+    const questionFamily = 'select-candidate'
+    const promptVersion = 'p1'
     const decisionInput: DecisionInput = {
       schemaVersion: 1,
       taskId,
       decisionId,
       stateVersion: input.stateVersion ?? 0,
-      policyVersion: input.policyVersion ?? 'p1',
+      policyVersion,
       catalogVersion: input.catalogVersion ?? 'c1',
       observationHash,
-      questionFamily: 'select-candidate',
-      promptVersion: 'p1',
+      questionFamily,
+      promptVersion,
       state,
-      candidates,
+      candidates: admittedCandidates,
     }
     const decision = await this.config.provider.decide(decisionInput, signal)
 
-    // 5. Calibration (if available and vendor confidence present).
-    let calibratedCorrectness: number | null = null
-    if (this.config.calibration && decision.vendorConfidence !== null) {
-      calibratedCorrectness = calibrate(this.config.calibration, decision.vendorConfidence)
+    // 5. Authoritative admission: correlation, model pinning, menu
+    // membership, and the calibration gate.
+    const verdict = admitDecision({
+      decision,
+      input: decisionInput,
+      admittedCandidates,
+      calibration: this.config.calibration,
+      expectedModel: this.config.expectedModel,
+      minCalibratedConfidence: this.config.minCalibratedConfidence,
+    })
+    if (!verdict.admitted) {
+      throw system1Error('DECISION_NOT_ADMITTED', `Decision failed admission: ${verdict.reason}`, {
+        decisionId: decision.decisionId,
+        reason: verdict.reason,
+        calibratedCorrectness: verdict.calibratedCorrectness,
+      })
     }
 
     // 6. Execute if a concrete candidate was selected (not escalate).
     let outcome: ExecutionOutcome | null = null
     if (decision.selectedId !== 'escalate-none') {
-      const selected = candidates.find((c) => c.id === decision.selectedId)
+      const selected = admittedCandidates.find((c) => c.id === decision.selectedId)
+      // Unreachable: admission already verified menu membership.
+      /* istanbul ignore next -- defensive: admission guarantees membership */
       if (!selected) {
         throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Selected candidate not in menu', {
           selectedId: decision.selectedId,
         })
       }
       // Defense in depth: coordinator never executes non-read effects.
-      // This is unreachable when the read-only filter above is correct;
-      // it guards against future filter regressions.
+      // Unreachable when the read-only filter above is correct; it guards
+      // against future filter regressions.
       /* istanbul ignore next -- defensive: filter guarantees read-only */
       if (selected.effect !== 'read') {
         throw system1Error('EFFECT_NOT_ALLOWED', 'Coordinator is read-only', {
           candidateId: selected.id,
           effect: selected.effect,
+        })
+      }
+      // Policy recheck immediately before dispatch: the grant is
+      // re-evaluated at dispatch time, not trusted from step 3.
+      const recheck = await this.config.policy.evaluate(selected, this.config.capabilityProfile, {
+        taskId,
+        tenantId: this.config.tenantId,
+        policyVersion,
+      })
+      if (!recheck.allowed) {
+        throw system1Error('CANDIDATE_NOT_ADMISSIBLE', `Selected candidate denied on dispatch recheck`, {
+          candidateId: selected.id,
+          reason: recheck.reason,
         })
       }
       outcome = await this.config.executor.execute(selected, signal)
@@ -171,14 +332,15 @@ export class ReadOnlyCoordinator {
     // Attach calibration to the decision for the result.
     const calibratedDecision: NormalizedDecision = {
       ...decision,
-      calibratedCorrectness,
-      calibrationVersion: calibratedCorrectness !== null ? this.config.calibration!.version : null,
+      calibratedCorrectness: verdict.calibratedCorrectness,
+      calibrationVersion:
+        verdict.calibratedCorrectness !== null ? this.config.calibration.version : null,
     }
 
     return {
       decision: calibratedDecision,
       outcome,
-      calibratedCorrectness,
+      calibratedCorrectness: verdict.calibratedCorrectness,
     }
   }
 }

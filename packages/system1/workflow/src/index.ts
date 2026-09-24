@@ -35,8 +35,11 @@ declare module '@deepseek-ai/cordis' {
 
 /** System 1 workflow plugin: creates and owns coordinator agents. */
 export class System1Workflows extends Service {
-  // Coordinator creation needs the registry; injection orders startup after it.
-  static inject = ['agents']
+  // Coordinator creation needs the registry; injection orders startup after
+  // it. The coordinator owns a private Cordis scope, and scoped tool
+  // registrations must resolve through it, so the tool runtime is a
+  // required dependency too.
+  static inject = ['agents', 'tools']
 
   static Config: z<System1WorkflowConfig> = z.object({
     mode: z.union(['off', 'shadow', 'enforce']).default('off'),

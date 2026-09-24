@@ -1,10 +1,19 @@
 /**
  * Normalize Jev API responses to NormalizedDecision.
  *
- * Handles choice, score, and noul response types. The selected candidate ID
- * must be one of the input candidates; otherwise the response is malformed.
- * Raw probabilities, vendor confidence, and calibrated correctness remain
- * distinct fields.
+ * The provider only issues `choice` questions. An answer whose `type` is
+ * present but is not `choice` is rejected as a type mismatch: per the Jev
+ * wire spec, Noul is a yes/no probability, not an abstention, so a Noul
+ * answer to a Choice request is malformed. The explicit escalation option
+ * is the Choice fallback.
+ *
+ * A choice answer carries a complete probability map: every candidate ID
+ * must appear exactly once, keys outside the candidate set are rejected,
+ * values are finite numbers in [0,1], and the values sum to 1 within a
+ * small tolerance. Score and Noul wire shapes without an explicit answer
+ * type are still parsed, so typed handling stays available if those
+ * question types are requested later. Raw probabilities, vendor
+ * confidence, and calibrated correctness remain distinct fields.
  *
  * @module @deepseek-ai/dsh-system1-jev/normalize
  */
@@ -26,6 +35,7 @@ interface JevRawResponse {
 
 /** Raw per-question answer shape (partial). */
 interface JevRawAnswer {
+  readonly type?: unknown
   readonly choice?: unknown
   readonly score?: unknown
   readonly noul?: unknown
@@ -33,6 +43,12 @@ interface JevRawAnswer {
   readonly confidence?: unknown
   readonly legend?: unknown
 }
+
+/** The only answer type this provider requests. */
+const CHOICE_ANSWER_TYPE = 'choice'
+
+/** Tolerance for probability sums (floating-point rounding). */
+const PROBABILITY_SUM_TOLERANCE = 1e-6
 
 /**
  * Normalize a raw Jev response to a NormalizedDecision.
@@ -53,7 +69,8 @@ export function normalizeJevResponse(
   const response = raw as JevRawResponse
   const candidateIds = new Set(input.candidates.map(c => c.id))
 
-  // Answers are keyed by question ID under `answers`.
+  // Answers are keyed by question ID under `answers`; the key lookup is the
+  // question-ID match.
   if (typeof response.answers !== 'object' || response.answers === null) {
     throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev response has no answers', {})
   }
@@ -65,10 +82,23 @@ export function normalizeJevResponse(
   }
   const result = answer as JevRawAnswer
 
-  // Noul: the model abstained.
+  // The provider only sends choice questions; an explicit different answer
+  // type is a wire mismatch, never an abstention.
+  if (result.type !== undefined && result.type !== CHOICE_ANSWER_TYPE) {
+    throw system1Error(
+      'PROVIDER_MALFORMED_RESPONSE',
+      'Jev answer type does not match the requested choice question',
+      { questionId: input.questionFamily, answerType: result.type },
+    )
+  }
+
+  // Noul: legacy abstention wire shape, kept for typed handling if Noul
+  // questions are requested later.
   if (result.noul !== undefined) {
     return {
       decisionId: input.decisionId,
+      questionFamily: input.questionFamily,
+      promptVersion: input.promptVersion,
       selectedId: 'escalate-none',
       probabilities: {},
       selectedProbability: 0,
@@ -92,12 +122,17 @@ export function normalizeJevResponse(
       })
     }
     const probabilities = parseProbabilities(result.probabilities, candidateIds)
+    // parseProbabilities guarantees an entry for every candidate ID,
+    // including the selected choice.
+    const selectedProbability = probabilities[choice] as number
     return {
       decisionId: input.decisionId,
+      questionFamily: input.questionFamily,
+      promptVersion: input.promptVersion,
       selectedId: choice,
       probabilities,
-      selectedProbability: probabilities[choice] ?? 0,
-      vendorConfidence: asNumberOrNull(result.confidence),
+      selectedProbability,
+      vendorConfidence: parseConfidence(result.confidence),
       calibratedCorrectness: null,
       calibrationVersion: null,
       modelRequested,
@@ -108,19 +143,18 @@ export function normalizeJevResponse(
     }
   }
 
-  // Score: the model scored candidates; select the highest.
+  // Score: legacy wire shape; select the highest-probability candidate.
   if (result.score !== undefined) {
     const probabilities = parseProbabilities(result.probabilities ?? result.score, candidateIds)
     const top = topCandidate(probabilities, candidateIds)
-    if (!top) {
-      throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev score has no valid candidate', {})
-    }
     return {
       decisionId: input.decisionId,
+      questionFamily: input.questionFamily,
+      promptVersion: input.promptVersion,
       selectedId: top.id,
       probabilities,
       selectedProbability: top.probability,
-      vendorConfidence: asNumberOrNull(result.confidence),
+      vendorConfidence: parseConfidence(result.confidence),
       calibratedCorrectness: null,
       calibrationVersion: null,
       modelRequested,
@@ -134,7 +168,15 @@ export function normalizeJevResponse(
   throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev answer has no choice, score, or noul', {})
 }
 
-/** Parse probabilities, validating against candidate IDs. */
+/**
+ * Parse a probability map, requiring exactly the candidate set: no unknown
+ * keys, no missing candidates, finite values in [0,1], and a sum of 1
+ * within tolerance.
+ * @param value - raw probability map.
+ * @param candidateIds - the complete candidate ID set.
+ * @returns the validated probability map.
+ * @throws System1Error PROVIDER_MALFORMED_RESPONSE on any deviation.
+ */
 function parseProbabilities(
   value: unknown,
   candidateIds: ReadonlySet<string>,
@@ -142,32 +184,82 @@ function parseProbabilities(
   if (typeof value !== 'object' || value === null) {
     throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev probabilities are not an object', {})
   }
+  const entries = Object.entries(value)
+  if (entries.length === 0) {
+    throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev probability map is empty', {})
+  }
   const result: Record<string, number> = {}
-  for (const [key, val] of Object.entries(value)) {
-    if (!candidateIds.has(key)) continue
+  let sum = 0
+  for (const [key, val] of entries) {
+    if (!candidateIds.has(key)) {
+      throw system1Error(
+        'PROVIDER_MALFORMED_RESPONSE',
+        `Jev probability for unknown candidate ${key}`,
+        { key },
+      )
+    }
     if (typeof val !== 'number' || !Number.isFinite(val) || val < 0 || val > 1) {
       throw system1Error('PROVIDER_MALFORMED_RESPONSE', `Invalid probability for ${key}`, { key, val })
     }
     result[key] = val
+    sum += val
+  }
+  for (const id of candidateIds) {
+    if (!(id in result)) {
+      throw system1Error(
+        'PROVIDER_MALFORMED_RESPONSE',
+        `Jev probability map is missing candidate ${id}`,
+        { id },
+      )
+    }
+  }
+  if (Math.abs(sum - 1) > PROBABILITY_SUM_TOLERANCE) {
+    throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev probabilities do not sum to 1', { sum })
   }
   return result
 }
 
-/** Select the candidate with the highest probability. */
+/**
+ * Parse vendor confidence: absent becomes null; a present value must be a
+ * finite number in [0,1].
+ * @param value - raw confidence value.
+ * @returns the confidence, or null when absent.
+ * @throws System1Error PROVIDER_MALFORMED_RESPONSE when present but invalid.
+ */
+function parseConfidence(value: unknown): number | null {
+  if (value === undefined || value === null) {
+    return null
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Jev confidence is out of range', {
+      confidence: value,
+    })
+  }
+  return value
+}
+
+/**
+ * Select the candidate with the highest probability; the first maximum in
+ * candidate order wins ties.
+ * @param probabilities - validated complete probability map.
+ * @param candidateIds - candidate IDs in selection order.
+ * @returns the top candidate and its probability.
+ */
 function topCandidate(
-  probabilities: Record<string, number>,
+  probabilities: Readonly<Record<string, number>>,
   candidateIds: ReadonlySet<string>,
-): { id: string; probability: number } | null {
-  let best: string | null = null
-  let bestProb = 0
+): { id: string; probability: number } {
+  // The map was validated to hold every candidate ID.
+  let bestId = ''
+  let bestProbability = -1
   for (const id of candidateIds) {
-    const prob = probabilities[id] ?? 0
-    if (prob > bestProb) {
-      bestProb = prob
-      best = id
+    const probability = probabilities[id] as number
+    if (probability > bestProbability) {
+      bestProbability = probability
+      bestId = id
     }
   }
-  return best === null ? null : { id: best, probability: bestProb }
+  return { id: bestId, probability: bestProbability }
 }
 
 /** Parse usage tokens (null-safe). */
@@ -184,10 +276,6 @@ function parseUsage(value: unknown): { inputTokens: number | null; outputTokens:
 
 function asStringOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null
-}
-
-function asNumberOrNull(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
 function asIntOrNull(value: unknown): number | null {

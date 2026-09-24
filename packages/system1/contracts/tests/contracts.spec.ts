@@ -69,6 +69,8 @@ describe('contract schemas', () => {
   it('validates normalized decisions with distinct confidence fields', () => {
     const decision = {
       decisionId: 'd1',
+        questionFamily: 'select-candidate',
+        promptVersion: 'p1',
       selectedId: 'c1',
       probabilities: { c1: 0.9, c2: 0.1 },
       selectedProbability: 0.9,

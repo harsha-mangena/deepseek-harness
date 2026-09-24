@@ -53,6 +53,44 @@ describe('isotonic calibration', () => {
     expect(calibrate(cal, 0.9)).toBe(0.5)
   })
 
+  it('pools tied vendor-confidence values before PAVA (order-invariant)', () => {
+    // Same multiset of observations in two different input orders must
+    // produce identical fits: tied scores are pooled first, so PAVA never
+    // sees order-dependent adjacent violators among ties.
+    const forward: CalibrationObservation[] = [
+      { vendorConfidence: 0.5, correct: 1 },
+      { vendorConfidence: 0.5, correct: 0 },
+      { vendorConfidence: 0.5, correct: 1 },
+      { vendorConfidence: 0.9, correct: 1 },
+      { vendorConfidence: 0.1, correct: 0 },
+    ]
+    const reverse = [...forward].reverse()
+    const calA = fitIsotonic(forward, 'v-tie')
+    const calB = fitIsotonic(reverse, 'v-tie')
+    expect(calA.breakpoints).toEqual(calB.breakpoints)
+    // The tied 0.5 group pools to mean 2/3 before PAVA.
+    expect(calibrate(calA, 0.5)).toBeCloseTo(2 / 3, 10)
+    for (let x = 0; x <= 1.001; x += 0.1) {
+      expect(calibrate(calA, x)).toBe(calibrate(calB, x))
+    }
+  })
+
+  it('binds an identity to the fit when provided', () => {
+    const observations: CalibrationObservation[] = [
+      { vendorConfidence: 0.2, correct: 0 },
+      { vendorConfidence: 0.8, correct: 1 },
+    ]
+    const identity = {
+      model: 'jev-v1',
+      promptVersion: 'p1',
+      questionFamily: 'select-candidate',
+    }
+    const bound = fitIsotonic(observations, 'v2', identity)
+    expect(bound.identity).toEqual(identity)
+    const unbound = fitIsotonic(observations, 'v2')
+    expect(unbound.identity).toBeNull()
+  })
+
   it('rejects invalid inputs', () => {
     expect(() => fitIsotonic([], 'v1')).toThrow(/at least 2/)
     expect(() => fitIsotonic([{ vendorConfidence: 0.5, correct: 1 }], 'v1')).toThrow(/at least 2/)
@@ -85,9 +123,9 @@ describe('isotonic calibration', () => {
       'v1',
     )
     expect(() => calibrate(cal, NaN)).toThrow(/finite/)
-    expect(() => calibrate({ version: 'v', breakpoints: [], observationCount: 0 }, 0.5)).toThrow(
-      /no breakpoints/,
-    )
+    expect(() =>
+      calibrate({ version: 'v', identity: null, breakpoints: [], observationCount: 0 }, 0.5),
+    ).toThrow(/no breakpoints/)
   })
 
   it('extrapolates with nearest breakpoint', () => {
@@ -122,6 +160,8 @@ const testInput: DecisionInput = {
 function testDecision(selectedId: string): NormalizedDecision {
   return {
     decisionId: 'd1',
+    questionFamily: 'q1',
+    promptVersion: 'p1',
     selectedId,
     probabilities: {},
     selectedProbability: 0.8,
@@ -151,6 +191,8 @@ describe('shadow evaluator', () => {
     await evaluator.evaluateShadow(testInput, new AbortController().signal)
     expect(records).toHaveLength(1)
     expect(records[0].agrees).toBe(true)
+    expect(records[0].comparison).toBe('agree')
+    expect(records[0].providerFailed).toBe(false)
     expect(records[0].timestampMs).toBe(12345)
 
     // Disagreement.
@@ -162,10 +204,11 @@ describe('shadow evaluator', () => {
     })
     await evaluator2.evaluateShadow(testInput, new AbortController().signal)
     expect(records[1].agrees).toBe(false)
+    expect(records[1].comparison).toBe('disagree')
     expect(records[1].baselineSelectedId).toBe('c2')
   })
 
-  it('handles missing baseline as agreement', async () => {
+  it('records a missing baseline as unknown, never as agreement', async () => {
     const records: ShadowRecord[] = []
     const provider: DecisionProvider = {
       decide: async () => testDecision('c1'),
@@ -175,12 +218,16 @@ describe('shadow evaluator', () => {
       sink: (r) => records.push(r),
     })
     await evaluator.evaluateShadow(testInput, new AbortController().signal)
-    expect(records[0].agrees).toBe(true)
+    expect(records).toHaveLength(1)
+    expect(records[0].agrees).toBe(false)
+    expect(records[0].comparison).toBe('unknown')
     expect(records[0].baselineSelectedId).toBeNull()
+    expect(records[0].providerFailed).toBe(false)
   })
 
-  it('swallows provider failures without recording', async () => {
+  it('records provider failures instead of dropping them', async () => {
     const records: ShadowRecord[] = []
+    const errors: unknown[] = []
     const provider: DecisionProvider = {
       decide: async () => {
         throw system1Error('PROVIDER_TIMEOUT', 'timeout', {})
@@ -189,8 +236,47 @@ describe('shadow evaluator', () => {
     const evaluator = new ShadowEvaluator({
       provider,
       sink: (r) => records.push(r),
+      onError: (e) => errors.push(e),
+    })
+    // Never rejects: the failure is isolated from the production path.
+    await evaluator.evaluateShadow(testInput, new AbortController().signal)
+    expect(records).toHaveLength(1)
+    expect(records[0].providerFailed).toBe(true)
+    expect(records[0].shadowDecision).toBeNull()
+    expect(records[0].comparison).toBe('unknown')
+    expect(records[0].agrees).toBe(false)
+    expect(errors).toHaveLength(1)
+  })
+
+  it('isolates baseline and sink failures through onError', async () => {
+    const errors: unknown[] = []
+    const provider: DecisionProvider = {
+      decide: async () => testDecision('c1'),
+    }
+    // Baseline throws: still records, reports via onError.
+    const records: ShadowRecord[] = []
+    const evaluator = new ShadowEvaluator({
+      provider,
+      baseline: () => {
+        throw new Error('baseline boom')
+      },
+      sink: (r) => records.push(r),
+      onError: (e) => errors.push(e),
     })
     await evaluator.evaluateShadow(testInput, new AbortController().signal)
-    expect(records).toHaveLength(0)
+    expect(records).toHaveLength(1)
+    expect(records[0].comparison).toBe('unknown')
+    expect(errors).toHaveLength(1)
+
+    // Sink throws: never propagates to the caller.
+    const evaluator2 = new ShadowEvaluator({
+      provider,
+      sink: () => {
+        throw new Error('sink boom')
+      },
+      onError: (e) => errors.push(e),
+    })
+    await evaluator2.evaluateShadow(testInput, new AbortController().signal)
+    expect(errors).toHaveLength(2)
   })
 })

@@ -10,6 +10,8 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentFactory, AgentHandle } from '@deepseek-ai/dsh-agent'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
@@ -92,6 +94,8 @@ function stubFactory(ctx: Context): AgentFactory {
 async function boot(mode: 'off' | 'shadow'): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(System1Workflows, { mode })
   return ctx
 }

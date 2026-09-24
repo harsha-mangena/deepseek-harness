@@ -10,6 +10,7 @@ export const MCP_PACKAGE_VERSION = '0.1.7-alpha.2'
 export { McpAdapter } from './adapter.ts'
 export type {
   McpToolDefinition,
+  McpAdaptOptions,
   McpExecutor,
   CircuitState,
   McpAdapterConfig,

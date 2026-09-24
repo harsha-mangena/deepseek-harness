@@ -9,6 +9,8 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { AgentRegistry } from '@deepseek-ai/dsh-agent'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
@@ -28,6 +30,8 @@ function userMessage(text: string): UserMessage {
 async function boot(): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(AgentRegistry)
+  await ctx.plugin(SystemPrompt)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(System1Workflows, { mode: 'shadow' })
   return ctx
 }
@@ -279,7 +283,7 @@ describe('system1 coordinator input seams', () => {
     }
   })
 
-  it('ignores wakeups while disposed or while a turn is running', async () => {
+  it('latches wakeups during a run and ignores wakeups while disposed', async () => {
     const ctx = await boot()
     try {
       let runs = 0
@@ -296,10 +300,13 @@ describe('system1 coordinator input seams', () => {
         expect(runs).toBe(1)
         release()
         await handle.coordinator.whenIdle()
+        // The wake during the active turn is latched and runs once it
+        // settles instead of being dropped (R17).
+        expect(runs).toBe(2)
         await handle.coordinator.dispose()
         // Waking a disposed coordinator must not start the driver.
         expect(() => handle.coordinator.followup(userMessage('late'))).toThrow(/is disposed/)
-        expect(runs).toBe(1)
+        expect(runs).toBe(2)
       } finally {
         await handle.dispose()
       }
@@ -345,6 +352,8 @@ describe('system1 service disposal seams', () => {
   it('honors an explicit provider and disposes handles idempotently', async () => {
     const ctx = new Context()
     await ctx.plugin(AgentRegistry)
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime)
     await ctx.plugin(System1Workflows, { mode: 'shadow', provider: 'jev' })
     try {
       expect(ctx.system1Workflows.config.provider).toBe('jev')
