@@ -344,6 +344,8 @@
       "@deepseek-ai/dsh-system1-integration": ["./packages/system1/integration/src"],
       // dsh-system1-delegation lives under system1/delegation/; same hand-written alias.
       "@deepseek-ai/dsh-system1-delegation": ["./packages/system1/delegation/src"],
+      // dsh-system1-mcp lives under system1/mcp/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-mcp": ["./packages/system1/mcp/src"],
       // BEGIN generated package aliases — pnpm run gen-tsconfig-paths
       "@deepseek-ai/dsh-acp": ["./packages/acp/acp/src"],
       "@deepseek-ai/dsh-acp-app": ["./packages/bundle/acp-app/src"],
