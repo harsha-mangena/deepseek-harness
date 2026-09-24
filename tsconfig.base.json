@@ -336,6 +336,8 @@
       "@deepseek-ai/dsh-system1-coordination": ["./packages/system1/coordination/src"],
       // dsh-system1-observations lives under system1/observations/; same hand-written alias.
       "@deepseek-ai/dsh-system1-observations": ["./packages/system1/observations/src"],
+      // dsh-system1-jev lives under system1/jev/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-jev": ["./packages/system1/jev/src"],
       // BEGIN generated package aliases — pnpm run gen-tsconfig-paths
       "@deepseek-ai/dsh-acp": ["./packages/acp/acp/src"],
       "@deepseek-ai/dsh-acp-app": ["./packages/bundle/acp-app/src"],
