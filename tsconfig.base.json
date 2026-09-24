@@ -350,6 +350,8 @@
       "@deepseek-ai/dsh-system1-memory": ["./packages/system1/memory/src"],
       // dsh-system1-observability lives under system1/observability/; same hand-written alias.
       "@deepseek-ai/dsh-system1-observability": ["./packages/system1/observability/src"],
+      // dsh-system1-distributed lives under system1/distributed/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-distributed": ["./packages/system1/distributed/src"],
       // BEGIN generated package aliases — pnpm run gen-tsconfig-paths
       "@deepseek-ai/dsh-acp": ["./packages/acp/acp/src"],
       "@deepseek-ai/dsh-acp-app": ["./packages/bundle/acp-app/src"],
