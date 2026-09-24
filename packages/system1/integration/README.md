@@ -14,6 +14,23 @@ End-to-end read-only coordinator for System 1 (Jev-only).
 - **Defense in depth**: write/mutate candidates are filtered from the menu; a second check rejects non-read effects at execution (guards against filter regressions).
 - Escalation (`escalate-none`) results in no execution.
 
+## Production driver
+
+`ReadOnlyProductionDriver` implements the workflow package's `CoordinatorDriver`: one durable read-only turn per coordinator wake.
+
+Turn lifecycle:
+
+1. Drain the coordinator inbox (next-step before next-turn) into provenance-labelled observations.
+2. Run the real `ReadOnlyCoordinator` decision loop: policy filter → Jev decision → `admitDecision` (correlation, model pinning, menu membership, calibration gate) → dispatch recheck.
+3. Dispatch the admitted read-only candidate through the coordinator's **scoped** tool runtime (`coordinator.ctx.tools`), so the call runs under the coordinator's private registrations and initiator.
+4. Verify the real tool result with the host-supplied `verify` hook, then record the outcome with the shipped `finalizeTerminal` finalizer:
+   - `success` only with a passing verification record backing `verifiedBy` (the check observes the real `ToolExecutionSuccess`, never a fabricated receipt).
+   - `escalated` when the decision is `escalate-none`.
+   - `failure` on admission rejection, policy denial, provider error, unresolvable tool mapping, tool failure, or failed verification.
+   - `cancelled` when the turn aborts.
+
+Fail-closed guarantees: nothing executes on an unadmitted decision; `resolveCall` returning `undefined` fails the turn instead of dispatching; the driver additionally refuses non-`read` candidates even if the menu filter regresses.
+
 ## Known Limitations and Deferred Work
 
 - Read-only only. Controlled mutations (write effects) are Phase 7.

@@ -15,3 +15,9 @@ export type {
   CoordinatorInput,
   CoordinatorResult,
 } from './coordinator.ts'
+export { ReadOnlyProductionDriver } from './driver.ts'
+export type {
+  ResolvedToolCall,
+  ToolVerificationContext,
+  ProductionDriverConfig,
+} from './driver.ts'

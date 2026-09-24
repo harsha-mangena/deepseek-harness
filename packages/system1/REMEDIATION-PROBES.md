@@ -32,7 +32,7 @@ features; do not weaken the assertions.
 | R16 | creates private tool registrations for each coordinator | B (F03) | **done** — per-coordinator scope; see `workflow/tests/lifecycle-invariants.spec.ts` |
 | R17 | runs follow-up work submitted during the active turn | B (F06) | **done** — wake latch; see `workflow/tests/lifecycle-invariants.spec.ts` |
 | R18 | rejects maintenance while a driver is active | B (F06) | **done** — see `workflow/tests/lifecycle-invariants.spec.ts` |
-| R19 | writes inbox changes into durable session events | C (F05) | open |
+| R19 | writes inbox changes into durable session events | D (F05) | open |
 | R20 | rejects a successful terminal with no verified evidence | A (F05) | **done** — `finalizeTerminal` enforces; see `workflow/tests/regression-fixtures.spec.ts` |
 | R21 | never reuses a released fencing token | B (F07) | **done** — durable monotonic epochs; see `coordination/tests/coordination.spec.ts` |
 | R22 | stale owner cannot release a replacement lease | B (F07) | **done** — stale-release rejection; see `coordination/tests/coordination.spec.ts` |
