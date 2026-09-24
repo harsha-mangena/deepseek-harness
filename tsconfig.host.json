@@ -450,6 +450,7 @@
     { "path": "./packages/system1/contracts" },
     { "path": "./packages/system1/policy" },
     { "path": "./packages/system1/coordination" },
+    { "path": "./packages/system1/observations" },
     { "path": "./packages/lsp/lsp" },
     { "path": "./packages/lsp/lsp-stdio" },
     { "path": "./packages/lsp/tool-lsp" },
