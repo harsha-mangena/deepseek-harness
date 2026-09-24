@@ -134,7 +134,7 @@ async function boot(system1Config: Record<string, unknown>): Promise<Context> {
     ['@deepseek-ai/dsh-agent-loop', AgentLoop],
     ['@deepseek-ai/dsh-experimental-system1', System1Plugin],
   ])
-  const merged = { backend: 'jev', mode: 'enforce', actuation: 'async', ...system1Config }
+  const merged = { backend: 'jev', mode: 'enforce', actuation: 'async', triageStyle: 'single', strategyHints: 'all', stopMode: 'reject', ...system1Config }
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'

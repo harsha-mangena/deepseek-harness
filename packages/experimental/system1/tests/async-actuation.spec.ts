@@ -354,7 +354,7 @@ async function boot(system1Config: Record<string, unknown>): Promise<Context> {
     ['@deepseek-ai/dsh-agent-loop', AgentLoop],
     ['@deepseek-ai/dsh-experimental-system1', System1Plugin],
   ])
-  const merged = { backend: 'jev', mode: 'enforce', actuation: 'async', ...system1Config }
+  const merged = { backend: 'jev', mode: 'enforce', actuation: 'async', triageStyle: 'single', strategyHints: 'all', stopMode: 'reject', ...system1Config }
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'
@@ -500,7 +500,7 @@ it('post-execute returns immediately; the retry hint arrives at the next pre-ste
 
 it('large-result triage replaces content within its deadline', async () => {
   jevResultTriage = 'noisy_keep_head'
-  const context = await boot({ triageMinChars: 100, triageHeadChars: 10, injectionScreen: false })
+  const context = await boot({ triageMinChars: 100, triageHeadChars: 10, triageTailChars: 10, injectionScreen: false })
   const big = { isError: false, content: [{ type: 'text', text: 'x'.repeat(500) }] } as unknown as ToolExecutionResult
   const post = await context.waterfall('tools/post-execute', exec(context, 'a8', 'run_tests', 'c1'), big, async (): Promise<PostToolDecision> => ({ kind: 'accept' }))
   if (post.kind !== 'accept' || post.content === undefined) throw new Error('expected replaced content')

@@ -127,7 +127,7 @@ async function boot(system1Config: Record<string, unknown>): Promise<Context> {
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'
-      ? ['  config:', ...Object.entries({ actuation: 'blocking', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
+      ? ['  config:', ...Object.entries({ actuation: 'blocking', triageStyle: 'single', strategyHints: 'all', stopMode: 'reject', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
       : [],
   ]).join('\n') + '\n')
 
@@ -299,7 +299,8 @@ it('escalates the next step one reasoning level after an acted-upon failure', as
   expect(hints).toHaveLength(1)
   expect(hints[0]).toContain('[System 1 triage: standard]')
   expect(hints[0]).toContain('[System 1 escalation]')
-  // The escalation is consumed once: the following step is trivial again.
+  // The escalation is consumed once, but routing is upgrade-only within a
+  // turn: the following step stays at standard (no escalation note).
   const payload2 = preStepPayload(context, agentId)
   const stepDecision2 = await context.waterfall(
     'agent/pre-step', payload2,
@@ -309,7 +310,7 @@ it('escalates the next step one reasoning level after an acted-upon failure', as
   if (stepDecision2.kind !== 'enter') return
   const hints2 = hintTexts(stepDecision2.messages)
   expect(hints2).toHaveLength(1)
-  expect(hints2[0]).toContain('[System 1 triage: trivial]')
+  expect(hints2[0]).toContain('[System 1 triage: standard]')
   expect(hints2[0]).not.toContain('[System 1 escalation]')
 })
 

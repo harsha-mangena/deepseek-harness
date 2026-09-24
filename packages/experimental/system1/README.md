@@ -140,6 +140,13 @@ All tunables are Schemastery-validated with safe defaults:
 | `stopStuckThreshold` | `0.9` | Stuck probability at/above which a hopeless trajectory ends the turn (enforce). Stricter than `loopStuckThreshold`: the STOP also requires a 5+ identical-call streak |
 | `delegationWeights` | `{ novelty: 0.4, toolRisk: 0.35, irreversibility: 0.25 }` | Relative weights for the delegation composite (normalized in code; individual weights may be zero, the total must be positive) |
 | `modelRoute` | `{}` | Verdict→override table for model routing (enforce), e.g. `{ complex: { model: 'strong-model' } }`. Each override may set `provider`, `model`, and/or `reasoningEffort`; unset fields keep the loop's config. Inert by default: provider/model names are deployment-specific |
+| `triageStyle` | `'decomposed'` | `decomposed`: four literal feature nouls over the request text (answerable / single-change / investigation / broad), combined in code. `single`: the original trivial/standard/complex choice |
+| `strategyHints` | `'off'` | Which verdicts inject a reasoning-strategy hint (enforce): `off`, `complex`, `all`. Off by default: no measured benefit, and hints persist as input tokens |
+| `routeDowngradeThreshold` | `0.85` | A `trivial` verdict below this confidence routes as `standard` (never downgrades) |
+| `verifyDowngrades` | `true` | Verify-then-escalate: a turn served by the `trivial` route has its final answer checked; a confident `inadequate` upgrades the route and steers one more step |
+| `verifyDeadlineMs` | `1200` | Max wait for that check at turn end |
+| `stopMode` | `'explain'` | Bounded STOP enters one last step telling the model to explain and denies all tools in it; `reject` = legacy silent reject |
+| `triageTailChars` | `1500` | Tail kept (with `triageHeadChars` head) when a result is triaged down; results whose tail reports a failure are never triaged |
 | `maxRequestRetries` | `1` | Max System 1-owned retries per failed model request per step (enforce); further failures delegate to the loop default |
 | `actuation` | `'async'` | `'async'` (deadline-bounded, default) or `'blocking'` (judge-first on every seam) enforce behavior |
 | `routeDeadlineMs` | `250` | Max wait for the turn's triage verdict before the first request (async) |
@@ -213,3 +220,17 @@ export TYPESAFE_API_KEY=<your key>
 - System 1 can never bypass destructive-action approval; it produces typed judgments, not tool calls.
 - JSON Schema validation of tool arguments stays deterministic and untouched.
 - A failing, slow, or missing backend is indistinguishable from "no opinion": the loop continues exactly as before.
+
+
+## Harness v2: what changed and why
+
+Live runs (18 runs, real DeepSeek + live Jev) exposed four problems; v2 fixes each:
+
+1. **Empty continuation steps were triaged.** Jev read an empty preview literally as "no reasoning needed" and answered `trivial` at ≈0.85 on every tool continuation, while the real request (step 1) came back `standard` at 0.18–0.38 — never actionable. Now every mode (shadow, blocking, async) triages **fresh input only** (first step or claimed steering) and judges **only the request text**.
+2. **One fuzzy question.** Triage is now four literal yes/no features combined by an explicit rule (`src/triage.ts`); missing answers count as 0.5, so a backend hiccup can never produce a confident `trivial`.
+3. **Hints cost tokens without measured benefit.** `strategyHints` defaults to `off`; routing no longer depends on hints.
+4. **Silent STOP.** The bounded STOP now explains to the user (`stopMode: explain`).
+
+Also: blocking and async routing share one sticky, upgrade-only per-turn ledger (no mid-turn downgrade, no per-step flapping); downgrades are gated at `routeDowngradeThreshold` and verified at turn end; result triage sees the task and the result's head and tail, and never drops a failing tail; each turn logs `system1: critical-path wait agent=… turn=… ms=… waits=… late=…` for benchmarks.
+
+Benchmarks: record one JSONL row per run and run `scripts/bench-report.ts` — it pairs runs by `(task, block)`, reports median ratios with bootstrap CIs, Wilcoxon and McNemar, the pairs needed for a 20% effect, and flags the run as **confounded** when shadow differs from off (shadow cannot change behavior).

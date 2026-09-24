@@ -259,7 +259,7 @@ async function boot(system1Config: Record<string, unknown>): Promise<Context> {
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'
-      ? ['  config:', ...Object.entries({ actuation: 'blocking', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
+      ? ['  config:', ...Object.entries({ actuation: 'blocking', triageStyle: 'single', strategyHints: 'all', stopMode: 'reject', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
       : [],
   ]).join('\n') + '\n')
 
@@ -396,21 +396,22 @@ it('D2: no route configured for the verdict leaves the config unchanged', async 
   expect(routed).toEqual(baseConfig)
 })
 
-it('D2: a verdict for another step leaves the config unchanged', async () => {
+it('D2: routing is sticky across the steps of a turn, and a new turn starts clean', async () => {
   jevTriage = 'complex'
   const context = await boot({
     backend: 'jev',
     mode: 'enforce',
     modelRoute: { complex: { model: 'strong-model' } },
   })
-  // Verdict cached for step 1; the request is for a step that was never triaged.
+  // Verdict set on step 1; a continuation step of the same turn keeps the
+  // route (no per-step flapping, the provider prefix cache survives).
   await triageThenRequest(context, 'route-stale', 1)
   const routed = await context.waterfall(
     'agent/request',
     requestPayload(context, 'route-stale', 2),
     async () => ({ ...baseConfig }),
   )
-  expect(routed).toEqual(baseConfig)
+  expect(routed).toEqual({ ...baseConfig, model: 'strong-model' })
 })
 
 it('D2: a route that changes nothing leaves the config untouched and unmarked', async () => {

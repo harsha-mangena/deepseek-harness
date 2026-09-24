@@ -76,6 +76,8 @@ import {
   buildPruneQuestion,
   buildRequestRetryQuestion,
   buildResultTriageQuestion,
+  edgesPreview,
+  tailReportsFailure,
   buildRetryHint,
   buildRetryQuestion,
   buildStrategyHint,
@@ -105,6 +107,14 @@ import {
 } from './gates.ts'
 import { System1Service } from './service.ts'
 import { JudgmentBoard } from './board.ts'
+import {
+  buildTriageFeatureQuestions,
+  combineTriage,
+  requestText,
+  TRIAGE_FEATURES,
+  type TriageFeatures,
+  validateTriageFeature,
+} from './triage.ts'
 import {
   compileToolPatterns,
   DEFAULT_RISKY_TOOL_PATTERNS,
@@ -320,6 +330,37 @@ export interface Config {
   jevScopeInstructions: boolean
   /** Open the Jev connection at plugin start so the first judgment skips the TLS handshake. */
   warmup: boolean
+  /**
+   * `decomposed` (default): four literal feature nouls over the request text,
+   * combined in code (see triage.ts). `single`: the original one-question
+   * trivial/standard/complex choice.
+   */
+  triageStyle: 'decomposed' | 'single'
+  /**
+   * Which triage verdicts inject a reasoning-strategy hint (enforce).
+   * `off` (default): none — live runs showed no measurable benefit, and
+   * every hint persists in history as extra input tokens. `complex`: only
+   * the decomposition hint for complex requests. `all`: every verdict.
+   */
+  strategyHints: 'off' | 'complex' | 'all'
+  /** A `trivial` verdict below this confidence routes as `standard` (no downgrade). */
+  routeDowngradeThreshold: number
+  /**
+   * Verify-then-escalate: at the end of a turn that was routed down to the
+   * `trivial` route, ask Jev whether the final answer satisfies the request;
+   * a confident `inadequate` upgrades the route and steers one more step.
+   */
+  verifyDowngrades: boolean
+  /** Max wait for the downgrade verification at turn end. */
+  verifyDeadlineMs: number
+  /**
+   * Bounded STOP behavior. `explain` (default): enter one last step that
+   * tells the model to stop and explain, and deny every tool call in it.
+   * `reject`: the original silent pre-step reject.
+   */
+  stopMode: 'explain' | 'reject'
+  /** Characters kept from the end of a triaged-down tool result (the head keeps `triageHeadChars`). */
+  triageTailChars: number
 }
 
 /** Runtime schema for {@link Config}. */
@@ -379,6 +420,13 @@ export const Config: z<Config> = z.object({
   criticalReserve: z.natural().default(4),
   jevScopeInstructions: z.boolean().default(true),
   warmup: z.boolean().default(true),
+  triageStyle: z.union(['decomposed', 'single'] as const).default('decomposed'),
+  strategyHints: z.union(['off', 'complex', 'all'] as const).default('off'),
+  routeDowngradeThreshold: z.number().min(0).max(1).default(0.85),
+  verifyDowngrades: z.boolean().default(true),
+  verifyDeadlineMs: z.natural().default(1200),
+  stopMode: z.union(['explain', 'reject'] as const).default('explain'),
+  triageTailChars: z.natural().default(1500),
 })
 
 type PreStepPayload = Parameters<Events['agent/pre-step']>[0]
@@ -1076,7 +1124,7 @@ export function apply(ctx: Context, config: Config): void {
   function noteStepState(payload: PreStepPayload): void {
     // Async mode keeps the turn's last real input: empty continuation steps
     // would otherwise blank the context tool-choice judgments rely on.
-    if (!(asyncAct && payload.messages.length === 0)) {
+    if (payload.messages.length > 0) {
       stepPreviews.set(payload.agent.id, previewMessages(payload.messages).join('\n'))
     }
     capMap(stepPreviews, 128)
@@ -1148,6 +1196,14 @@ export function apply(ctx: Context, config: Config): void {
    * verdict only traces, warns, or rewrites the result. Empty for errors:
    * the retry judgment owns failures.
    */
+  /** Keep the head and the tail of a triaged-down result, with a durable marker between. */
+  function keepEdges(text: string, toolName: string): string {
+    const head = config.triageHeadChars
+    const tail = config.triageTailChars
+    if (text.length <= head + tail) return text
+    return `${text.slice(0, head)}${buildPruneMarker(toolName, text.length)}${tail > 0 ? text.slice(-tail) : ''}`
+  }
+
   function buildResultQuestions(
     exec: ToolExecution,
     result: ToolExecutionResult,
@@ -1159,9 +1215,17 @@ export function apply(ctx: Context, config: Config): void {
     // Fixtures and some tool results omit `content`; default defensively.
     // oxlint-disable-next-line typescript/no-unnecessary-condition -- content is optional at runtime
     const resultText = result.isError ? '' : extractResultText(result.content ?? [])
-    if (resultText.length >= config.triageMinChars) {
+    // Deterministic never-drop guard: test runners, compilers and stack
+    // traces print the decisive failure at the END of their output, so a
+    // result whose tail reports an error is always kept whole — no question.
+    if (resultText.length >= config.triageMinChars && !tailReportsFailure(resultText, config.triageTailChars)) {
       questions.push(
-        buildResultTriageQuestion(exec.name, resultText.slice(0, config.triageHeadChars), resultText.length),
+        buildResultTriageQuestion(
+          exec.name,
+          edgesPreview(resultText, config.triageHeadChars, config.triageTailChars),
+          resultText.length,
+          stepPreviews.get(exec.agent?.id ?? '') ?? '',
+        ),
       )
       validators.push(validateResultTriage)
       kinds.push('result-triage')
@@ -1326,21 +1390,21 @@ export function apply(ctx: Context, config: Config): void {
    * over, so there is no veto; assist mode warns the operator when the
    * answer clearly misses the request. Never rejects.
    */
-  async function observeFinalAnswer(agent: { id: string }, turn: number): Promise<void> {
+  /** Ask the final-answer question for a finished turn; null when there is nothing to judge. */
+  async function finalAnswerDecision(agent: { id: string }, turn: number): Promise<System1Decision<unknown> | null> {
     const key = `${agent.id}:${turn}`
     const offset = turnStarts.get(key)
     turnStarts.delete(key)
     const derive = (agent as { session?: { deriveMessages?: () => unknown[] } }).session?.deriveMessages
-    if (typeof derive !== 'function') return
+    if (typeof derive !== 'function') return null
     let messages: unknown[]
     try {
       messages = derive()
     } catch {
-      return
+      return null
     }
-    /* v8 ignore next -- defensive: test sessions lack deriveMessages, so turnStarts is never populated */
     const qa = extractFinalQa(offset !== undefined ? messages.slice(offset) : messages)
-    if (qa === null) return
+    if (qa === null) return null
     const [decision] = await service.askMany(
       [buildFinalAnswerQuestion(qa.request, qa.answer)],
       [validateFinalAnswer],
@@ -1348,7 +1412,12 @@ export function apply(ctx: Context, config: Config): void {
       lifetime.signal,
       agent.id,
     )
-    if (decision === undefined || decision.value !== 'inadequate') return
+    return decision ?? null
+  }
+
+  async function observeFinalAnswer(agent: { id: string }, turn: number): Promise<void> {
+    const decision = await finalAnswerDecision(agent, turn)
+    if (decision === null || decision.value !== 'inadequate') return
     service.markActed(decision.trace.id)
     if (config.mode === 'assist') {
       /* v8 ignore next -- defensive: the service always provides a judgment */
@@ -1368,20 +1437,13 @@ export function apply(ctx: Context, config: Config): void {
     // it only traces (shadow) or warns (assist), never rewrites.
     /* v8 ignore next -- defensive: maybePruneHistory never rejects */
     void maybePruneHistory(payload.agent, lifetime.signal).catch(() => undefined)
-    // Triage and delegability travel in one batch — Jev evaluates questions
-    // in parallel, so the delegation question costs barely more than triage
-    // alone, and the delegability answers accumulate a shadow-mode dataset.
-    const questions = [buildTriageQuestion(payload.messages), buildDelegationQuestion(payload.messages)]
-    const validators: Array<(answer: unknown) => unknown> = [validateTriage, validateDelegation]
-    const decisions = await service.askMany(questions, validators, 'turn', lifetime.signal, payload.agent.id)
-    const triage = decisions[0]
-    /* v8 ignore next -- defensive: askMany always returns one decision per question */
-    if (triage !== undefined) {
-      const verdict = triage.value
-      if (verdict === 'trivial' || verdict === 'standard' || verdict === 'complex') {
-        agents.noteTriage(payload.agent.id, payload.turn, payload.step, verdict, triage.trace.id)
-      }
-    }
+    // Observe exactly what enforce would judge: fresh input only. Triaging
+    // empty tool continuations produced a confident-but-meaningless
+    // `trivial` stream in shadow data and burned the turn budget.
+    if (!isFreshStep(payload.step, payload.messages.length)) return
+    const judged = await askTurnTriage(payload.agent.id, payload.messages, lifetime.signal)
+    if (judged === null || judged.verdict === null) return
+    agents.noteTriage(payload.agent.id, payload.turn, payload.step, judged.verdict, judged.triageTrace)
   }
 
   /**
@@ -1402,17 +1464,15 @@ export function apply(ctx: Context, config: Config): void {
     trackTurn(payload.agent.id, payload.turn)
     trackSession(payload.agent)
     noteStepState(payload)
+    stopSteps.delete(payload.agent.id)
     // Bounded STOP first: a hopeless trajectory (long identical-call streak
     // plus Jev nearly certain the agent is stuck) ends here instead of
     // spending another model call and tool round-trip on it.
-    if (await stopCheck(payload.agent.id, payload.signal)) {
-      ctx.logger.warn(`system1: stopping hopeless turn for agent ${payload.agent.id} (stuck trajectory)`)
-      return { kind: 'reject' }
-    }
+    if (await stopCheck(payload.agent.id, payload.signal)) return await stopStep(payload.agent.id, next)
     // Session-start preselection settles before the first request is built:
     // the restriction must be in place before the loop reads the tool list.
     // runPreselect never rejects, so awaiting here cannot break the step.
-    if (payload.step === 1 && enforce && config.preselect) {
+    if (payload.step === 1 && config.preselect) {
       const pending = preselectTasks.get(payload.agent.id)
       if (pending !== undefined) {
         preselectTasks.delete(payload.agent.id)
@@ -1422,39 +1482,35 @@ export function apply(ctx: Context, config: Config): void {
     // Pressure-gated prune runs before the triage batch so the step's own
     // request — and Jev's triage question — see the pruned context.
     await maybePruneHistory(payload.agent, payload.signal)
-    const questions = [buildTriageQuestion(payload.messages), buildDelegationQuestion(payload.messages)]
-    const validators: Array<(answer: unknown) => unknown> = [validateTriage, validateDelegation]
-    const judged = service.askMany(questions, validators, 'turn', payload.signal, payload.agent.id)
-    const [decisions, decision] = await Promise.all([judged, next()])
+    // Triage only fresh input (first step, or claimed steering) — never
+    // empty tool continuations, which Jev reads literally as "trivial".
+    const fresh = isFreshStep(payload.step, payload.messages.length)
+    const judged = fresh
+      ? timedWait(payload.agent.id, askTurnTriage(payload.agent.id, payload.messages, payload.signal), value => value === null)
+      : Promise.resolve(null)
+    const [triage, decision] = await Promise.all([judged, next()])
     // An empty first step owns a no-step turn: the loop discards the decision,
-    // so there is no model call to guide. Later steps with empty claims are
-    // normal tool continuations — the appended hint still reaches the model
-    // because the loop appends decision messages to the session.
+    // so there is no model call to guide.
     if (decision.kind === 'reject' || (payload.step === 1 && decision.messages.length === 0)) return decision
     const messages = [...decision.messages]
-    const triage = decisions[0]
-    if (triage !== undefined && triage.value !== null) {
-      // Failure-signal escalation: a retry hint or loop nudge fired since the
-      // last step, so bump the reasoning one level — the default strategy
-      // failed, so the agent should think harder, not differently. The bump
-      // was captured before trackTurn so a new-task reset cannot wipe it, and
-      // it does not persist into the next step.
-      // The triage validator passed, so the value is a TriageVerdict.
-      const verdict = triage.value as TriageVerdict
-      const effective = escalated
-        ? verdict === 'trivial' ? 'standard' : /* v8 ignore next -- non-trivial escalation to complex; covered in isolation, flaky in full suite */
-          'complex'
-        : verdict
-      // Cache the effective verdict for model routing at `agent/request`:
-      // reusing the triage verdict costs no extra model call.
-      agents.noteTriage(payload.agent.id, payload.turn, payload.step, effective, triage.trace.id)
-      service.markActed(triage.trace.id)
-      messages.push(guidance(buildStrategyHint(effective, escalated), `triage:${effective}`))
+    if (triage !== null) {
+      const verdict = routableVerdict(triage)
+      if (verdict !== null) {
+        routes.offer(payload.agent.id, payload.turn, verdict, triage.triageTrace)
+        triage.triageTraces.forEach((traceId) => { service.markActed(traceId) })
+      }
     }
-    const delegation = decisions[1]
-    if (delegation !== undefined && delegation.value === true && teamToolsSeen.has(payload.agent.id)) {
-      // The delegation validator passed, so the value is a boolean.
-      service.markActed(delegation.trace.id)
+    // Failure-signal escalation: a retry hint or loop nudge fired since the
+    // last step, so bump the turn's route one level (upgrade-only ledger).
+    if (escalated) routes.escalate(payload.agent.id, payload.turn)
+    const route = routes.get(payload.agent.id, payload.turn)
+    if (route !== null && (fresh || escalated) && hintAllowed(route.verdict)
+      && hintLedger.admit(payload.agent.id, payload.turn, `strategy:${route.verdict}:${escalated ? 'esc' : 'base'}`)) {
+      messages.push(guidance(buildStrategyHint(route.verdict, escalated), `triage:${route.verdict}`))
+    }
+    if (triage !== null && triage.delegate && teamToolsSeen.has(payload.agent.id)
+      && hintLedger.admit(payload.agent.id, payload.turn, 'delegation-hint')) {
+      service.markActed(triage.delegationTrace)
       messages.push(guidance(buildDelegationHint(), 'delegation'))
     }
     if (messages.length === decision.messages.length) return decision
@@ -1758,8 +1814,7 @@ export function apply(ctx: Context, config: Config): void {
           // Replace the bulky result with its head plus a durable marker:
           // the marker names the tool and the original length so a replay
           // can reconstruct what the model saw.
-          const head = resultQuestions.resultText.slice(0, config.triageHeadChars)
-          replacement = [{ type: 'text', text: `${head}${buildPruneMarker(entry.name, resultQuestions.resultText.length)}` }]
+          replacement = [{ type: 'text', text: keepEdges(resultQuestions.resultText, entry.name) }]
           ctx.logger.warn(
             `system1: result triage dropped ${resultQuestions.resultText.length} chars from ${entry.name} (${triage})`,
           )
@@ -1850,31 +1905,13 @@ export function apply(ctx: Context, config: Config): void {
   function routeModel(
     agentId: string,
     turn: number,
-    step: number,
+    _step: number,
     current: LlmCallConfig,
   ): LlmCallConfig | null {
-    const cached = agents.takeTriage(agentId, turn, step)
-    if (cached === null) return null
-    const override = config.modelRoute[cached.verdict]
-    if (override === undefined) return null
-    const routed: LlmCallConfig = {
-      ...current,
-      ...(override.provider !== undefined ? { provider: override.provider } : {}),
-      ...(override.model !== undefined ? { model: override.model } : {}),
-      ...(override.reasoningEffort !== undefined
-        ? { reasoningEffort: ReasoningEffortId(override.reasoningEffort) }
-        : {}),
-    }
-    if (
-      routed.provider === current.provider
-      && routed.model === current.model
-      && routed.reasoningEffort === current.reasoningEffort
-    ) return null
-    service.markActed(cached.traceId)
-    ctx.logger.info(
-      `system1: routing agent ${agentId} step to ${routed.provider}/${routed.model} (triage: ${cached.verdict})`,
-    )
-    return routed
+    // Sticky per turn (upgrade-only ledger), shared with async mode: a
+    // continuation step keeps the turn's route instead of reverting to the
+    // default config, so the DeepSeek prefix cache survives the turn.
+    return actRoute(agentId, turn, current)
   }
 
   /**
@@ -1921,6 +1958,134 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * Turn triage for every mode. Judges only the request text of the claimed
+   * messages — never tool traffic — and returns null when there is nothing
+   * to judge (tool continuations), so empty steps are never triaged.
+   * `decomposed` asks four literal feature nouls plus delegability in one
+   * batch (shared flat state); `single` asks the original choice question.
+   */
+  async function askTurnTriage(
+    agentId: string,
+    messages: readonly unknown[],
+    signal: AbortSignal,
+  ): Promise<TurnJudgment | null> {
+    const request = requestText(messages)
+    if (request.length === 0) return null
+    if (config.triageStyle === 'single') {
+      const decisions = await service.askMany(
+        [buildTriageQuestion(messages), buildDelegationQuestion(messages)],
+        [validateTriage, validateDelegation] as Array<(answer: unknown) => unknown>,
+        'turn',
+        signal,
+        agentId,
+      )
+      const triage = decisions[0]
+      const delegation = decisions[1]
+      /* v8 ignore next -- defensive: askMany always returns one decision per question */
+      if (triage === undefined || delegation === undefined) return null
+      const verdict = triage.value === 'trivial' || triage.value === 'standard' || triage.value === 'complex' ? triage.value : null
+      return {
+        verdict,
+        confidence: triage.judgment?.confidence ?? 0,
+        triageTrace: triage.trace.id,
+        triageTraces: [triage.trace.id],
+        delegate: delegation.value === true,
+        delegationTrace: delegation.trace.id,
+      }
+    }
+    const featureQuestions = buildTriageFeatureQuestions(request)
+    const decisions = await service.askMany(
+      [...featureQuestions, buildDelegationQuestion(messages)],
+      [...featureQuestions.map(() => validateTriageFeature), validateDelegation] as Array<(answer: unknown) => unknown>,
+      'turn',
+      signal,
+      agentId,
+    )
+    const features: Record<string, number | null> = {}
+    let answered = 0
+    TRIAGE_FEATURES.forEach((feature, index) => {
+      const value = decisions[index]?.value
+      features[feature] = typeof value === 'number' ? value : null
+      if (typeof value === 'number') answered += 1
+    })
+    const delegation = decisions[TRIAGE_FEATURES.length]
+    const traces = decisions.slice(0, TRIAGE_FEATURES.length).map(decision => decision.trace.id)
+    // No feature answered (backend down, budget, abstentions): no verdict.
+    const outcome = answered === 0 ? null : combineTriage(features as TriageFeatures)
+    return {
+      verdict: outcome?.verdict ?? null,
+      confidence: outcome?.confidence ?? 0,
+      triageTrace: traces[0] ?? '',
+      triageTraces: traces,
+      delegate: delegation?.value === true,
+      delegationTrace: delegation?.trace.id ?? '',
+    }
+  }
+
+  /** The verdict a triage may route on: low-confidence `trivial` never downgrades. */
+  function routableVerdict(judged: TurnJudgment): TriageVerdict | null {
+    if (judged.verdict === 'trivial' && judged.confidence < config.routeDowngradeThreshold) return 'standard'
+    return judged.verdict
+  }
+
+  /** Whether a verdict injects a strategy hint under `strategyHints`. */
+  function hintAllowed(verdict: TriageVerdict): boolean {
+    return config.strategyHints === 'all' || (config.strategyHints === 'complex' && verdict === 'complex')
+  }
+
+  /** Turns (per agent) whose requests were routed down to the `trivial` route. */
+  const downgradedTurns = new Map<string, number>()
+  /** Agents whose current step is a STOP step: every tool call is denied. */
+  const stopSteps = new Set<string>()
+  /** Critical-path wait accounting per agent for the current turn. */
+  const waits = new Map<string, { ms: number; count: number; late: number }>()
+
+  /** Await `promise` and charge its wall time to the agent's critical path. */
+  async function timedWait<T>(agentId: string, promise: Promise<T>, isLate: (value: T) => boolean): Promise<T> {
+    const started = performance.now()
+    const value = await promise
+    const entry = waits.get(agentId) ?? { ms: 0, count: 0, late: 0 }
+    entry.ms += performance.now() - started
+    entry.count += 1
+    if (isLate(value)) entry.late += 1
+    waits.set(agentId, entry)
+    capMap(waits, 128)
+    return value
+  }
+
+  /** Log and reset the turn's critical-path wait (benchmarks parse this line). */
+  function flushWaits(agentId: string, turn: number): void {
+    const entry = waits.get(agentId)
+    waits.delete(agentId)
+    if (entry === undefined) return
+    ctx.logger.info(
+      `system1: critical-path wait agent=${agentId} turn=${turn} ms=${Math.round(entry.ms)} waits=${entry.count} late=${entry.late}`,
+    )
+  }
+
+  /** The STOP step's guidance: stop acting, explain to the user. */
+  function stopGuidance(): UserMessage {
+    return guidance(
+      '[System 1 stop] You have repeated the same failing action several times without progress. Do not call any more tools in this turn. Tell the user plainly what you tried, what failed, and what you need from them to continue.',
+      'stop',
+    )
+  }
+
+  /**
+   * Enter a STOP step (stopMode `explain`) or reject (stopMode `reject`).
+   * The STOP step keeps the turn user-visible: the model explains instead of
+   * the loop ending silently, and `tools/pre-execute` denies every call.
+   */
+  async function stopStep(agentId: string, next: PreStepNext): Promise<PreStepDecision> {
+    ctx.logger.warn(`system1: stopping hopeless turn for agent ${agentId} (stuck trajectory)`)
+    if (config.stopMode === 'reject') return { kind: 'reject' }
+    stopSteps.add(agentId)
+    const decision = await next()
+    if (decision.kind === 'reject') return decision
+    return { ...decision, messages: [...decision.messages, stopGuidance()] }
+  }
+
   // ---------------------------------------------------------------------
   // Async actuation (enforce + `actuation: 'async'`, the default).
   //
@@ -1953,7 +2118,11 @@ export function apply(ctx: Context, config: Config): void {
   /** A turn-level judgment: triage verdict plus delegability, with traces. */
   interface TurnJudgment {
     verdict: TriageVerdict | null
+    /** Support for the verdict in [0, 1]; gates downgrades. */
+    confidence: number
     triageTrace: string
+    /** Every trace that contributed to the verdict (decomposed: one per feature). */
+    triageTraces: string[]
     delegate: boolean
     delegationTrace: string
   }
@@ -1994,30 +2163,16 @@ export function apply(ctx: Context, config: Config): void {
 
   /** Ask the turn-level batch (triage + delegability). Never rejects. */
   async function judgeTurn(agentId: string, messages: readonly unknown[]): Promise<TurnJudgment | null> {
-    const decisions = await service.askMany(
-      [buildTriageQuestion(messages), buildDelegationQuestion(messages)],
-      [validateTriage, validateDelegation] as Array<(answer: unknown) => unknown>,
-      'turn',
-      lifetime.signal,
-      agentId,
-    )
-    const triage = decisions[0]
-    const delegation = decisions[1]
-    /* v8 ignore next -- defensive: askMany always returns one decision per question */
-    if (triage === undefined || delegation === undefined) return null
-    return {
-      verdict: triage.value === 'trivial' || triage.value === 'standard' || triage.value === 'complex' ? triage.value : null,
-      triageTrace: triage.trace.id,
-      delegate: delegation.value === true,
-      delegationTrace: delegation.trace.id,
-    }
+    return await askTurnTriage(agentId, messages, lifetime.signal)
   }
 
   /** Adopt a settled turn judgment into the sticky route ledger. */
   function adoptTurnJudgment(agentId: string, turn: number, judged: TurnJudgment | null): TurnJudgment | null {
     board.delete(turnKey(agentId))
-    if (judged === null || judged.verdict === null) return judged
-    routes.offer(agentId, turn, judged.verdict, judged.triageTrace)
+    if (judged === null) return judged
+    const verdict = routableVerdict(judged)
+    if (verdict === null) return judged
+    routes.offer(agentId, turn, verdict, judged.triageTrace)
     return judged
   }
 
@@ -2078,12 +2233,10 @@ export function apply(ctx: Context, config: Config): void {
     trackTurn(agentId, payload.turn)
     trackSession(payload.agent)
     noteStepState(payload)
+    stopSteps.delete(agentId)
     // Bounded STOP: only asks Jev when the deterministic detector already
     // sees a 5+ identical streak, so the common path never waits here.
-    if (await stopCheck(agentId, payload.signal)) {
-      ctx.logger.warn(`system1: stopping hopeless turn for agent ${agentId} (stuck trajectory)`)
-      return { kind: 'reject' }
-    }
+    if (await stopCheck(agentId, payload.signal)) return await stopStep(agentId, next)
     if (payload.step === 1 && config.preselect) {
       const pending = preselectTasks.get(agentId)
       if (pending !== undefined) {
@@ -2093,7 +2246,7 @@ export function apply(ctx: Context, config: Config): void {
     }
     await maybePruneHistory(payload.agent, payload.signal)
 
-    const fresh = isFreshStep(payload.step, payload.messages.length)
+    const fresh = isFreshStep(payload.step, payload.messages.length) && requestText(payload.messages).length > 0
     const key = turnKey(agentId)
     // Step 1 of a task normally finds the speculative judgment posted at
     // inbox insert; steering claims and inbox-less turns ask here.
@@ -2103,7 +2256,7 @@ export function apply(ctx: Context, config: Config): void {
     const [decision, turnOutcome] = await Promise.all([
       next(),
       fresh && board.has(key)
-        ? board.take<TurnJudgment>(key, config.routeDeadlineMs, payload.signal)
+        ? timedWait(agentId, board.take<TurnJudgment>(key, config.routeDeadlineMs, payload.signal), outcome => outcome.status === 'late')
         : Promise.resolve(null),
     ])
     if (decision.kind === 'reject' || (payload.step === 1 && decision.messages.length === 0)) return decision
@@ -2119,14 +2272,17 @@ export function apply(ctx: Context, config: Config): void {
       extra.push(guidance(buildDelegationHint(), 'delegation'))
     }
 
-    const drained = await drainPosted(agentId, payload.turn, config.drainDeadlineMs, payload.signal)
+    const hasPending = pendingPost.list(agentId).length > 0
+    const drained = hasPending
+      ? await timedWait(agentId, drainPosted(agentId, payload.turn, config.drainDeadlineMs, payload.signal), () => pendingPost.list(agentId).length > 0)
+      : { messages: [], escalate: false }
     const escalate = failureSignal || drained.escalate
     if (escalate) routes.escalate(agentId, payload.turn)
     const route = routes.get(agentId, payload.turn)
     // The strategy hint goes out once per verdict per turn — on the fresh
     // step that set it, or when a failure signal escalated it — never on
     // every continuation step.
-    if (route !== null && (fresh || escalate)
+    if (route !== null && (fresh || escalate) && hintAllowed(route.verdict)
       && hintLedger.admit(agentId, payload.turn, `strategy:${route.verdict}:${escalate ? 'esc' : 'base'}`)) {
       /* v8 ignore next -- defensive: the plugin always offers a trace id */
       if (route.traceId !== null) service.markActed(route.traceId)
@@ -2170,6 +2326,9 @@ export function apply(ctx: Context, config: Config): void {
     if (route === null) return null
     const routed = routedConfig(current, route.verdict)
     if (routed === null) return null
+    if (route.verdict === 'trivial') downgradedTurns.set(agentId, turn)
+    else downgradedTurns.delete(agentId)
+    capMap(downgradedTurns, 128)
     if (hintLedger.admit(agentId, turn, `route:${route.verdict}`)) {
       /* v8 ignore next -- defensive: the plugin always offers a trace id */
       if (route.traceId !== null) service.markActed(route.traceId)
@@ -2185,7 +2344,11 @@ export function apply(ctx: Context, config: Config): void {
    */
   async function actToolChoice(exec: ToolExecution, next: PreExecuteNext): Promise<PreToolDecision> {
     if (exec.name === SPAWN_TOOL_NAME || !isRiskyTool(exec.name, riskyPatterns)) return await next()
-    const judged = await withDeadline(askToolChoice(exec, lifetime.signal), config.toolGateDeadlineMs, exec.signal)
+    const judged = await timedWait(
+      exec.agent?.id ?? 'unknown-agent',
+      withDeadline(askToolChoice(exec, lifetime.signal), config.toolGateDeadlineMs, exec.signal),
+      value => value === null,
+    )
     if (judged === null) return await next()
     service.markActed(judged.traceId)
     const reason = buildToolDenyReason(exec.name, judged.confidence)
@@ -2369,8 +2532,7 @@ export function apply(ctx: Context, config: Config): void {
       if (judged !== null && typeof judged.value === 'string') {
         const verdict = judged.value as ResultTriageVerdict
         if (verdict === 'noisy_keep_head' || verdict === 'irrelevant') {
-          const head = resultQuestions.resultText.slice(0, config.triageHeadChars)
-          replacement = [{ type: 'text', text: `${head}${buildPruneMarker(entry.name, resultQuestions.resultText.length)}` }]
+          replacement = [{ type: 'text', text: keepEdges(resultQuestions.resultText, entry.name) }]
           ctx.logger.warn(`system1: result triage dropped ${resultQuestions.resultText.length} chars from ${entry.name} (${verdict})`)
           service.markActed(judged.trace.id)
         } else if (verdict === 'error_actionable' || verdict === 'error_transient') {
@@ -2430,6 +2592,9 @@ export function apply(ctx: Context, config: Config): void {
    * warns the operator).
    */
   const disposePreExecute = ctx.on('tools/pre-execute', async (exec, next) => {
+    if (enforce && stopSteps.has(exec.agent?.id ?? '')) {
+      return { kind: 'deny', reason: 'System 1 stop: this turn is being stopped after repeated failing actions. Explain to the user instead of calling tools.' }
+    }
     if (asyncAct) return await actToolChoice(exec, next)
     if (enforce) return await judgeToolChoice(exec, next)
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
@@ -2453,9 +2618,40 @@ export function apply(ctx: Context, config: Config): void {
       for (const key of pendingPost.list(payload.agent.id)) board.delete(key)
       pendingPost.reset(payload.agent.id)
     }
+    stopSteps.delete(payload.agent.id)
+    if (enforce && config.verifyDowngrades && downgradedTurns.get(payload.agent.id) === payload.turn) {
+      downgradedTurns.delete(payload.agent.id)
+      return verifyDowngrade(payload).finally(() => { flushWaits(payload.agent.id, payload.turn) })
+    }
+    flushWaits(payload.agent.id, payload.turn)
     /* v8 ignore next -- defensive: System1Service.askMany never rejects */
     void observeFinalAnswer(payload.agent, payload.turn).catch(() => undefined)
+    return undefined
   })
+
+  /**
+   * Verify-then-escalate: the turn was served by the cheap `trivial` route,
+   * so check the final answer before letting the turn end. A confident
+   * `inadequate` upgrades the turn's route (upgrade-only ledger) and steers
+   * one more step, which the loop runs on the upgraded route. Bounded by
+   * `verifyDeadlineMs`; any doubt, timeout or error lets the turn end.
+   */
+  async function verifyDowngrade(payload: { agent: { id: string; steer?: (message: UserMessage) => void }; turn: number }): Promise<void> {
+    const agentId = payload.agent.id
+    const decision = await timedWait(
+      agentId,
+      withDeadline(finalAnswerDecision(payload.agent, payload.turn), config.verifyDeadlineMs, lifetime.signal),
+      value => value === null,
+    )
+    if (decision === null || decision.value !== 'inadequate') return
+    service.markActed(decision.trace.id)
+    routes.offer(agentId, payload.turn, 'standard', decision.trace.id)
+    ctx.logger.warn(`system1: cheap-route answer judged inadequate for agent ${agentId}; escalating turn ${payload.turn}`)
+    payload.agent.steer?.(guidance(
+      '[System 1 verify] The previous answer does not fully address the request. Re-read the request and answer it completely; verify any claim you are unsure of.',
+      'verify',
+    ))
+  }
 
   /**
    * Stream-time speculation: `agent/assistant-stream` tool-call-delta

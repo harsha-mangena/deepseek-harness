@@ -37,6 +37,7 @@ export type System1QuestionKind =
   | 'injection-screen'
   | 'subagent-accept'
   | 'prune'
+  | 'triage-feature'
 
 /** Jev's verdict on a subagent's output: meets the task, partially meets it, or fails it. */
 export type SubagentAcceptVerdict = 'meets' | 'partial' | 'fails'

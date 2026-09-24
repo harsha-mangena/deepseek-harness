@@ -32,6 +32,7 @@ import {
   buildTriageQuestion,
   type ObservedToolCall,
 } from '../src/gates.ts'
+import { buildTriageFeatureQuestions, TRIAGE_FEATURES } from '../src/triage.ts'
 import type { System1Question, System1RuntimeConfig } from '../src/types.ts'
 
 interface Case {
@@ -61,7 +62,22 @@ const call = (name: string, argsKey: string, isError = false): ObservedToolCall 
 // Golden cases: small, hand-labeled, and deliberately unambiguous. Grow each
 // kind to 30-50 cases from real `system1/decision` traces before trusting a
 // threshold (see the handoff doc, P2).
+/** Decomposed-triage feature cases: [request, expected per feature (answerable, single-change, investigation, broad)]. */
+const FEATURE_CASES: Array<[string, [boolean, boolean, boolean, boolean]]> = [
+  ['what does the --no-open flag do in a typical CLI?', [true, false, false, false]],
+  ['fix the typo "recieve" in README.md line 12', [false, true, false, false]],
+  ['the date parser test fails on leap years; find out why and fix it', [false, false, true, false]],
+  ['migrate the session store from JSONL to SQLite and update every consumer', [false, false, false, true]],
+  ['we get an intermittent deadlock under load between scheduler and job runner', [false, false, true, true]],
+  ['rename getUser to fetchUser in src/api/user.ts', [false, true, false, false]],
+]
+
 const CASES: Case[] = [
+  ...FEATURE_CASES.flatMap(([request, expected]) => buildTriageFeatureQuestions(request).map((question, index) => ({
+    name: `feature/${TRIAGE_FEATURES[index]}/${request.slice(0, 24)}`,
+    question,
+    expect: expected[index] as boolean,
+  }))),
   // triage (routing driver)
   { name: 'triage/greeting', question: buildTriageQuestion([user('thanks!')]), expect: 'trivial' },
   { name: 'triage/flag', question: buildTriageQuestion([user('what does the --no-open flag do in our CLI?')]), expect: 'trivial' },

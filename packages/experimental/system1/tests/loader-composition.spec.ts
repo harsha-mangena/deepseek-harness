@@ -181,7 +181,7 @@ async function boot(
   await writeFile(configPath, [...modules.keys()].flatMap(name => [
     `- name: '${name}'`,
     ...name === '@deepseek-ai/dsh-experimental-system1'
-      ? ['  config:', ...Object.entries({ actuation: 'blocking', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
+      ? ['  config:', ...Object.entries({ actuation: 'blocking', triageStyle: 'single', strategyHints: 'all', stopMode: 'reject', ...system1Config }).map(([key, value]) => `    ${key}: ${JSON.stringify(value)}`)]
       : [],
   ]).join('\n') + '\n')
 
@@ -219,7 +219,8 @@ function liveSession(context: Context, agentId: string): SessionId {
 function preStepPayload(context: Context, agentId: string, signal: AbortSignal): PreStepPayload {
   return {
     agent: { id: agentId, sessionId: liveSession(context, agentId) },
-    messages: [],
+    // Shadow triages fresh input only: the step carries a real user message.
+    messages: [createUserMessage({ content: [{ type: 'text', text: 'Probe the fixture tool.' }], source: { kind: 'user' } })],
     turn: 1,
     step: 1,
     signal,
@@ -271,8 +272,10 @@ it('consults Jev on real turns without changing or delaying loop behavior', asyn
   expect(agent.session.deriveMessages().some(message => message.role === 'tool')).toBe(true)
 
   // Shadow observations reached Jev on the real wire format...
+  // Step 1 (fresh user input) is triaged; step 2 is a tool continuation and
+  // is not — triaging empty continuations only produced noise.
   await vi.waitFor(() => {
-    expect(jevCalls).toHaveLength(3)
+    expect(jevCalls).toHaveLength(2)
   })
   for (const call of jevCalls) {
     expect(call.url).toBe('https://api.typesafe.ai/v1/systemone')
@@ -280,7 +283,7 @@ it('consults Jev on real turns without changing or delaying loop behavior', asyn
   // The two pre-step batches ask triage and step delegability together; the
   // delegation *hint* is only injected once team tooling has been seen.
   const batches = jevCalls.filter(call => askedKinds(call).includes('triage'))
-  expect(batches).toHaveLength(2)
+  expect(batches).toHaveLength(1)
   for (const call of batches) {
     expect(Object.keys(call.questions)).toHaveLength(2)
     expect(call.questions['triage#0']).toMatchObject({ type: 'choice' })

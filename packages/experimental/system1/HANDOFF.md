@@ -584,3 +584,29 @@ export DEEPSEEK_API_KEY=...
 
 Share `.artifacts/jev-eval.json` and the G8 report (no keys, no raw
 prompts if sensitive) for review.
+
+---
+
+## Addendum — Harness v2 (patch 0003), status after the 18-run live benchmark
+
+**Benchmark verdict.** The 18-run benchmark (n=2 per cell) shows no System 1 effect. Shadow cannot change behavior, yet it
+beat Off by 33% on tokens — 99.5% of that gap is one task (Choose 4290→2300), so the run is confounded (order / cache / time
+of day). Enforce vs Shadow (+12% tokens, equal steps) flips sign across tasks: noise. Image 3's step-2+ `trivial` verdicts
+came from shadow `observeStep` triaging empty tool continuations every step.
+
+**Done in 0003:** fresh-only triage in every mode; decomposed request triage (`src/triage.ts`); `strategyHints: off` default;
+downgrade gate (`routeDowngradeThreshold`); shared sticky upgrade-only routing in blocking and async; G7 verify-then-escalate;
+G12 explaining STOP (`stopMode`); G6 task-aware head+tail result triage with a never-drop failing-tail guard; per-turn
+critical-path wait log; `scripts/bench-report.ts` (paired stats, confound detector, power); eval feature cases.
+
+**Still open (Muse):**
+- G4: `src/index.ts` coverage 99.55% stmts / 97.89% branches — uncovered: lines 605–608 (warm-up catch), 1024, 1067,
+  2667 and branches at 822, 853, 1022, 1065, 1204, 1227, 1406, 1415, 2015–2022 (askTurnTriage single-style/abstain
+  branches), 2085, 2172, 2199, 2665. Add tests; do not add v8-ignores for reachable logic.
+- Review the v8-ignores added in 53422bf: "flaky in full suite" and "timing-dependent in tests" are reachable paths —
+  make those tests deterministic instead (fake timers / explicit board settlement).
+- G3: format-5 writer / persistence acknowledgement for `source.kind='system1'` (needs a decision).
+- G8: re-run the benchmark with the protocol in the review: suites where System 1 can act (S1 trivial-on-Pro, S2 failing
+  loop, S4 noisy outputs), ≥30 pairs per task, randomized condition order per block, cache tokens split, wall time to
+  turn-stopping, then `bench-report.ts`. Commit the runner (live-test/ is untracked today).
+- G9/G10/G15/G16/G18 unchanged.
