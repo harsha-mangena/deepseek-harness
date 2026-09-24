@@ -453,6 +453,7 @@
     { "path": "./packages/system1/observations" },
     { "path": "./packages/system1/jev" },
     { "path": "./packages/system1/calibration" },
+    { "path": "./packages/system1/integration" },
     { "path": "./packages/lsp/lsp" },
     { "path": "./packages/lsp/lsp-stdio" },
     { "path": "./packages/lsp/tool-lsp" },
