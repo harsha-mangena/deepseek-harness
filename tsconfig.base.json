@@ -328,6 +328,12 @@
       // dsh-system1-workflow lives under system1/workflow/, so the generator cannot map
       // its name to its directory; this alias stays hand-written.
       "@deepseek-ai/dsh-system1-workflow": ["./packages/system1/workflow/src"],
+      // dsh-system1-contracts lives under system1/contracts/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-contracts": ["./packages/system1/contracts/src"],
+      // dsh-system1-policy lives under system1/policy/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-policy": ["./packages/system1/policy/src"],
+      // dsh-system1-coordination lives under system1/coordination/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-coordination": ["./packages/system1/coordination/src"],
       // BEGIN generated package aliases — pnpm run gen-tsconfig-paths
       "@deepseek-ai/dsh-acp": ["./packages/acp/acp/src"],
       "@deepseek-ai/dsh-acp-app": ["./packages/bundle/acp-app/src"],
