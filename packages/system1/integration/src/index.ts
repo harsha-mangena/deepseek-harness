@@ -15,8 +15,9 @@ export type {
   CoordinatorInput,
   CoordinatorResult,
 } from './coordinator.ts'
-export { ReadOnlyProductionDriver } from './driver.ts'
+export { ReadOnlyProductionDriver, buildEscalationBundle } from './driver.ts'
 export type {
+  EscalationBundleInput,
   ResolvedToolCall,
   ToolVerificationContext,
   ProductionDriverConfig,

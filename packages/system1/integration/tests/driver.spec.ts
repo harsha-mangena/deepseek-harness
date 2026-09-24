@@ -26,11 +26,14 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import * as WorkflowModule from '@deepseek-ai/dsh-system1-workflow'
 import {
   System1RequestId,
+  type HandoffBundle,
+  type HandoffHandler,
   type System1CoordinatorAgent,
   type System1Workflows,
 } from '@deepseek-ai/dsh-system1-workflow'
 import {
   ReadOnlyProductionDriver,
+  buildEscalationBundle,
   type ProductionDriverConfig,
   type ToolVerificationContext,
 } from '@deepseek-ai/dsh-system1-integration'
@@ -414,3 +417,192 @@ describe('ReadOnlyProductionDriver', () => {
     }
   })
 })
+
+describe('buildEscalationBundle', () => {
+  it('builds an honest bundle from the turn observation and decision', () => {
+    const bundle = buildEscalationBundle({
+      requestId: System1RequestId('req-7'),
+      observations: [
+        { provenance: { kind: 'user-input' }, content: 'Check CI status', timestampMs: 1 },
+        { provenance: { kind: 'user-input' }, content: 'Use the main branch', timestampMs: 2 },
+      ],
+      decision: testDecision('escalate-none', null),
+      reason: 'Coordinator selected escalate-none',
+      budget: { poolName: 'pool-main', units: 100 },
+      tenantId: 'tenant-test',
+    })
+    expect(bundle.schemaVersion).toBe(1)
+    expect(bundle.taskId).toBe('req-7-escalation')
+    expect(bundle.objective).toBe('Check CI status\nUse the main branch')
+    expect(bundle.constraints.join(' ')).toContain('tenant-test')
+    // Escalation dispatches nothing: no completed effects, no fresh evidence.
+    expect(bundle.completedEffects).toEqual([])
+    expect(bundle.unknownEffects).toEqual([])
+    expect(bundle.failedChoices).toEqual([
+      { choice: 'escalate-none', reason: 'Coordinator selected escalate-none' },
+    ])
+    expect(bundle.remainingBudget).toEqual({ poolName: 'pool-main', units: 100 })
+  })
+
+  it('falls back to the decision when there are no observations', () => {
+    const bundle = buildEscalationBundle({
+      requestId: System1RequestId('req-8'),
+      observations: [],
+      decision: testDecision('escalate-none', null),
+      reason: 'no executable outcome',
+      budget: { poolName: 'pool-main', units: 25 },
+      tenantId: 'tenant-test',
+    })
+    expect(bundle.objective).toContain('d1')
+    expect(bundle.objective).toContain('no executable outcome')
+  })
+})
+
+describe('driver escalation handoff', () => {
+  function escalatingDriver(overrides: Partial<ProductionDriverConfig> = {}) {
+    return makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('escalate-none', null),
+          decisionId: input.decisionId,
+          probabilities: {},
+          selectedProbability: 0,
+        }),
+      },
+      ...overrides,
+    })
+  }
+
+  it('keeps the fail-safe escalated terminal when no handoff handler is configured', async () => {
+    const driver = escalatingDriver()
+    const setup = await runTurn('s-driver-escalate-default', driver)
+    try {
+      expect(setup.toolRan()).toBe(false)
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+      // No handler ran: no handoff verification evidence was recorded.
+      const verifications = setup.session
+        .snapshotEvents()
+        .filter((event) => event.type === 'system1/verification')
+      expect(verifications).toHaveLength(0)
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('invokes the handoff handler with the escalation bundle and records its evidence', async () => {
+    const seen: HandoffBundle[] = []
+    const handler: HandoffHandler = async (_coordinator, bundle, _signal) => {
+      seen.push(bundle)
+      return {
+        kind: 'completed',
+        artifacts: ['artifact:summary'],
+        evidence: ['evidence:ci-log'],
+        actualUnits: 12,
+      }
+    }
+    const driver = escalatingDriver({
+      handoff: handler,
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-driver-escalate-handoff', driver)
+    try {
+      expect(setup.toolRan()).toBe(false)
+      expect(seen).toHaveLength(1)
+      expect(seen[0].taskId).toBe('req-test-escalation')
+      expect(seen[0].objective).toContain('Check CI status')
+      expect(seen[0].remainingBudget).toEqual({ poolName: 'pool-main', units: 100 })
+      expect(seen[0].constraints.join(' ')).toContain('tenant-test')
+
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+
+      // The child's evidence is durable in the session log.
+      const verifications = setup.session
+        .snapshotEvents()
+        .filter((event) => event.type === 'system1/verification')
+      expect(verifications).toHaveLength(1)
+      expect(verifications[0].data.checkId).toBe('deepseek-handoff')
+      expect(verifications[0].data.evidence).toBe('evidence:ci-log')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('finalizes escalated when the handoff handler reports failure', async () => {
+    const driver = escalatingDriver({
+      handoff: async () => ({
+        kind: 'failed',
+        code: 'EXECUTION_FAILED',
+        reason: 'child exploded',
+      }),
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-driver-escalate-failed', driver)
+    try {
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+      const summary = terminalSummary(setup.session)
+      expect(summary).toContain('EXECUTION_FAILED')
+      expect(summary).toContain('child exploded')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('finalizes escalated when the handoff handler throws', async () => {
+    const driver = escalatingDriver({
+      handoff: async () => {
+        throw new Error('handler bug')
+      },
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-driver-escalate-threw', driver)
+    try {
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+      expect(terminalSummary(setup.session)).toContain('threw')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('rejects a handoff without a budget at construction', () => {
+    expect(
+      () =>
+        makeDriver({
+          handoff: async () => ({
+            kind: 'failed',
+            code: 'EXECUTION_FAILED',
+            reason: 'unreachable',
+          }),
+        }),
+    ).toThrow(/handoffBudget/)
+  })
+
+  it('rejects a non-positive handoff budget at construction', () => {
+    expect(() =>
+      makeDriver({
+        handoff: async () => ({
+          kind: 'failed',
+          code: 'EXECUTION_FAILED',
+          reason: 'unreachable',
+        }),
+        handoffBudget: { poolName: 'pool-main', units: 0 },
+      }),
+    ).toThrow(/positive/)
+  })
+})
+
+/** Summary of the single terminal event in a session. */
+function terminalSummary(session: Session): string {
+  const event = session
+    .snapshotEvents()
+    .find((candidate) => candidate.type === 'system1/terminal')
+  const data = event?.data as { summary?: string } | undefined
+  return data?.summary ?? ''
+}

@@ -49,7 +49,8 @@ export class System1Workflows extends Service {
     model: z.string(),
   })
 
-  /** Resolved and immutable plugin configuration. */
+  /** Resolved plugin configuration. Fixed at boot, except `mode`, which
+   * {@link rollbackToBaseline} transitions one-way to `'off'`. */
   readonly config: ResolvedSystem1WorkflowConfig
 
   /**
@@ -127,6 +128,27 @@ export class System1Workflows extends Service {
     const agent = this.ctx.agents.get(sessionId)
     return agent instanceof System1CoordinatorAgent ? agent : undefined
   }
+
+  /**
+   * Roll the integration back to the baseline DeepSeek path. Every live
+   * coordinator is drained and unregistered — in-flight turns are
+   * cancelled, the driver settles, and owned effects unwind — using the
+   * same teardown as {@link System1CoordinatorHandle.dispose}. Nothing is
+   * deleted: inbox appends, receipts, verification evidence, unknown
+   * outcomes, and terminal records all stay in the durable session log,
+   * and budget and fencing state are untouched. Afterwards the plugin
+   * mode is latched to `'off'`, so coordinator creation is refused and
+   * new work takes the standard DeepSeek path. The transition is
+   * one-way; re-enabling requires reloading the plugin with new
+   * configuration.
+   * @returns resolves once every live coordinator is drained and the
+   *   mode is latched to `'off'`.
+   */
+  async rollbackToBaseline(): Promise<void> {
+    const disposers = [...this.liveCoordinators]
+    await Promise.allSettled(disposers.map((dispose) => dispose()))
+    this.config.mode = 'off'
+  }
 }
 
 export default System1Workflows
@@ -169,3 +191,30 @@ export { SYSTEM1_EVENT_TYPES } from './events.ts'
 export { System1Inbox } from './inbox.ts'
 export { System1CoordinatorAgent } from './coordinator-agent.ts'
 export type { CoordinatorDriver } from './coordinator-agent.ts'
+export {
+  HANDOFF_SCHEMA_VERSION,
+  MAX_HANDOFF_DEPTH,
+  checkReturnContract,
+  extractHandoffResult,
+  handoffToDeepSeek,
+  parseChildResult,
+  parseHandoffBundle,
+  renderHandoffMessage,
+  renderHandoffText,
+} from './handoff.ts'
+export type {
+  HandoffBudget,
+  HandoffBudgetLedger,
+  HandoffBundle,
+  HandoffChildResult,
+  HandoffHandler,
+  HandoffOptions,
+  HandoffOutcome,
+  HandoffReturnContract,
+} from './handoff.ts'
+export { spawnWorker } from './workers.ts'
+export type {
+  WorkerOptions,
+  WorkerOutcome,
+  WorkerSpec,
+} from './workers.ts'

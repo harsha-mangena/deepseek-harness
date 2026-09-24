@@ -48,6 +48,10 @@ Call `ctx.system1Workflows.create(session, driver)` with a session and a driver.
 
 Creating while `mode` is `off` throws. Creating for a session that already has a coordinator throws a collision error. A driver that rejects on abort is contained; a driver that rejects for any other reason is recorded on the coordinator and does not take down the plugin.
 
+### Rolling back to the baseline
+
+Call `ctx.system1Workflows.rollbackToBaseline()` to remove the integration from the serving path immediately. Every live coordinator is drained and unregistered (in-flight turns cancelled, driver settled, owned effects unwound) — the same teardown as the handle's `dispose()`. Nothing is deleted: session events, receipts, verification evidence, unknown outcomes, budgets, and fencing epochs are preserved for replay. The mode is then latched one-way to `'off'`, so new coordinator creation is refused and new work takes the standard DeepSeek path. Re-enabling requires reloading the plugin with new configuration. See the [operations runbook](../../../docs/system1/operations-runbook.md) for the full procedure.
+
 ### Finalizing a request
 
 Record the terminal outcome with `finalizeTerminal({ session, requestId, outcome, summary, verifiedBy, verifications })`. It is the only supported way to append `system1/terminal`: success requires a non-empty `verifiedBy` list where every cited check has a passing verification record, and throws `TerminalInvariantError` otherwise. Other outcomes record without evidence. Appending `system1/terminal` directly bypasses this check and is unsupported.
@@ -66,6 +70,14 @@ Inbox appends (`send`, `followup`, `steer`) are written to the durable session l
 
 `delegate(fencingToken, depth, work)` binds delegated work to the coordinator's fencing token and enforces a maximum delegation depth of 5. Invalid tokens or excessive depth fail closed. The token must come from a lease acquired via the coordination package; the coordinator never invents one.
 
+### DeepSeek handoff
+
+`handoffToDeepSeek(coordinator, bundle, signal, options)` transfers a bounded task to a real DeepSeek child agent created through the coordinator's own agent registry — the standard DeepSeek factory is never modified or replaced. The `HandoffBundle` is runtime-validated at the trust boundary; the child's budget is reserved from the parent pool before creation, settled against measured usage on success, and released on failure or cancellation. The child is created with explicit `parentAgent` lineage, `meta.delegationDepth`, `meta.parentSession`, and `origin: 'subagent'`; its initial context is seeded with the bundle through its scoped system prompt, and it is driven through its real inbox. Parent cancellation propagates via `agent.cancel()`; the child's final assistant message is parsed and validated against the bundle's return contract; the owned child handle is always disposed. A durable `system1/handoff` event keeps the transfer reconstructable from the parent session log.
+
+### Scoped workers
+
+`spawnWorker(coordinator, spec, signal, options)` builds on the handoff machinery and the existing `DelegationManager` (depth tracking and budget pre-checks). The worker's tool capabilities are restricted to exactly the spec's allow-list via `tools.restrict()` inside the child's unpublished setup scope; unknown capability names fail loudly at setup. Workers share the parent's budget pool and cancellation signal.
+
 ### Evidence
 
 Verification results are stored durably as `system1/verification` session events. `getEvidence(requestId)` retrieves them in log order for audit or recovery. The production driver emits these events before finalizing, so a success terminal's `verifiedBy` checks always have retrievable backing evidence.
@@ -77,7 +89,9 @@ Verification results are stored durably as `system1/verification` session events
 - `src/inbox.ts` — the coordinator's real `Inbox` implementation.
 - `src/coordinator-agent.ts` — `System1CoordinatorAgent`, the custom runtime root.
 - `src/finalizer.ts` — `finalizeTerminal`: the supported terminal-event writer and its invariant.
-- `src/plugin.ts` — `System1Workflows` service: kill-switched creation, lifecycle ownership, lookup.
+- `src/handoff.ts` — `handoffToDeepSeek`: real DeepSeek child handoff with budget, lineage, cancellation, and return validation.
+- `src/workers.ts` — `spawnWorker`: scoped workers with restricted tool capabilities on the handoff machinery.
+- `src/index.ts` — `System1Workflows` service: kill-switched creation, lifecycle ownership, lookup, and `rollbackToBaseline`.
 - `src/index.ts` — public surface.
 
 ## Further Exploration

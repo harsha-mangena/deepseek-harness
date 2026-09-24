@@ -59,6 +59,8 @@
     "test:bench:built": "vitest run --config vitest.bench.config.ts",
     "test:expected": "vitest run --config vitest.expected.config.ts",
     "test:expected:refresh": "DSH_SNAPSHOT=refresh vitest run --config vitest.expected.config.ts",
+    "system1:bench": "node packages/system1/scripts/bench.mjs",
+    "system1:report": "node packages/system1/scripts/report.mjs",
     "test:approval-policy": "node --test .github/review-ownership/check-approval.test.mjs .github/review-ownership/blame-ownership.test.mjs .github/review-ownership/author-weight.test.mjs",
     "test:issue-management": "node .github/issue-management/policy.test.mjs",
     "test:snapshot": "vitest run --config vitest.snapshot.config.ts",

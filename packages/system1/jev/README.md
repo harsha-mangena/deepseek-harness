@@ -9,6 +9,25 @@ Jev decision provider for System 1: TypeSafe API adapter (Jev-only).
 - **Retry policy**: one transport retry (per plan §8) for transient failures only — HTTP 429, 5xx, and network/timeout errors. Permanent failures are never retried: invalid credentials (401/403) make exactly one HTTP attempt, as do other 4xx rejections, malformed responses, and cancellations. Timeouts, rate limits, and auth failures map to structured `System1Error` codes.
 - **Usage accounting**: parses input/output tokens (null-safe) for the cost ledger.
 
+## Live smoke test
+
+`src/live-smoke.ts` makes one real `Choice` call to the live TypeSafe API
+through the production `JevDecisionProvider.decide()` path (transport,
+strict normalization, model pinning), then prints the model
+requested/resolved, selected ID, calibrated fields, and usage. It never logs
+the API key.
+
+```sh
+# export TYPESAFE_API_KEY in the environment, then run:
+pnpm --filter @deepseek-ai/dsh-system1-jev system1:live-smoke
+```
+
+`TYPESAFE_JEV_MODEL` optionally overrides the pinned model (default
+`jev-1.13.0`). Without `TYPESAFE_API_KEY` the script exits 2 with
+`skipped: no credentials` — a skip, not a failure. It never runs as part of
+the default test suite; `tests/live-smoke.spec.ts` covers only the key-gated
+skip behavior (no network calls).
+
 ## Known Limitations and Deferred Work
 
 - All transport tests use mocked fetch; no live API calls are made in tests.

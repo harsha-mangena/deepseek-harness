@@ -24,10 +24,25 @@
       "path": "../../core/session"
     },
     {
+      "path": "../../core/scope"
+    },
+    {
+      "path": "../../core/system-prompt"
+    },
+    {
+      "path": "../../core/tools"
+    },
+    {
       "path": "../../llm/llm"
     },
     {
       "path": "../../util/brand"
+    },
+    {
+      "path": "../contracts"
+    },
+    {
+      "path": "../delegation"
     }
   ]
 }

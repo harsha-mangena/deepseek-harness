@@ -38,7 +38,7 @@ See "Exit-gate assessment" below.
 | 8 | Retained-evidence quality and final task quality meet the fixed baseline margin | **Met** — complete-output bounds, recursive secret redaction, durable evidence |
 | 9 | A reviewer can explain why a task routed, what executed, how much it consumed, and why it was declared successful from stored evidence | **Met** — durable session events (inbox, verification, terminal); evidence retrievable by request ID |
 | 10 | Load/chaos results satisfy declared service limits; recovery preserves effects and budgets | **Not met** — no load/chaos testing; recovery preserves inbox and evidence but budgets not yet durable |
-| 13 | Every enabled feature has verified evidence and an operational owner/runbook | **Partial** — all features have regression tests and documented guarantees; no operational runbook yet |
+| 13 | Every enabled feature has verified evidence and an operational owner/runbook | **Mostly met** — all features have regression tests and documented guarantees; `docs/system1/operations-runbook.md` covers startup checks, modes, kill switch, rollback, monitoring, and incident response; `pnpm run system1:bench` / `system1:report` produce timed manifests. No production deployment has exercised the runbook, and no operational owner is named |
 
 ## Remediation record
 
@@ -50,9 +50,25 @@ Remediation proceeded in phases A–E, in order:
 - **D — Recovery, delegation, evidence handling** (`e143be3`). Durable inbox session events with replay recovery, delegation with fencing tokens and depth limits, durable verification evidence retrievable by request ID.
 - **E — Certification** (this document). Measured evidence: 327 tests pass (24 files), 98.15% statement / 96.16% branch coverage on system1 packages, typecheck clean for all modified packages. Explicit blocked status for live checks lacking credentials.
 
+## Follow-up: operations (§13.13, §13.14)
+
+After the remediation commits, the remaining partial checklist items were closed as implemented-but-unexercised:
+
+- **`System1Workflows.rollbackToBaseline()`** drains every live coordinator (in-flight turns cancelled, driver settled, owned effects unwound, agent unregistered), preserves all session events, receipts, verification evidence, budgets, and fencing epochs, then latches the mode one-way to `'off'` so new work takes the baseline DeepSeek path. Covered by `packages/system1/workflow/tests/rollback.spec.ts` (event preservation, in-flight cancellation, one-way latch, idempotency).
+- **`docs/system1/operations-runbook.md`** documents startup checks (dependencies, suite, typecheck, Jev key/pinned model, approved calibration, MCP availability, SQLite storage), `off`/`shadow`/`enforce` mode operations, the kill-switch procedure, the rollback procedure, monitoring (budget exhaustion, calibration drift, verification failures, provider health, unknown outcomes), and incident responses for provider outage, unknown write outcome, budget exhaustion, and verification failure loop.
+- **`pnpm run system1:bench`** runs the system1 vitest suite and writes `packages/system1/bench-manifest.json` (per-file package, test counts, durations, timestamp, git revision; gitignored). **`pnpm run system1:report`** prints totals, slowest files, and pass/fail from the manifest.
+- Honest limit: rollback, the kill switch, and the runbook procedures have not been exercised in a production deployment; the bench scripts measure local suite timing only.
+
 ## Known limitations
 
-- **No live validation in this build**: Jev transport was verified against the live API on 2026-09-24 (prior commit); this remediation build has no live API calls. DeepSeek API unreachable from this environment.
+- **No live validation in this build**: a live smoke script exists
+  (`packages/system1/jev/src/live-smoke.ts`, runnable via
+  `pnpm --filter @deepseek-ai/dsh-system1-jev system1:live-smoke` with
+  `TYPESAFE_API_KEY` set; exits 2 with `skipped: no credentials` when unset),
+  but it has not been executed in this build — no credentials are available
+  in this environment. Jev transport was verified against the live API on
+  2026-09-24 (prior commit); this remediation build has no live API calls.
+  DeepSeek API unreachable from this environment.
 - **No production calibration**: the calibration gate enforces thresholds, but production correctness data has not been collected.
 - **No load/chaos testing**: recovery preserves inbox and evidence; budgets are not yet durable; service limits not measured.
 - **In-memory coordination**: work queue and checkpoints are single-process; PostgreSQL persistence deferred.

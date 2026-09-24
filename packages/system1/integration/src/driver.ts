@@ -21,6 +21,7 @@ import type {
   Candidate,
   DecisionProvider,
   ExecutionOutcome,
+  NormalizedDecision,
 } from '@deepseek-ai/dsh-system1-contracts'
 import type {
   CatalogTool,
@@ -38,6 +39,9 @@ import {
 import type {
   CoordinatorDriver,
   FinalizerVerification,
+  HandoffBundle,
+  HandoffHandler,
+  HandoffOutcome,
   System1CoordinatorAgent,
 } from '@deepseek-ai/dsh-system1-workflow'
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
@@ -62,6 +66,54 @@ export interface ToolVerificationContext {
   readonly result: ToolExecutionSuccess
   /** Receipt reference recorded on the execution outcome. */
   readonly receiptRef: string
+}
+
+/** Input for {@link buildEscalationBundle}. */
+export interface EscalationBundleInput {
+  /** Request id of the escalated turn. */
+  readonly requestId: ReturnType<typeof System1RequestId>
+  /** Observations drained from the coordinator inbox this turn. */
+  readonly observations: readonly Observation[]
+  /** The decision that led to escalation. */
+  readonly decision: NormalizedDecision
+  /** Why the turn escalated. */
+  readonly reason: string
+  /** Budget for the handoff child. */
+  readonly budget: { readonly poolName: string; readonly units: number }
+  /** Tenant the escalation belongs to. */
+  readonly tenantId: string
+}
+
+/**
+ * Build the DeepSeek handoff bundle for an escalated turn. The bundle is
+ * honest about what the turn established: escalation happens with no tool
+ * dispatched, so there are no completed effects and no fresh evidence — the
+ * drained observations become the objective and the rejected selection is
+ * recorded as a failed choice.
+ */
+export function buildEscalationBundle(input: EscalationBundleInput): HandoffBundle {
+  const objective =
+    input.observations.length > 0
+      ? input.observations.map((observation) => observation.content).join('\n')
+      : `Escalated decision ${input.decision.decisionId}: ${input.reason}`
+  return {
+    schemaVersion: 1,
+    taskId: `${input.requestId}-escalation`,
+    objective,
+    constraints: [
+      `System 1 read-only escalation for tenant ${input.tenantId}`,
+      'No System 1 tool is dispatched after escalation',
+      `Escalation reason: ${input.reason}`,
+    ],
+    acceptedFacts: [],
+    resourceVersions: {},
+    completedEffects: [],
+    unknownEffects: [],
+    failedChoices: [{ choice: input.decision.selectedId, reason: input.reason }],
+    remainingBudget: { poolName: input.budget.poolName, units: input.budget.units },
+    verifierRequirements: [],
+    returnContract: { requiredArtifacts: [], requiredEvidence: [] },
+  }
 }
 
 /** Production driver configuration. */
@@ -93,6 +145,25 @@ export interface ProductionDriverConfig {
   readonly newRequestId?: () => ReturnType<typeof System1RequestId>
   /** Tool call ID generator (injectable for tests). */
   readonly newCallId?: () => ToolCallId
+  /**
+   * Optional DeepSeek handoff handler. When set (with `handoffBudget`), an
+   * escalated turn invokes the handler with a bundle built from the turn's
+   * observation/decision instead of finalizing `escalated` with no
+   * transfer of ownership. The handler owns the child lifecycle and
+   * budget. Default: unset — escalation keeps the fail-safe `escalated`
+   * terminal behavior.
+   */
+  readonly handoff?: HandoffHandler
+  /**
+   * Budget for the escalation handoff child, debited from the handler's
+   * ledger. Required when `handoff` is set; ignored otherwise.
+   */
+  readonly handoffBudget?: {
+    /** Parent pool the child's budget is reserved from. */
+    readonly poolName: string
+    /** Units reserved for the child. */
+    readonly units: number
+  }
 }
 
 /** Production driver: one durable read-only turn per wake. */
@@ -113,6 +184,22 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         'Production driver requires a pinned expectedModel',
         {},
       )
+    }
+    if (config.handoff !== undefined) {
+      if (config.handoffBudget === undefined) {
+        throw system1Error(
+          'INVALID_CONFIG',
+          'Production driver handoff requires an explicit handoffBudget',
+          {},
+        )
+      }
+      if (config.handoffBudget.units <= 0) {
+        throw system1Error(
+          'INVALID_CONFIG',
+          'Production driver handoffBudget.units must be positive',
+          { units: config.handoffBudget.units },
+        )
+      }
     }
     this.config = config
   }
@@ -197,14 +284,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     }
 
     if (result.decision.selectedId === 'escalate-none' || result.outcome === null) {
-      finalizeTerminal({
-        session,
-        requestId,
-        outcome: 'escalated',
-        summary: 'Decision escalated; no tool dispatched',
-        verifiedBy: [],
-        verifications: [],
-      })
+      await this.escalate(coordinator, requestId, observations, result, signal)
       return
     }
 
@@ -265,6 +345,95 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       summary: `Dispatched ${dispatched.candidate.id} (${dispatched.receiptRef})`,
       verifiedBy: [verification.checkId],
       verifications: [verification],
+    })
+  }
+
+  /**
+   * Handle an escalated turn. With no handoff handler configured this keeps
+   * the fail-safe behavior: a durable `escalated` terminal with no transfer
+   * of ownership. With a handler, the turn's observation/decision is built
+   * into a handoff bundle and handed to DeepSeek; the handler owns the
+   * child lifecycle and budget. A throwing handler fails the turn closed
+   * as `escalated`.
+   */
+  private async escalate(
+    coordinator: System1CoordinatorAgent,
+    requestId: ReturnType<typeof System1RequestId>,
+    observations: readonly Observation[],
+    result: CoordinatorResult,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const session = coordinator.session
+    const handler = this.config.handoff
+    const budget = this.config.handoffBudget
+    if (handler === undefined || budget === undefined) {
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'escalated',
+        summary: 'Decision escalated; no tool dispatched',
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+    const bundle = buildEscalationBundle({
+      requestId,
+      observations,
+      decision: result.decision,
+      reason:
+        result.decision.selectedId === 'escalate-none'
+          ? 'Coordinator selected escalate-none'
+          : 'Coordinator produced no executable outcome',
+      budget,
+      tenantId: this.config.tenantId,
+    })
+    let outcome: HandoffOutcome
+    try {
+      outcome = await handler(coordinator, bundle, signal)
+    } catch (error) {
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'escalated',
+        summary: `Escalation handoff threw: ${failureSummary(error)}; no tool dispatched`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+    if (outcome.kind === 'completed') {
+      // The child's evidence enters the session log before the terminal
+      // event, so getEvidence can retrieve it later.
+      for (const ref of outcome.evidence) {
+        session.append('system1/verification', {
+          schemaVersion: 1,
+          requestId,
+          checkId: 'deepseek-handoff',
+          passed: true,
+          evidence: ref,
+        })
+      }
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'escalated',
+        summary:
+          `Escalated to DeepSeek; child returned ${outcome.artifacts.length} ` +
+          `artifact(s) and ${outcome.evidence.length} evidence ref(s), ` +
+          `settling ${outcome.actualUnits} units`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+    finalizeTerminal({
+      session,
+      requestId,
+      outcome: 'escalated',
+      summary: `Escalation handoff failed (${outcome.code}): ${outcome.reason}; no tool dispatched`,
+      verifiedBy: [],
+      verifications: [],
     })
   }
 
