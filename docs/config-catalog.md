@@ -3185,6 +3185,46 @@ export interface Config {
 
 Source: [`packages/core/system-prompt/src/index.ts:247`](../packages/core/system-prompt/src/index.ts)
 
+<a id="deepseek-aidsh-system1-workflow"></a>
+
+## `@deepseek-ai/dsh-system1-workflow`
+
+Requires: `agents`
+
+```ts config-catalog
+/**
+ * Workflow plugin configuration: operating posture, decision provider, and
+ * Jev model selection. Schemastery fills defaults; absent fields resolve to
+ * the values documented on each property.
+ */
+export interface System1WorkflowConfig {
+  /** Operating posture; `off` keeps the plugin inert. Defaults to `off`. */
+  mode?: System1Mode
+  /** Decision provider; only `jev` is supported. Defaults to `jev`. */
+  provider?: System1Provider
+  /** Jev model name resolved at call time; omit to let Jev resolve the pinned default. */
+  model?: string
+}
+
+/** Operating posture of the System 1 integration. */
+export type System1Mode =
+  /** Plugin loaded but refuses coordinator creation; the standard DeepSeek path is untouched. */
+  | 'off'
+  /** Coordinators run and record decisions, but every decision is advisory: DeepSeek still executes. */
+  | 'shadow'
+  /** Coordinators run and own routing/execution decisions for admitted work. */
+  | 'enforce'
+
+/**
+ * Execution provider backing System 1 decisions. Jev is the only supported
+ * provider; this stays a closed union so adding a provider is a deliberate,
+ * reviewed change rather than a config accident.
+ */
+export type System1Provider = 'jev'
+```
+
+Source: [`packages/system1/workflow/src/types.ts:40`](../packages/system1/workflow/src/types.ts)
+
 <a id="deepseek-aidsh-terminal-bash"></a>
 
 ## `@deepseek-ai/dsh-terminal-bash`

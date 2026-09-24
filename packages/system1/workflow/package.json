@@ -1,0 +1,48 @@
+{
+  "dependencies": {
+    "@deepseek-ai/schemastery": "workspace:~"
+  },
+  "private": true,
+  "description": "System 1 coordinator: custom AgentRegistry runtime root with a kill-switched Cordis plugin (Jev-only).",
+  "devDependencies": {
+    "@deepseek-ai/cordis": "workspace:~",
+    "@deepseek-ai/dsh-agent": "workspace:*",
+    "@deepseek-ai/dsh-llm": "workspace:*",
+    "@deepseek-ai/dsh-session": "workspace:*",
+    "@deepseek-ai/dsh-system-prompt": "workspace:*",
+    "@deepseek-ai/dsh-tools": "workspace:*"
+  },
+  "exports": {
+    ".": {
+      "default": "./lib/index.js",
+      "types": "./lib/types/index.d.ts"
+    },
+    "./package.json": "./package.json",
+    "./src/*": "./src/*"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts"
+  ],
+  "license": "MIT",
+  "main": "lib/index.js",
+  "name": "@deepseek-ai/dsh-system1-workflow",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:~",
+    "@deepseek-ai/dsh-agent": "workspace:*",
+    "@deepseek-ai/dsh-brand": "workspace:*",
+    "@deepseek-ai/dsh-llm": "workspace:*",
+    "@deepseek-ai/dsh-session": "workspace:*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "directory": "packages/system1/workflow",
+    "type": "git",
+    "url": "git+https://github.com/deepseek-ai/deepseek-harness.git"
+  },
+  "type": "module",
+  "types": "lib/types/index.d.ts",
+  "version": "0.1.7-alpha.2"
+}
