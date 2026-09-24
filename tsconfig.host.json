@@ -456,6 +456,7 @@
     { "path": "./packages/system1/integration" },
     { "path": "./packages/system1/delegation" },
     { "path": "./packages/system1/mcp" },
+    { "path": "./packages/system1/memory" },
     { "path": "./packages/lsp/lsp" },
     { "path": "./packages/lsp/lsp-stdio" },
     { "path": "./packages/lsp/tool-lsp" },
