@@ -23,7 +23,7 @@ calibration data, no load/chaos testing, and no production deployment.
 | B — execution authority and lifecycle | `d9b612e` | `d9b612e7f5697acf005183719f762409ae1fa199` |
 | C — durable state, authoritative accounting, persisted evidence | `9bc95eb` | `9bc95eb6f3c3fa1c497e055cfafc7eb60b7cb33b` |
 | D — supported composition and bounded DeepSeek fallback | `6e6d5ea` | `6e6d5ea64ff77fdb35456fb11725b9e9a029e555` |
-| E — evaluation and release evidence | `5322b25` | `5322b25e72d9f704ac888cc7a2dc6ed3d83e1d05` |
+| E — evaluation and release evidence | `83501e7` | `83501e772a8f1e41738dcde2bc5d0e76673c007b` |
 
 ## Finding → commit → test matrix
 
