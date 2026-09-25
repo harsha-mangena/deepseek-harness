@@ -30,8 +30,10 @@
  *    its initial context is seeded with the bundle through the child's
  *    scoped system prompt, and it is driven through its real inbox.
  * 6. Parent cancellation propagates to the child via `agent.cancel()`.
- * 7. The child's final committed assistant message is parsed and validated
- *    against the bundle's return contract; invalid returns fail closed.
+ * 7. The child's final committed assistant message is parsed, checked against
+ *    the bundle's return contract, and every evidence reference is resolved
+ *    against stored records; invalid returns and unresolvable references
+ *    fail closed.
  * 8. The owned child handle is always disposed.
  *
  * @module @deepseek-ai/dsh-system1-workflow/handoff
@@ -81,6 +83,13 @@ export interface HandoffBudgetLedger {
    * active, which is itself a hold until settled or released.
    */
   holdForReconciliation?(reservationId: string, claimedUnits: number, reason: string): void
+  /**
+   * Human-readable description of the pool's overrun policy (e.g.
+   * `"reject"` or `"hold with 10-unit allowance"`), rendered into the
+   * handoff prompt's budget envelope. Optional: when absent the prompt
+   * states the settlement invariant without naming a policy.
+   */
+  overrunPolicyDescription?(): string
 }
 
 /** Budget remaining for the child, debited from the named parent pool. */
@@ -88,6 +97,18 @@ export interface HandoffBudget {
   readonly poolName: string
   /** Units reserved for the child before it is created. */
   readonly units: number
+}
+
+/**
+ * Runtime values for {@link renderHandoffText} that are known only when the
+ * handoff is dispatched — not when the bundle is built. All fields optional
+ * so the pure bundle-only rendering stays testable.
+ */
+export interface HandoffPromptEnvelope {
+  /** Budget reservation id minted for this handoff run. */
+  readonly reservationId?: string
+  /** Human-readable overrun policy of the ledger pool (e.g. "reject"). */
+  readonly overrunPolicy?: string
 }
 
 /** What the child must return for the handoff to validate. */
@@ -207,6 +228,15 @@ export interface HandoffOptions {
    */
   readonly measureChildUsage?: (childSession: Session) => number | null
   /**
+   * Check an evidence reference returned by the child against stored
+   * records. Called for every evidence reference in the child's result;
+   * a reference the check rejects — or a blank reference — fails the
+   * handoff closed after settlement. Optional: when absent, only blank
+   * references are rejected and resolvability is enforced by the caller
+   * (the supported production wiring always provides this check).
+   */
+  readonly resolveEvidence?: (reference: string) => boolean
+  /**
    * Extra setup run inside the child's unpublished scope after the handoff
    * bundle is seeded — e.g. worker tool restriction. Runs before the child
    * is published, so it can only shape the child's scoped world.
@@ -283,8 +313,17 @@ export type HandoffHandler = (
  * Render the handoff bundle as a system-prompt section. The section is
  * registered in the child's unpublished scope during setup, so the bundle is
  * part of the child's initial context and reconstructable from configuration.
+ *
+ * The rendering carries the full return obligation: pinned resource versions,
+ * the budget envelope, verifier requirements, and the return contract with
+ * the usage-report schema. The optional envelope adds dispatch-time values
+ * (reservation id, overrun policy) that the bundle cannot know.
+ *
+ * @param bundle - the validated handoff bundle.
+ * @param envelope - runtime values known only at dispatch; may be omitted.
+ * @returns the prompt text.
  */
-export function renderHandoffText(bundle: HandoffBundle): string {
+export function renderHandoffText(bundle: HandoffBundle, envelope?: HandoffPromptEnvelope): string {
   const lines = [
     `# System 1 handoff (task ${bundle.taskId})`,
     '',
@@ -301,6 +340,14 @@ export function renderHandoffText(bundle: HandoffBundle): string {
       ...bundle.acceptedFacts.map((f) => `- ${f.fact} [${f.provenance}]`),
     )
   }
+  const resourceNames = Object.keys(bundle.resourceVersions)
+  if (resourceNames.length > 0) {
+    lines.push(
+      '',
+      'Pinned resource versions (use exactly these; do not substitute newer or older):',
+      ...resourceNames.map((name) => `- ${name}: ${bundle.resourceVersions[name]}`),
+    )
+  }
   if (bundle.completedEffects.length > 0) {
     lines.push('', 'Already completed (do not redo):', ...bundle.completedEffects.map((e) => `- ${e}`))
   }
@@ -314,12 +361,50 @@ export function renderHandoffText(bundle: HandoffBundle): string {
       ...bundle.failedChoices.map((f) => `- ${f.choice}: ${f.reason}`),
     )
   }
+  const budgetLines = [
+    '',
+    'Budget envelope (debited from the parent pool):',
+    `- Pool: ${bundle.remainingBudget.poolName}`,
+    `- Units reserved: ${bundle.remainingBudget.units}`,
+  ]
+  if (envelope?.reservationId !== undefined) {
+    budgetLines.push(`- Reservation: ${envelope.reservationId}`)
+  }
+  if (envelope?.overrunPolicy !== undefined) {
+    budgetLines.push(`- Overrun policy: ${envelope.overrunPolicy}`)
+  }
+  budgetLines.push(
+    'Usage above the reservation plus the pool overrun allowance is never silently',
+    'absorbed: it is rejected or held for reconciliation.',
+  )
+  lines.push(...budgetLines)
+  if (bundle.verifierRequirements.length > 0) {
+    lines.push(
+      '',
+      'Verifier requirements (all must be satisfied):',
+      ...bundle.verifierRequirements.map((v) => `- ${v}`),
+    )
+  }
+  const { requiredArtifacts, requiredEvidence } = bundle.returnContract
+  if (requiredArtifacts.length > 0 || requiredEvidence.length > 0) {
+    lines.push('', 'Return contract — your final message MUST satisfy every entry:')
+    if (requiredArtifacts.length > 0) {
+      lines.push(`- Required artifacts (string references): ${requiredArtifacts.join(', ')}`)
+    }
+    if (requiredEvidence.length > 0) {
+      lines.push(`- Required evidence (references to stored records): ${requiredEvidence.join(', ')}`)
+    }
+  }
   lines.push(
     '',
     'When you finish, your final message MUST be a single JSON object with this shape:',
     '{"schemaVersion":1,"artifacts":[...],"evidence":[...],"actualUnits":<number>}',
-    'where `artifacts` and `evidence` are string references and `actualUnits`',
-    'is the budget you consumed.',
+    'where `artifacts` and `evidence` are string references to the required',
+    'artifacts and evidence above, and `actualUnits` is your usage report: the',
+    'whole number of budget units you consumed. Your report is validated but',
+    'never trusted for settlement — the host meters your provider usage from',
+    'its own telemetry. Missing required artifacts or evidence, unresolvable',
+    'evidence references, or an invalid usage report fail the handoff closed.',
   )
   return lines.join('\n')
 }
@@ -395,6 +480,31 @@ export function parseChildResult(text: string): HandoffChildResult {
   }
   const parsed = ChildResultSchema(data)
   return { artifacts: parsed.artifacts, evidence: parsed.evidence, actualUnits: parsed.actualUnits }
+}
+
+/**
+ * Find evidence references that cannot back a result: blank references are
+ * never references, and when a resolver is provided every reference it
+ * rejects is unresolvable. A handoff whose child returned an unresolvable
+ * reference fails closed — the reference can never back a success claim.
+ *
+ * @param evidence - the evidence references from the child's result.
+ * @param resolve - optional check against stored records.
+ * @returns the unresolvable references; empty when all resolve.
+ */
+export function findUnresolvableEvidence(
+  evidence: readonly string[],
+  resolve?: (reference: string) => boolean,
+): string[] {
+  const unresolvable: string[] = []
+  for (const ref of evidence) {
+    if (ref.trim().length === 0) {
+      unresolvable.push(ref)
+    } else if (resolve !== undefined && !resolve(ref)) {
+      unresolvable.push(ref)
+    }
+  }
+  return unresolvable
 }
 
 /**
@@ -592,7 +702,13 @@ export async function handoffToDeepSeek(
 
     const sessionId = options.newSessionId?.()
       ?? SessionId(`sys1-handoff-${Date.now()}-${Math.random().toString(36).slice(2)}`)
-    const handoffText = renderHandoffText(parsed)
+    // The prompt carries the dispatch-time budget envelope: the reservation
+    // id minted above, and the ledger's overrun policy when it describes one.
+    const overrunPolicy = options.ledger.overrunPolicyDescription?.()
+    const handoffText = renderHandoffText(
+      parsed,
+      overrunPolicy === undefined ? { reservationId } : { reservationId, overrunPolicy },
+    )
     let handle: AgentHandle
     try {
       handle = await coordinator.ctx.agents.create({
@@ -746,6 +862,17 @@ export async function handoffToDeepSeek(
         return failed(
           'VERIFICATION_FAILED',
           `DeepSeek child result missing return-contract entries: ${missing.join(', ')}`,
+        )
+      }
+      // Evidence references must resolve against stored records: a child
+      // that invents references fails closed. Settlement already happened
+      // above — the child ran, so its spend is real — but an unresolvable
+      // reference can never back a success claim.
+      const unresolvable = findUnresolvableEvidence(result.evidence, options.resolveEvidence)
+      if (unresolvable.length > 0) {
+        return failed(
+          'VERIFICATION_FAILED',
+          `DeepSeek child returned unresolvable evidence references: ${unresolvable.join(', ')}`,
         )
       }
       return {

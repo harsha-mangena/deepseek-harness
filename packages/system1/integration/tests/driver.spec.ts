@@ -54,6 +54,7 @@ import type { CapabilityProfile } from '@deepseek-ai/dsh-system1-policy'
 import { fitIsotonic } from '@deepseek-ai/dsh-system1-calibration'
 import type { IsotonicCalibration } from '@deepseek-ai/dsh-system1-calibration'
 import type { CatalogTool } from '@deepseek-ai/dsh-system1-observations'
+import { system1Error } from '@deepseek-ai/dsh-system1-contracts'
 import type {
   DecisionProvider,
   NormalizedDecision,
@@ -839,6 +840,217 @@ describe('driver escalation handoff', () => {
         handoffBudget: { poolName: 'pool-main', units: 0 },
       }),
     ).toThrow(/positive/)
+  })
+
+  it('rejects invalid fallback bounds at construction', () => {
+    expect(() =>
+      makeDriver({
+        handoff: async () => ({ kind: 'completed', artifacts: [], evidence: [], actualUnits: 0 }),
+        handoffBudget: { poolName: 'pool-main', units: 10 },
+        fallback: { timeoutMs: 0, maxConsecutiveFailures: 3, maxSteps: 10 },
+      }),
+    ).toThrow(/fallback\.timeoutMs/)
+    expect(() =>
+      makeDriver({
+        handoff: async () => ({ kind: 'completed', artifacts: [], evidence: [], actualUnits: 0 }),
+        handoffBudget: { poolName: 'pool-main', units: 10 },
+        fallback: { timeoutMs: 1000, maxConsecutiveFailures: -1, maxSteps: 10 },
+      }),
+    ).toThrow(/fallback\.maxConsecutiveFailures/)
+  })
+})
+
+describe('driver DeepSeek fallback bounds (N05)', () => {
+  it('routes a low-confidence decision to the DeepSeek fallback and labels the terminal', async () => {
+    let calls = 0
+    const driver = makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('c1', 0.1),
+          decisionId: input.decisionId,
+        }),
+      },
+      handoff: async () => {
+        calls += 1
+        return { kind: 'completed', artifacts: ['a:1'], evidence: [], actualUnits: 5 }
+      },
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-fallback-lowconf', driver)
+    try {
+      expect(calls).toBe(1)
+      expect(setup.toolRan()).toBe(false)
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+      // Not System 1-verified: the fallback result carries no verification.
+      expect(recorded[0].verifiedBy).toBeUndefined()
+      const summary = terminalSummary(setup.session)
+      expect(summary).toContain('DeepSeek fallback')
+      // The fallback invocation is a durable session event, distinct
+      // from System 1 verification.
+      const fallbacks = eventData<{ outcome: string }>(setup.session, 'system1/fallback')
+      expect(fallbacks).toHaveLength(1)
+      expect(fallbacks[0].outcome).toBe('completed')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('routes a provider failure to the DeepSeek fallback with the failure reason', async () => {
+    let calls = 0
+    const seen: HandoffBundle[] = []
+    const driver = makeDriver({
+      provider: {
+        decide: async () => {
+          throw system1Error('PROVIDER_TIMEOUT', 'jev down', {})
+        },
+      },
+      handoff: async (_coordinator, bundle) => {
+        calls += 1
+        seen.push(bundle)
+        return { kind: 'completed', artifacts: [], evidence: [], actualUnits: 3 }
+      },
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-fallback-provider', driver)
+    try {
+      expect(calls).toBe(1)
+      expect(seen[0].failedChoices).toEqual([])
+      expect(seen[0].constraints.join(' ')).toContain('PROVIDER_TIMEOUT')
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('does not fall back when no handoff handler is configured', async () => {
+    const driver = makeDriver({
+      provider: {
+        decide: async () => {
+          throw system1Error('PROVIDER_TIMEOUT', 'jev down', {})
+        },
+      },
+    })
+    const setup = await runTurn('s-fallback-nohandler', driver)
+    try {
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('failure')
+      const fallbacks = eventData<unknown>(setup.session, 'system1/fallback')
+      expect(fallbacks).toHaveLength(0)
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('does not fall back on policy or admission security failures', async () => {
+    let calls = 0
+    const driver = makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('c1'),
+          decisionId: 'wrong-id',
+          questionFamily: input.questionFamily,
+          promptVersion: input.promptVersion,
+        }),
+      },
+      handoff: async () => {
+        calls += 1
+        return { kind: 'completed', artifacts: [], evidence: [], actualUnits: 0 }
+      },
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-fallback-correlation', driver)
+    try {
+      expect(calls).toBe(0)
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('failure')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('opens the circuit breaker after consecutive fallback failures and fails closed', async () => {
+    let calls = 0
+    const driver = makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('c1', 0.1),
+          decisionId: input.decisionId,
+        }),
+      },
+      handoff: async () => {
+        calls += 1
+        return { kind: 'failed', code: 'EXECUTION_FAILED', reason: 'fallback down' }
+      },
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+      fallback: { timeoutMs: 5000, maxConsecutiveFailures: 2, maxSteps: 5 },
+    })
+    // First two turns: the handler runs and fails.
+    for (const sessionId of ['s-breaker-1', 's-breaker-2']) {
+      const setup = await runTurn(sessionId, driver)
+      try {
+        const recorded = terminals(setup.session)
+        expect(recorded[0].outcome).toBe('escalated')
+      } finally {
+        await setup.dispose()
+      }
+    }
+    expect(calls).toBe(2)
+    // The breaker opens on the second consecutive failure: the third
+    // turn fails closed without invoking the handler.
+    const setup = await runTurn('s-breaker-3', driver)
+    try {
+      expect(calls).toBe(2)
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('failure')
+      expect(terminalSummary(setup.session)).toContain('circuit breaker open')
+      const breakerEvents = eventData<{ state: string }>(
+        setup.session,
+        'system1/fallback-breaker',
+      )
+      expect(breakerEvents.some((event) => event.state === 'open')).toBe(true)
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('abandons a fallback that exceeds its per-call timeout', async () => {
+    const driver = makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('c1', 0.1),
+          decisionId: input.decisionId,
+        }),
+      },
+      handoff: async (_coordinator, _bundle, signal) => {
+        // Hang until the driver aborts the signal.
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        return { kind: 'completed', artifacts: [], evidence: [], actualUnits: 0 }
+      },
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+      fallback: { timeoutMs: 50, maxConsecutiveFailures: 3, maxSteps: 5 },
+    })
+    const setup = await runTurn('s-fallback-timeout', driver)
+    try {
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].outcome).toBe('escalated')
+      expect(terminalSummary(setup.session)).toContain('timed out')
+      const fallbacks = eventData<{ outcome: string }>(setup.session, 'system1/fallback')
+      expect(fallbacks).toHaveLength(1)
+      expect(fallbacks[0].outcome).toBe('timeout')
+    } finally {
+      await setup.dispose()
+    }
   })
 })
 

@@ -272,6 +272,7 @@ export {
   MAX_HANDOFF_DEPTH,
   checkReturnContract,
   extractHandoffResult,
+  findUnresolvableEvidence,
   handoffToDeepSeek,
   parseChildResult,
   parseHandoffBundle,
@@ -286,6 +287,7 @@ export type {
   HandoffHandler,
   HandoffOptions,
   HandoffOutcome,
+  HandoffPromptEnvelope,
   HandoffReturnContract,
 } from './handoff.ts'
 export { spawnWorker } from './workers.ts'

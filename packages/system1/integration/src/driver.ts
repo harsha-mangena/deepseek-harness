@@ -22,7 +22,7 @@
  * @module @deepseek-ai/dsh-system1-integration/driver
  */
 
-import { system1Error } from '@deepseek-ai/dsh-system1-contracts'
+import { system1Error, System1Error } from '@deepseek-ai/dsh-system1-contracts'
 import type {
   Candidate,
   DecisionProvider,
@@ -67,6 +67,12 @@ import {
   resolveHandoffRefs,
   serializeArguments,
 } from './evidence.ts'
+import {
+  FallbackCircuitBreaker,
+  invokeFallbackWithTimeout,
+  resolveFallbackBounds,
+} from './fallback.ts'
+import type { FallbackBounds, System1FallbackBreakerData, System1FallbackData } from './fallback.ts'
 import type {
   EvidenceSpillStore,
   ResolvedToolCall,
@@ -93,14 +99,20 @@ export interface EscalationBundleInput {
   readonly requestId: ReturnType<typeof System1RequestId>
   /** Observations drained from the coordinator inbox this turn. */
   readonly observations: readonly Observation[]
-  /** The decision that led to escalation. */
-  readonly decision: NormalizedDecision
+  /**
+   * The decision that led to escalation, when one was made. Absent when
+   * the provider failed before deciding: the bundle then carries only the
+   * observations and the failure reason.
+   */
+  readonly decision?: NormalizedDecision
   /** Why the turn escalated. */
   readonly reason: string
   /** Budget for the handoff child. */
   readonly budget: { readonly poolName: string; readonly units: number }
   /** Tenant the escalation belongs to. */
   readonly tenantId: string
+  /** Maximum model steps for the fallback child, when bounded. */
+  readonly maxSteps?: number
 }
 
 /**
@@ -108,27 +120,38 @@ export interface EscalationBundleInput {
  * honest about what the turn established: escalation happens with no tool
  * dispatched, so there are no completed effects and no fresh evidence — the
  * drained observations become the objective and the rejected selection is
- * recorded as a failed choice.
+ * recorded as a failed choice. When no decision was made (provider
+ * failure), the failed-choices entry is omitted and the reason carries the
+ * failure.
  */
 export function buildEscalationBundle(input: EscalationBundleInput): HandoffBundle {
   const objective =
     input.observations.length > 0
       ? input.observations.map((observation) => observation.content).join('\n')
-      : `Escalated decision ${input.decision.decisionId}: ${input.reason}`
+      : input.decision !== undefined
+        ? `Escalated decision ${input.decision.decisionId}: ${input.reason}`
+        : `Escalated turn ${input.requestId}: ${input.reason}`
+  const constraints = [
+    `System 1 read-only escalation for tenant ${input.tenantId}`,
+    'No System 1 tool is dispatched after escalation',
+    `Escalation reason: ${input.reason}`,
+    ...(input.maxSteps === undefined
+      ? []
+      : [`The DeepSeek fallback child must not exceed ${input.maxSteps} model steps`]),
+  ]
   return {
     schemaVersion: 1,
     taskId: `${input.requestId}-escalation`,
     objective,
-    constraints: [
-      `System 1 read-only escalation for tenant ${input.tenantId}`,
-      'No System 1 tool is dispatched after escalation',
-      `Escalation reason: ${input.reason}`,
-    ],
+    constraints,
     acceptedFacts: [],
     resourceVersions: {},
     completedEffects: [],
     unknownEffects: [],
-    failedChoices: [{ choice: input.decision.selectedId, reason: input.reason }],
+    failedChoices:
+      input.decision === undefined
+        ? []
+        : [{ choice: input.decision.selectedId, reason: input.reason }],
     remainingBudget: { poolName: input.budget.poolName, units: input.budget.units },
     verifierRequirements: [],
     returnContract: { requiredArtifacts: [], requiredEvidence: [] },
@@ -242,11 +265,23 @@ export interface ProductionDriverConfig {
    * reconciliation hold, never released free.
    */
   readonly budget?: DriverBudgetConfig
+  /**
+   * Bounds for the DeepSeek fallback invoked at escalation (provider
+   * failure or low-confidence decision). The per-call timeout and the
+   * error-budget circuit breaker are enforced by the driver around the
+   * `handoff` handler; the per-run call budget is `handoffBudget`; the
+   * step cap is carried in the bundle constraints for the handoff
+   * implementation to enforce. Defaults apply when unset; only used when
+   * `handoff` is configured.
+   */
+  readonly fallback?: FallbackBounds
 }
 
 /** Production driver: one durable read-only turn per wake. */
 export class ReadOnlyProductionDriver implements CoordinatorDriver {
   private readonly config: ProductionDriverConfig
+  private readonly fallbackBounds: Required<FallbackBounds>
+  private readonly fallbackBreaker: FallbackCircuitBreaker
 
   /**
    * @param config - driver configuration.
@@ -293,6 +328,12 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     if (config.budget !== undefined) {
       validateBudgetConfig(config.budget)
     }
+    // resolveFallbackBounds throws on invalid bounds; the bounds only
+    // take effect when a handoff handler is configured.
+    this.fallbackBounds = resolveFallbackBounds(config.fallback)
+    this.fallbackBreaker = new FallbackCircuitBreaker(
+      this.fallbackBounds.maxConsecutiveFailures,
+    )
     this.config = config
   }
 
@@ -381,6 +422,22 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     try {
       result = await inner.run({ observations, catalog: this.config.catalog }, signal)
     } catch (error) {
+      // Provider failure or low-confidence rejection: the System 1
+      // pipeline cannot decide, so the turn escalates to the configured
+      // DeepSeek fallback instead of failing outright. All other errors
+      // (policy denials, admission security checks, budget exhaustion)
+      // fail closed.
+      if (this.shouldFallbackOnError(error)) {
+        await this.escalateFromFailure(
+          coordinator,
+          requestId,
+          observations,
+          decisionHolder.decision,
+          error,
+          signal,
+        )
+        return
+      }
       finalizeOnce({
         session,
         requestId,
@@ -752,6 +809,82 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
   }
 
   /**
+   * Decide whether a decision-pipeline error should escalate to the
+   * configured DeepSeek fallback. Only provider failures (the Jev
+   * decision provider is down) and low-confidence rejections (uncertainty)
+   * qualify — and only when a handoff handler is configured. Policy
+   * denials, admission security checks (correlation, model pinning, menu
+   * membership), and budget exhaustion fail closed.
+   * @param error - the error thrown by the coordinator run.
+   * @returns true when the turn should escalate to the DeepSeek fallback.
+   */
+  private shouldFallbackOnError(error: unknown): boolean {
+    if (this.config.handoff === undefined) return false
+    if (!(error instanceof System1Error)) return false
+    // Provider failure: the Jev decision provider threw.
+    if (error.code.startsWith('PROVIDER_')) return true
+    // Uncertainty: the decision was rejected for low calibrated
+    // confidence. Other admission rejections (correlation, model
+    // pinning, menu membership) are security checks and fail closed.
+    if (error.code === 'DECISION_NOT_ADMITTED') {
+      return error.details['reason'] === 'calibration: below confidence threshold'
+    }
+    return false
+  }
+
+  /**
+   * Escalate a turn whose decision pipeline failed (provider failure or
+   * low-confidence rejection) to the configured DeepSeek fallback. The
+   * captured decision, when the provider returned one before admission
+   * rejected it, is recorded as a failed choice; when the provider threw,
+   * the bundle carries only the observations and the failure reason.
+   * @param coordinator - the coordinator being driven.
+   * @param requestId - the workflow request for this turn.
+   * @param observations - the drained observations for the turn.
+   * @param decision - the provider decision, if one was returned.
+   * @param error - the pipeline error that triggered escalation.
+   * @param signal - aborts when the coordinator is cancelled or disposed.
+   */
+  private async escalateFromFailure(
+    coordinator: System1CoordinatorAgent,
+    requestId: ReturnType<typeof System1RequestId>,
+    observations: readonly Observation[],
+    decision: NormalizedDecision | undefined,
+    error: unknown,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const budget = this.config.handoffBudget
+    // shouldFallbackOnError guarantees a handler; the constructor
+    // guarantees a budget when the handler is set.
+    /* v8 ignore next -- defensive: escalateFromFailure is only called when shouldFallbackOnError passed */
+    if (budget === undefined) {
+      finalizeOnce({
+        session: coordinator.session,
+        requestId,
+        outcome: 'failure',
+        summary: `Turn failed: ${failureSummary(error)}`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+    const reason =
+      error instanceof System1Error
+        ? `System 1 decision pipeline failed (${error.code}): ${error.message}`
+        : `System 1 decision pipeline failed: ${failureSummary(error)}`
+    const bundle = buildEscalationBundle({
+      requestId,
+      observations,
+      ...(decision === undefined ? {} : { decision }),
+      reason,
+      budget,
+      tenantId: this.config.tenantId,
+      maxSteps: this.fallbackBounds.maxSteps,
+    })
+    await this.runFallback(coordinator, requestId, bundle, reason, signal)
+  }
+
+  /**
    * Handle an escalated turn. With no handoff handler configured this keeps
    * the fail-safe behavior: a durable `escalated` terminal with no transfer
    * of ownership. With a handler, the turn's observation/decision is built
@@ -780,32 +913,141 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
+    const reason =
+      result.decision.selectedId === 'escalate-none'
+        ? 'Coordinator selected escalate-none'
+        : 'Coordinator produced no executable outcome'
     const bundle = buildEscalationBundle({
       requestId,
       observations,
       decision: result.decision,
-      reason:
-        result.decision.selectedId === 'escalate-none'
-          ? 'Coordinator selected escalate-none'
-          : 'Coordinator produced no executable outcome',
+      reason,
       budget,
       tenantId: this.config.tenantId,
+      maxSteps: this.fallbackBounds.maxSteps,
     })
-    let outcome: HandoffOutcome
-    try {
-      outcome = await handler(coordinator, bundle, signal)
-    } catch (error) {
+    await this.runFallback(coordinator, requestId, bundle, reason, signal)
+  }
+
+  /**
+   * Run the configured DeepSeek fallback for an escalated turn under the
+   * fallback bounds: the error-budget circuit breaker, the per-call
+   * timeout, and the per-run handoff budget. Each invocation and every
+   * breaker transition is recorded as a session event; the terminal
+   * summary labels the result as a DeepSeek fallback, never as a System
+   * 1-verified success. A failing fallback or an open breaker fails the
+   * turn closed — never a silent success.
+   * @param coordinator - the coordinator being driven.
+   * @param requestId - the workflow request for this turn.
+   * @param bundle - the handoff bundle for the fallback child.
+   * @param reason - why the turn escalated.
+   * @param signal - aborts when the coordinator is cancelled or disposed.
+   */
+  private async runFallback(
+    coordinator: System1CoordinatorAgent,
+    requestId: ReturnType<typeof System1RequestId>,
+    bundle: HandoffBundle,
+    reason: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const session = coordinator.session
+    const handler = this.config.handoff
+    // escalate() and escalateFromFailure() guarantee a handler; be
+    // defensive so a future caller cannot invoke an absent fallback.
+    /* v8 ignore next -- defensive: callers check the handler first */
+    if (handler === undefined) {
       finalizeTerminal({
         session,
         requestId,
         outcome: 'escalated',
-        summary: `Escalation handoff threw: ${failureSummary(error)}; no tool dispatched`,
+        summary: 'Decision escalated; no tool dispatched',
         verifiedBy: [],
         verifications: [],
       })
       return
     }
+    const bounds = this.fallbackBounds
+    const requestIdString = requestId as unknown as string
+
+    if (this.fallbackBreaker.isOpen()) {
+      session.append('system1/fallback-breaker', {
+        schemaVersion: 1,
+        requestId: requestIdString,
+        state: 'open',
+        consecutiveFailures: this.fallbackBreaker.failures(),
+      } satisfies System1FallbackBreakerData)
+      finalizeOnce({
+        session,
+        requestId,
+        outcome: 'failure',
+        summary:
+          'DeepSeek fallback unavailable: circuit breaker open after ' +
+          `${this.fallbackBreaker.failures()} consecutive fallback failures; no tool dispatched`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+
+    const recordInvocation = (invocationOutcome: System1FallbackData['outcome']): void => {
+      session.append('system1/fallback', {
+        schemaVersion: 1,
+        requestId: requestIdString,
+        reason,
+        timeoutMs: bounds.timeoutMs,
+        maxSteps: bounds.maxSteps,
+        outcome: invocationOutcome,
+      } satisfies System1FallbackData)
+    }
+
+    let outcome: HandoffOutcome | 'timeout'
+    try {
+      outcome = await invokeFallbackWithTimeout<HandoffOutcome>(
+        (fallbackSignal) => handler(coordinator, bundle, fallbackSignal),
+        signal,
+        bounds.timeoutMs,
+      )
+    } catch (error) {
+      recordInvocation('threw')
+      this.recordFallbackFailure(session, requestIdString)
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'escalated',
+        summary: `DeepSeek fallback threw: ${failureSummary(error)}; no tool dispatched`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+
+    if (outcome === 'timeout') {
+      recordInvocation('timeout')
+      this.recordFallbackFailure(session, requestIdString)
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'escalated',
+        summary:
+          `DeepSeek fallback timed out after ${bounds.timeoutMs}ms; ` +
+          `no tool dispatched`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+
     if (outcome.kind === 'completed') {
+      recordInvocation('completed')
+      const reopened = this.fallbackBreaker.recordSuccess()
+      if (reopened) {
+        session.append('system1/fallback-breaker', {
+          schemaVersion: 1,
+          requestId: requestIdString,
+          state: 'closed',
+          consecutiveFailures: 0,
+        } satisfies System1FallbackBreakerData)
+      }
       // Handoff evidence references resolve against the bundle's return
       // contract before they are accepted: only well-formed,
       // contract-satisfying references are recorded as passing
@@ -828,10 +1070,10 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         outcome: 'escalated',
         summary:
           unresolved.length === 0
-            ? `Escalated to DeepSeek; child returned ${outcome.artifacts.length} ` +
+            ? `DeepSeek fallback completed; child returned ${outcome.artifacts.length} ` +
               `artifact(s) and ${outcome.evidence.length} evidence ref(s), ` +
               `settling ${outcome.actualUnits} units`
-            : `Escalated to DeepSeek with ${unresolved.length} unresolved evidence ref(s): ` +
+            : `DeepSeek fallback completed with ${unresolved.length} unresolved evidence ref(s): ` +
               `${unresolved.map((resolution) => resolution.reason ?? resolution.ref).join('; ')}; ` +
               `settling ${outcome.actualUnits} units`,
         verifiedBy: [],
@@ -839,14 +1081,35 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
+    this.recordFallbackFailure(session, requestIdString)
+    recordInvocation('failed')
     finalizeTerminal({
       session,
       requestId,
       outcome: 'escalated',
-      summary: `Escalation handoff failed (${outcome.code}): ${outcome.reason}; no tool dispatched`,
+      summary: `DeepSeek fallback failed (${outcome.code}): ${outcome.reason}; no tool dispatched`,
       verifiedBy: [],
       verifications: [],
     })
+  }
+
+  /**
+   * Record a fallback failure against the circuit breaker, opening it
+   * when the error budget is exhausted. The opening transition is logged
+   * as a `system1/fallback-breaker` session event.
+   * @param session - the coordinator session.
+   * @param requestId - the workflow request id as a string.
+   */
+  private recordFallbackFailure(session: Session, requestId: string): void {
+    const opened = this.fallbackBreaker.recordFailure()
+    if (opened) {
+      session.append('system1/fallback-breaker', {
+        schemaVersion: 1,
+        requestId,
+        state: 'open',
+        consecutiveFailures: this.fallbackBreaker.failures(),
+      } satisfies System1FallbackBreakerData)
+    }
   }
 
   /**

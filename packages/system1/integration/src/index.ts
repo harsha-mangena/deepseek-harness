@@ -22,6 +22,19 @@ export type {
   ProductionDriverConfig,
 } from './driver.ts'
 export {
+  DEFAULT_FALLBACK_MAX_CONSECUTIVE_FAILURES,
+  DEFAULT_FALLBACK_MAX_STEPS,
+  DEFAULT_FALLBACK_TIMEOUT_MS,
+  FallbackCircuitBreaker,
+  invokeFallbackWithTimeout,
+  resolveFallbackBounds,
+} from './fallback.ts'
+export type {
+  FallbackBounds,
+  System1FallbackBreakerData,
+  System1FallbackData,
+} from './fallback.ts'
+export {
   MAX_ARGS_SUMMARY_CHARS,
   MAX_EVIDENCE_CHARS,
   evidenceText,

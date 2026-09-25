@@ -37,6 +37,7 @@ import {
   System1RequestId,
   checkReturnContract,
   extractHandoffResult,
+  findUnresolvableEvidence,
   handoffToDeepSeek,
   parseHandoffBundle,
   renderHandoffText,
@@ -45,6 +46,7 @@ import {
   type HandoffBudgetLedger,
   type HandoffBundle,
   type HandoffOptions,
+  type HandoffPromptEnvelope,
   type System1CoordinatorAgent,
 } from '@deepseek-ai/dsh-system1-workflow'
 
@@ -1754,4 +1756,195 @@ describe('handoff budget edge cases', () => {
     expect(text).toContain('local model: too slow')
   })
 })
+})
+
+describe('handoff return obligations (N11)', () => {
+  it('renders pinned resource versions, budget envelope, verifier requirements, and the return contract', () => {
+    const envelope: HandoffPromptEnvelope = { reservationId: 'res-9', overrunPolicy: 'reject' }
+    const text = renderHandoffText(
+      validBundle({
+        resourceVersions: { 'report.pdf': 'version-47', 'tool-catalog': 'catalog-12' },
+        remainingBudget: { poolName: 'pool', units: 37 },
+        verifierRequirements: ['verify-freshness'],
+        returnContract: { requiredArtifacts: ['artifact:required'], requiredEvidence: ['evidence:required'] },
+      }),
+      envelope,
+    )
+    expect(text).toContain('Pinned resource versions')
+    expect(text).toContain('report.pdf: version-47')
+    expect(text).toContain('tool-catalog: catalog-12')
+    expect(text).toContain('Budget envelope')
+    expect(text).toContain('Pool: pool')
+    expect(text).toContain('Units reserved: 37')
+    expect(text).toContain('Reservation: res-9')
+    expect(text).toContain('Overrun policy: reject')
+    expect(text).toContain('Verifier requirements')
+    expect(text).toContain('verify-freshness')
+    expect(text).toContain('Return contract')
+    expect(text).toContain('artifact:required')
+    expect(text).toContain('evidence:required')
+    expect(text).toContain('usage report')
+  })
+
+  it('omits the reservation and overrun lines when the envelope does not carry them', () => {
+    const text = renderHandoffText(validBundle(), {})
+    expect(text).toContain('Budget envelope')
+    expect(text).not.toContain('Reservation:')
+    expect(text).not.toContain('Overrun policy:')
+  })
+
+  it('renders the reservation without an overrun policy', () => {
+    const text = renderHandoffText(validBundle(), { reservationId: 'res-9' })
+    expect(text).toContain('Reservation: res-9')
+    expect(text).not.toContain('Overrun policy:')
+  })
+
+  it('renders the overrun policy without a reservation id', () => {
+    const text = renderHandoffText(validBundle(), { overrunPolicy: 'hold' })
+    expect(text).toContain('Overrun policy: hold')
+    expect(text).not.toContain('Reservation:')
+  })
+
+  it('skips the pinned versions section when no versions are pinned', () => {
+    const text = renderHandoffText(validBundle({ resourceVersions: {} }))
+    expect(text).not.toContain('Pinned resource versions')
+  })
+
+  it('renders artifact-only and evidence-only return contracts', () => {
+    const artifactsOnly = renderHandoffText(
+      validBundle({ returnContract: { requiredArtifacts: ['a:1'], requiredEvidence: [] } }),
+    )
+    expect(artifactsOnly).toContain('Required artifacts')
+    expect(artifactsOnly).not.toContain('Required evidence')
+    const evidenceOnly = renderHandoffText(
+      validBundle({ returnContract: { requiredArtifacts: [], requiredEvidence: ['e:1'] } }),
+    )
+    expect(evidenceOnly).toContain('Required evidence')
+    expect(evidenceOnly).not.toContain('Required artifacts')
+  })
+
+  it('finds unresolvable evidence references', () => {
+    expect(findUnresolvableEvidence([])).toEqual([])
+    expect(findUnresolvableEvidence(['e:1', 'e:2'])).toEqual([])
+    expect(findUnresolvableEvidence(['e:1', '  '])).toEqual(['  '])
+    expect(findUnresolvableEvidence(['e:1', 'e:2'], () => true)).toEqual([])
+    expect(findUnresolvableEvidence(['e:1', 'e:fake'], (ref) => ref !== 'e:fake')).toEqual(['e:fake'])
+  })
+
+  it('fails closed when the child returns an unresolvable evidence reference', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: ['evidence:invented'], actualUnits: 10 },
+      usage: { inputTokens: 5, outputTokens: 5 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle({ returnContract: { requiredArtifacts: [], requiredEvidence: [] } }),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { resolveEvidence: (ref) => ref === 'evidence:real' }),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('VERIFICATION_FAILED')
+        expect(outcome.reason).toContain('evidence:invented')
+      }
+      // The child ran: spend settled from telemetry, never released free.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('fails closed on a blank evidence reference even without a resolver', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: ['   '], actualUnits: 10 },
+      usage: { inputTokens: 5, outputTokens: 5 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') expect(outcome.code).toBe('VERIFICATION_FAILED')
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('completes when every evidence reference resolves', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: ['evidence:real'], actualUnits: 10 },
+      usage: { inputTokens: 5, outputTokens: 5 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { resolveEvidence: (ref) => ref === 'evidence:real' }),
+      )
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: ['evidence:real'],
+        actualUnits: 10,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('treats corrupt recorded output token counts as unmetered', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 37 },
+      usage: { inputTokens: 20, outputTokens: -5 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      // Negative recorded output tokens fail closed to the conservative charge.
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 100,
+      })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main').consumed).toBe(100)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('seeds the child prompt with the reservation id and the ledger overrun policy', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 10 },
+      usage: { inputTokens: 5, outputTokens: 5 },
+    })
+    try {
+      const ledger: HandoffBudgetLedger = {
+        ...fixture.ledger,
+        overrunPolicyDescription: () => 'reject',
+      }
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(ledger),
+      )
+      expect(outcome.kind).toBe('completed')
+      const section = fixture.promptSections.find((s) => s.name === 'system1/handoff') as PromptSection
+      const text = typeof section.text === 'string' ? section.text : ''
+      expect(text).toContain(`Reservation: ${fixture.reservationIds[0]}`)
+      expect(text).toContain('Overrun policy: reject')
+    } finally {
+      await fixture.dispose()
+    }
+  })
 })
