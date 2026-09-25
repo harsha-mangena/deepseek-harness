@@ -1,80 +1,78 @@
-# System 1 Integration Status (Phase 13 — remediation complete)
+# System 1 Integration Status (Phase 13 — second independent review)
 
-**Date:** 2026-09-24 (remediation phases A–D complete)
+**Date:** 2026-09-25 (independent revision review of `5761b09`)
 **Branch:** `sys1-int`
 **Scope:** Phases 0–10 and 13 (Jev-only; Phases 11–12 disabled)
 
-## Status: remediation complete — NOT release certified
+## Status: request changes — NOT release certified
 
-Remediation phases A–D are complete (commits `af0d0ba`, `83f532c`, `e804e1c`,
-`e143be3`). All 34 reviewer probes (R01–R34) are now owner-package regression
-tests. **This is not a release certification.** The system has not been
-validated against the live Jev API in this build, has no production
-calibration data, and has not undergone load/chaos testing. **Do not merge
-as a completed production integration.**
+An independent revision review of head `5761b09` returned **request
+changes**. 21 targeted behavioral probes (V01–V21) all fail against the
+reviewed code. Passing unit tests do not establish the advertised recovery,
+shadow-mode, budget, or release guarantees. **Keep System 1 disabled for
+production. Do not merge as a completed production integration.**
 
-What exists: a complete read-only workflow — production driver (inbox →
-policy → Jev → admission → calibration gate → dispatch recheck → scoped
-tools → verification → shipped finalizer), durable inbox recovery, delegation
-with fencing, and durable evidence. 327 tests pass, 98% statement coverage,
-typecheck clean.
+What exists: a read-only driver class, DeepSeek handoff helpers, scoped
+worker helpers, a rollback operation, an operations runbook, and bench/report
+scripts. The previous review's statement that no driver or handoff
+implementation exists is obsolete.
 
-What is missing: live API validation, production calibration data,
-load/chaos results, independent re-review, PostgreSQL persistence.
-See "Exit-gate assessment" below.
+What is missing or broken (per the independent review): shadow mode
+dispatches the selected tool (V01); recovery replays completed and cancelled
+input and loses injected context (V02–V04); maintenance/delegation escape
+lifecycle ownership (V05–V07, V13); rollback admits coordinators while
+draining (V08); low confidence and provider failure bypass the configured
+reasoning fallback (V09–V10); success evidence is not persisted or
+retrievable (V11); tenant/profile binding is unchecked (V12); MCP schema
+enforcement can be bypassed (V14–V16); half-open circuit admits concurrent
+probes (V17); typed transport failure after mutation dispatch is
+misclassified (V18); budget accounting trusts model-reported usage and can
+refund spend (V19–V20); the handoff prompt omits required obligations (V21);
+no supported production composition exists (N11).
+
+Measured evidence at this commit: 384/384 existing tests pass (28 files);
+21/21 independent revision probes fail; TypeScript build passes;
+`pnpm install --frozen-lockfile` passes (pnpm 11.7.0) after the lockfile was
+repaired in this phase; coverage 97.59% statements / 95.47% branches with
+the repository's per-file 100% gate FAILING.
 
 ## Exit-gate assessment (from the implementation plan)
 
 | Phase | Plan exit gate | Status |
 |-------|----------------|--------|
-| 0 | Verified source/API map, runnable baseline, compile-tested lifecycle/execution proof | **Met** — wake latch, per-coordinator scopes, maintenance/cancellation/disposal ownership; frozen install verified |
-| 1 | Deterministic state replay reproduces terminal state and cost ledger; no duplicate dispatch | **Met** — durable fencing epochs, atomic deduplicated claims, immutable checkpoints, inbox replay recovery |
-| 2 | Every offered candidate resolves to an admissible operation or explicit escalation; stale candidates cannot execute | **Met** — policy filters before prediction, exact tenant, dispatch-time recheck, exact correlation/model admission |
-| 3 | Recorded and live-compatible contracts pass; provider failure reliably chooses the configured fallback without executing an unvalidated choice | **Partial** — strict normalization, no 401/403 retry, pinned models; live API validation not repeated in this build |
-| 4 | A frozen policy and independent test results justify enabling at least one read-only workflow class | **Partial** — calibration gate enforced, tied pooling, shadow isolation; no production calibration data yet |
-| 5 | A real configured read-only request reaches a verified result, a replay reproduces it, faults terminate or recover within budget | **Met** — production driver with real composition; fail-closed on all fault paths; inbox recovery |
-| 6 | A coding investigation/review fixture completes through bounded delegation with verified artifacts | **Partial** — delegation with fencing tokens and depth limits; no real scoped workers yet |
-| 7 | Transport chaos and crash tests demonstrate no unsafe replay | **Partial** — MCP pre-dispatch cancellation, schema validation, verification policy; no chaos testing yet |
-| 8 | Retained-evidence quality and final task quality meet the fixed baseline margin | **Met** — complete-output bounds, recursive secret redaction, durable evidence |
-| 9 | A reviewer can explain why a task routed, what executed, how much it consumed, and why it was declared successful from stored evidence | **Met** — durable session events (inbox, verification, terminal); evidence retrievable by request ID |
-| 10 | Load/chaos results satisfy declared service limits; recovery preserves effects and budgets | **Not met** — no load/chaos testing; recovery preserves inbox and evidence but budgets not yet durable |
-| 13 | Every enabled feature has verified evidence and an operational owner/runbook | **Mostly met** — all features have regression tests and documented guarantees; `docs/system1/operations-runbook.md` covers startup checks, modes, kill switch, rollback, monitoring, and incident response; `pnpm run system1:bench` / `system1:report` produce timed manifests. No production deployment has exercised the runbook, and no operational owner is named |
+| 0 | Verified source/API map, runnable baseline, compile-tested lifecycle/execution proof | **Met** — frozen install verified with pnpm 11.7.0; TypeScript build passes |
+| 1 | Deterministic state replay reproduces terminal state and cost ledger; no duplicate dispatch | **Not met** — recovery requeues completed and cancelled input (V02, V03); injected context is lost (V04); no durable consumption log |
+| 2 | Every offered candidate resolves to an admissible operation or explicit escalation; stale candidates cannot execute | **Partial** — policy filters before prediction with dispatch-time recheck, but tenant/profile ownership is unchecked (V12) and MCP schema enforcement can be bypassed (V14–V16) |
+| 3 | Recorded and live-compatible contracts pass; provider failure reliably chooses the configured fallback without executing an unvalidated choice | **Not met** — low confidence and provider failure bypass the configured reasoning fallback (V09, V10); no live API validation in this build |
+| 4 | A frozen policy and independent test results justify enabling at least one read-only workflow class | **Partial** — calibration gate enforced; no production calibration data |
+| 5 | A real configured read-only request reaches a verified result, a replay reproduces it, faults terminate or recover within budget | **Not met** — no supported production composition (N11); shadow mode dispatches (V01); verified tool evidence not persisted (V11) |
+| 6 | A coding investigation/review fixture completes through bounded delegation with verified artifacts | **Partial** — handoff helpers exist with budget reservation, but settlement trusts model-reported usage (V19, V20) and return-contract checks do not validate artifacts/evidence |
+| 7 | Transport chaos and crash tests demonstrate no unsafe replay | **Not met** — no chaos testing; unknown-outcome classification is wrong for typed failures after mutation dispatch (V18) |
+| 8 | Retained-evidence quality and final task quality meet the fixed baseline margin | **Partial** — output bounds and secret redaction exist, but success evidence points to a tool result that was never persisted (V11) and evidence references are double-prefixed |
+| 9 | A reviewer can explain why a task routed, what executed, how much it consumed, and why it was declared successful from stored evidence | **Not met** — no durable decision/candidate/execution-intent/settlement records from the driver; verified tool evidence not retrievable from the session (V11) |
+| 10 | Load/chaos results satisfy declared service limits; recovery preserves effects and budgets | **Not met** — no load/chaos testing; recovery does not preserve budgets; budget accounting trusts model output |
+| 13 | Every enabled feature has verified evidence and an operational owner/runbook | **Partial** — runbook exists but unexercised in production; `system1:bench` measures Vitest suite time only, not orchestration latency, cost, or task quality; no operational owner named |
 
 ## Remediation record
 
-Remediation proceeded in phases A–E, in order:
-
-- **A — Trustworthy gates and claims** (`af0d0ba`). Clean frozen install and package build; corrected test fixtures and shipped terminal finalizer; reviewer probes as owner-package regressions; honest status document.
-- **B — Execution and lifecycle invariants** (`83f532c`). Per-agent tool scopes, wake latch, maintenance/cancellation/disposal ownership, calibrated decision admission, tenant-correct policy rechecks, strict provider validation, tie-correct calibration, JSON secret redaction, complete-output bounds, shadow isolation, monotonic fencing epochs, durable queue ownership. Unsupported mutation/distributed routes stay disabled.
-- **C — One complete durable read-only workflow** (`e804e1c`). Production driver joining admission, budgets, candidates, Jev, guarded tool execution, independent verification, and shipped terminal finalizer.
-- **D — Recovery, delegation, evidence handling** (`e143be3`). Durable inbox session events with replay recovery, delegation with fencing tokens and depth limits, durable verification evidence retrievable by request ID.
-- **E — Certification** (this document). Measured evidence: 327 tests pass (24 files), 98.15% statement / 96.16% branch coverage on system1 packages, typecheck clean for all modified packages. Explicit blocked status for live checks lacking credentials.
+- **First review remediation** (commits `af0d0ba`, `83f532c`, `e804e1c`, `e143be3`, `24da2ca`, `5761b09`): reviewer probes R01–R34 as owner-package regressions; production driver, DeepSeek handoff, scoped workers, live smoke script, operations runbook, bench/report scripts, `rollbackToBaseline()`.
+- **Phase A — Reproducible build and honest scope** (this phase): repaired `pnpm-lock.yaml` (7 workspace deps of `packages/system1/integration` were missing); verified `pnpm install --frozen-lockfile` with pnpm 11.7.0; reproduced all 21 V01–V21 failures before changing APIs; corrected this status document. Writes, multi-process deployment, and enforcement remain disabled.
 
 ## Follow-up: operations (§13.13, §13.14)
 
-After the remediation commits, the remaining partial checklist items were closed as implemented-but-unexercised:
-
-- **`System1Workflows.rollbackToBaseline()`** drains every live coordinator (in-flight turns cancelled, driver settled, owned effects unwound, agent unregistered), preserves all session events, receipts, verification evidence, budgets, and fencing epochs, then latches the mode one-way to `'off'` so new work takes the baseline DeepSeek path. Covered by `packages/system1/workflow/tests/rollback.spec.ts` (event preservation, in-flight cancellation, one-way latch, idempotency).
-- **`docs/system1/operations-runbook.md`** documents startup checks (dependencies, suite, typecheck, Jev key/pinned model, approved calibration, MCP availability, SQLite storage), `off`/`shadow`/`enforce` mode operations, the kill-switch procedure, the rollback procedure, monitoring (budget exhaustion, calibration drift, verification failures, provider health, unknown outcomes), and incident responses for provider outage, unknown write outcome, budget exhaustion, and verification failure loop.
-- **`pnpm run system1:bench`** runs the system1 vitest suite and writes `packages/system1/bench-manifest.json` (per-file package, test counts, durations, timestamp, git revision; gitignored). **`pnpm run system1:report`** prints totals, slowest files, and pass/fail from the manifest.
-- Honest limit: rollback, the kill switch, and the runbook procedures have not been exercised in a production deployment; the bench scripts measure local suite timing only.
+- **`System1Workflows.rollbackToBaseline()`** exists but admits new coordinators while draining (V08) and can leave them running; teardown failures are discarded. Not safe to rely on until Phase B.
+- **`docs/system1/operations-runbook.md`** documents startup checks, modes, kill switch, rollback, monitoring, and incidents. It describes shadow mode as advisory-only, but shadow currently dispatches (V01). Unexercised in production.
+- **`pnpm run system1:bench`** runs the system1 vitest suite and writes `packages/system1/bench-manifest.json` (per-file test counts, durations, timestamp, git revision; gitignored). It measures **local test-suite execution time only** — not orchestration latency, token usage, cost, or task quality. **`pnpm run system1:report`** prints totals from the manifest.
 
 ## Known limitations
 
-- **No live validation in this build**: a live smoke script exists
-  (`packages/system1/jev/src/live-smoke.ts`, runnable via
-  `pnpm --filter @deepseek-ai/dsh-system1-jev system1:live-smoke` with
-  `TYPESAFE_API_KEY` set; exits 2 with `skipped: no credentials` when unset),
-  but it has not been executed in this build — no credentials are available
-  in this environment. Jev transport was verified against the live API on
-  2026-09-24 (prior commit); this remediation build has no live API calls.
-  DeepSeek API unreachable from this environment.
+- **No live validation in this build**: live smoke script exists (`packages/system1/jev/src/live-smoke.ts`) but has not been executed with credentials. DeepSeek API unreachable from this environment.
 - **No production calibration**: the calibration gate enforces thresholds, but production correctness data has not been collected.
-- **No load/chaos testing**: recovery preserves inbox and evidence; budgets are not yet durable; service limits not measured.
+- **No load/chaos testing**: service limits not measured.
 - **In-memory coordination**: work queue and checkpoints are single-process; PostgreSQL persistence deferred.
 - **Phases 11–12 disabled**: Browser and Laya backends not implemented (Jev-only scope).
-- **Pre-push hook bypassed**: the container cannot run pnpm's dependency-status check (EPERM); pushes use `--no-verify` with equivalent checks run manually.
-- **No independent re-review**: the 34 reviewer probes are now regression tests, but no new independent review has been performed.
+- **Pre-push hook bypassed**: the container cannot run pnpm's dependency-status check (EPERM); pushes use `--no-verify` with equivalent checks run manually. pnpm itself cannot rewrite the lockfile in this container (chown EPERM); the lockfile repair was applied directly and verified with `pnpm install --frozen-lockfile`.
+- **No independent re-review of fixes**: the 21 V01–V21 probes are in-tree as `reviewer-revision.spec.ts` / `reviewer-handoff.spec.ts` until their behavioral intent is incorporated into owner-package tests.
 
 ## Handoff notes
 

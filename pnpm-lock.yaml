@@ -12363,6 +12363,9 @@ importers:
 
   packages/system1/integration:
     dependencies:
+      '@deepseek-ai/dsh-llm':
+        specifier: workspace:*
+        version: link:../../llm/llm
       '@deepseek-ai/dsh-system1-calibration':
         specifier: workspace:*
         version: link:../calibration
@@ -12381,6 +12384,25 @@ importers:
       '@deepseek-ai/dsh-system1-policy':
         specifier: workspace:*
         version: link:../policy
+      '@deepseek-ai/dsh-system1-workflow':
+        specifier: workspace:*
+        version: link:../workflow
+      '@deepseek-ai/dsh-tools':
+        specifier: workspace:*
+        version: link:../../core/tools
+    devDependencies:
+      '@deepseek-ai/cordis':
+        specifier: workspace:~
+        version: link:../../../vendor/cordis
+      '@deepseek-ai/dsh-agent':
+        specifier: workspace:*
+        version: link:../../core/agent
+      '@deepseek-ai/dsh-session':
+        specifier: workspace:*
+        version: link:../../core/session
+      '@deepseek-ai/dsh-system-prompt':
+        specifier: workspace:*
+        version: link:../../core/system-prompt
 
   packages/system1/jev:
     dependencies:
