@@ -13,7 +13,7 @@
  * @module @deepseek-ai/dsh-system1-workflow/events
  */
 
-import type { System1RequestId } from './types.ts'
+import type { System1InputId, System1RequestId } from './types.ts'
 import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 
 /** Every System 1 event payload carries a schema version so replay can migrate. */
@@ -142,6 +142,8 @@ export interface System1ContextSelectionData extends System1EventBase {
 export interface System1InboxData {
   /** Payload schema version; currently always 1. */
   schemaVersion: 1
+  /** Stable identity of this input, assigned at enqueue. */
+  inputId: System1InputId
   /** Which pending list received the message. */
   target: 'next-turn' | 'next-step'
   /** The appended message, as a JSON snapshot. */
@@ -149,6 +151,45 @@ export interface System1InboxData {
   /** Epoch milliseconds when the append was recorded. */
   appendedAt: number
 }
+
+/**
+ * Inbox transition: a pending input left the queue, was replaced in
+ * place, or was linked to a workflow request. Recovery replays these to
+ * decide which enqueued inputs are still pending: only inputs with no
+ * later `claimed`/`discarded` transition are rebuilt. `replaced` and
+ * `associated` transitions never settle an input.
+ */
+export type System1InboxTransitionData = {
+  /** Payload schema version; currently always 1. */
+  schemaVersion: 1
+  /** The input this transition settles. */
+  inputId: System1InputId
+  /** Which pending list the input belonged to. */
+  target: 'next-turn' | 'next-step'
+  /** Epoch milliseconds when the transition was recorded. */
+  at: number
+} & (
+  | {
+    /** A turn took ownership of the input; recovery must not requeue it. */
+    transition: 'claimed'
+  }
+  | {
+    /** The input was dropped without being processed; recovery must not restore it. */
+    transition: 'discarded'
+  }
+  | {
+    /** The input was replaced in place; recovery rebuilds the replacement. */
+    transition: 'replaced'
+    /** The replacement message, as a JSON snapshot. */
+    message: UserMessage
+  }
+  | {
+    /** The input was linked to a workflow request before dispatch. */
+    transition: 'associated'
+    /** Workflow request the input was attached to. */
+    requestId: System1RequestId
+  }
+)
 
 /** Terminal: the workflow request reached a final outcome. */
 export type System1TerminalData = System1EventBase & (
@@ -200,6 +241,8 @@ declare module '@deepseek-ai/dsh-session/types' {
     'system1/terminal': System1TerminalData
     /** A message entered the coordinator's inbox queue. */
     'system1/inbox': System1InboxData
+    /** A pending inbox input was claimed, discarded, replaced, or linked to a request. */
+    'system1/inbox-transition': System1InboxTransitionData
   }
 }
 
@@ -217,6 +260,7 @@ export const SYSTEM1_EVENT_TYPES = [
   'system1/context-selection',
   'system1/terminal',
   'system1/inbox',
+  'system1/inbox-transition',
 ] as const
 
 /** One of the reserved System 1 session event types. */

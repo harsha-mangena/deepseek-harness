@@ -26,6 +26,7 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import * as WorkflowModule from '@deepseek-ai/dsh-system1-workflow'
 import {
   System1RequestId,
+  type HandoffBudgetLedger,
   type HandoffBundle,
   type HandoffHandler,
   type System1CoordinatorAgent,
@@ -33,8 +34,18 @@ import {
   type System1Workflows,
 } from '@deepseek-ai/dsh-system1-workflow'
 import {
+  CoordinationStore,
+  SequentialIdGenerator,
+  SystemClock,
+} from '@deepseek-ai/dsh-system1-coordination'
+import {
   ReadOnlyProductionDriver,
   buildEscalationBundle,
+  findStoredToolResult,
+  hashEvidenceContent,
+  loadStoredVerifications,
+  resolveCheckEvidence,
+  MAX_EVIDENCE_CHARS,
   type ProductionDriverConfig,
   type ToolVerificationContext,
 } from '@deepseek-ai/dsh-system1-integration'
@@ -201,6 +212,24 @@ interface TurnSetup {
   dispose: () => Promise<void>
 }
 
+/** Register the real scoped CI tool fixture on the coordinator. */
+function registerCiTool(
+  coordinator: System1CoordinatorAgent,
+  onExecute?: () => void,
+): void {
+  coordinator.ctx.tools.register(
+    defineContentToolFixture({
+      name: 'ci-status',
+      description: 'CI status reader',
+      parameters: {},
+      async execute() {
+        onExecute?.()
+        return [{ type: 'text', text: 'CI is green' }]
+      },
+    }),
+  )
+}
+
 /** Create a coordinator with a real scoped tool and run one driver turn. */
 async function runTurn(
   sessionId: string,
@@ -210,17 +239,9 @@ async function runTurn(
   const session = Session.create(SessionId(sessionId))
   const handle = await workflows.create(session, driver)
   let ran = false
-  handle.coordinator.ctx.tools.register(
-    defineContentToolFixture({
-      name: 'ci-status',
-      description: 'CI status reader',
-      parameters: {},
-      async execute() {
-        ran = true
-        return [{ type: 'text', text: 'CI is green' }]
-      },
-    }),
-  )
+  registerCiTool(handle.coordinator, () => {
+    ran = true
+  })
   handle.coordinator.followup(userMessage('Check CI status'))
   await handle.coordinator.whenIdle()
   return {
@@ -829,3 +850,410 @@ function terminalSummary(session: Session): string {
   const data = event?.data as { summary?: string } | undefined
   return data?.summary ?? ''
 }
+
+/** Payloads of every event of one type, in log order. */
+function eventData<T>(session: Session, type: string): T[] {
+  return session
+    .snapshotEvents()
+    .filter((event) => event.type === type)
+    .map((event) => event.data as T)
+}
+
+describe('ReadOnlyProductionDriver evidence (N06)', () => {
+  it('records pre-dispatch evidence and the real tool/result before verification', async () => {
+    const driver = makeDriver({})
+    const setup = await runTurn('s-evidence-predispatch', driver)
+    try {
+      expect(setup.toolRan()).toBe(true)
+
+      // Pre-dispatch: admission, decision identity, the approved
+      // operation/argument digest, the attempt, and execution intent.
+      const plans = eventData<{
+        decisionId: string
+        admission: string
+        candidateId: string
+        operationRef: string
+        argumentDigest: string
+        attempt: number
+      }>(setup.session, 'system1/dispatch-plan')
+      expect(plans).toHaveLength(1)
+      expect(plans[0]).toMatchObject({
+        admission: 'admit',
+        candidateId: 'c1',
+        operationRef: 'op:ci-runs:read:v1',
+        attempt: 1,
+      })
+      expect(typeof plans[0]?.decisionId).toBe('string')
+      expect(plans[0]?.argumentDigest).toBe(hashEvidenceContent([{ type: 'text', text: '{}' }]))
+
+      // The real tool result is persisted before verification (reviewer probe V11).
+      const calls = eventData<{ callId: string }>(setup.session, 'tool/call')
+      const results = eventData<{ message: { toolCallId: string } }>(
+        setup.session,
+        'tool/result',
+      )
+      expect(calls).toHaveLength(1)
+      expect(results).toHaveLength(1)
+      expect(results[0]?.message.toolCallId).toBe('call-test')
+
+      // Verification cites the bare receipt (no double prefix) and the
+      // binding names the verifier version and checked resource versions.
+      const verifications = eventData<{ evidence: string }>(
+        setup.session,
+        'system1/verification',
+      )
+      expect(verifications[0]?.evidence).toBe('tool-call:call-test')
+      const bindings = eventData<{
+        verifierVersion: string
+        resourceVersions: Record<string, string>
+      }>(setup.session, 'system1/evidence-binding')
+      expect(bindings).toHaveLength(1)
+      expect(bindings[0]?.verifierVersion).toBe('verify:ci:v1')
+      expect(Object.keys(bindings[0]?.resourceVersions ?? {})).toEqual([
+        'tool-call:call-test',
+      ])
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('resolves finalization evidence from a restarted session log', async () => {
+    const driver = makeDriver({})
+    const setup = await runTurn('s-evidence-restart', driver)
+    try {
+      expect(setup.toolRan()).toBe(true)
+      const requestId = System1RequestId('req-test')
+      const restarted = Session.create(
+        SessionId('s-evidence-restart'),
+        setup.session.snapshotEvents(),
+      )
+      // The finalizer's stored projection survives the restart.
+      const stored = loadStoredVerifications(restarted, requestId)
+      expect(stored).toHaveLength(1)
+      const storedResult = findStoredToolResult(restarted, ToolCallId('call-test'))
+      if (storedResult === undefined) throw new Error('expected a stored tool/result')
+      const check = stored[0]
+      if (check === undefined) throw new Error('expected a stored verification')
+      const resolution = resolveCheckEvidence(restarted, requestId, [
+        {
+          checkId: check.checkId,
+          expectedReceiptRef: 'tool-call:call-test',
+          expectedHash: hashEvidenceContent(storedResult.data.message.content),
+        },
+      ])
+      expect(resolution.ok).toBe(true)
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('finalizes a repeated request id exactly once', async () => {
+    const requestIds = ['req-a', 'req-b', 'req-a']
+    let next = 0
+    const driver = makeDriver({
+      newRequestId: () => System1RequestId(requestIds[next++] ?? 'req-fallback'),
+    })
+    const { ctx, workflows } = await boot()
+    try {
+      const session = Session.create(SessionId('s-evidence-idempotent'))
+      const handle = await workflows.create(session, driver)
+      try {
+        registerCiTool(handle.coordinator)
+        for (let turn = 0; turn < 3; turn++) {
+          handle.coordinator.followup(userMessage('Check CI status'))
+          await handle.coordinator.whenIdle()
+        }
+        const recorded = terminals(session)
+        expect(recorded).toHaveLength(2)
+        expect(recorded.every((terminal) => terminal.outcome === 'success')).toBe(true)
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('fails closed when the candidate has no verification policy', async () => {
+    const noPolicyCatalog: CatalogTool[] = [
+      {
+        toolId: 'ci-runs',
+        label: 'Read CI runs',
+        route: 'tool',
+        effect: 'read',
+        operationRef: 'op:ci-runs:read:v1',
+        preconditions: {},
+        verificationPolicyId: '',
+      },
+    ]
+    const driver = makeDriver({ catalog: noPolicyCatalog })
+    const setup = await runTurn('s-evidence-no-policy', driver)
+    try {
+      expect(setup.toolRan()).toBe(true)
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0]?.outcome).toBe('failure')
+      expect(terminalSummary(setup.session)).toContain('No verification policy')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('records unresolved handoff evidence as failed verification', async () => {
+    const driver = makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('escalate-none', null),
+          decisionId: input.decisionId,
+          probabilities: {},
+          selectedProbability: 0,
+        }),
+      },
+      handoff: async () => ({
+        kind: 'completed',
+        artifacts: [],
+        evidence: [''],
+        actualUnits: 3,
+      }),
+      handoffBudget: { poolName: 'pool-main', units: 100 },
+    })
+    const setup = await runTurn('s-evidence-handoff-unresolved', driver)
+    try {
+      const recorded = terminals(setup.session)
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0]?.outcome).toBe('escalated')
+      const verifications = eventData<{ checkId: string; passed: boolean }>(
+        setup.session,
+        'system1/verification',
+      )
+      expect(verifications).toHaveLength(1)
+      expect(verifications[0]).toMatchObject({ checkId: 'deepseek-handoff', passed: false })
+      expect(terminalSummary(setup.session)).toContain('unresolved')
+    } finally {
+      await setup.dispose()
+    }
+  })
+
+  it('spills an oversized tool result by reference and still finalizes success', async () => {
+    const driver = makeDriver({})
+    const { ctx, workflows } = await boot()
+    try {
+      // Best-effort spill store on the coordinator context; the driver
+      // reads it opportunistically, so a plain structural stub suffices.
+      ctx.provide('spillStore', {
+        saveText: (input: { content: string }) =>
+          Promise.resolve({ locator: 'spill://tenant-test/big', bytes: input.content.length }),
+      })
+      const session = Session.create(SessionId('s-evidence-spill'))
+      const handle = await workflows.create(session, driver)
+      try {
+        const bigText = `CI is green ${'x'.repeat(MAX_EVIDENCE_CHARS)}`
+        handle.coordinator.ctx.tools.register(
+          defineContentToolFixture({
+            name: 'ci-status',
+            description: 'CI status reader',
+            parameters: {},
+            async execute() {
+              return [{ type: 'text', text: bigText }]
+            },
+          }),
+        )
+        handle.coordinator.followup(userMessage('Check CI status'))
+        await handle.coordinator.whenIdle()
+        const recorded = terminals(session)
+        expect(recorded).toHaveLength(1)
+        expect(recorded[0]?.outcome).toBe('success')
+
+        // The binding records the spill reference with the driver tenant.
+        const bindings = eventData<{
+          verifierVersion: string
+          spill?: { locator: string; contentHash: string; tenantId: string; sessionId: string }
+        }>(session, 'system1/evidence-binding')
+        expect(bindings).toHaveLength(1)
+        expect(bindings[0]?.spill?.locator).toBe('spill://tenant-test/big')
+        expect(bindings[0]?.spill?.tenantId).toBe('tenant-test')
+        expect(bindings[0]?.spill?.sessionId).toBe('s-evidence-spill')
+        expect(bindings[0]?.spill?.contentHash).toBe(
+          hashEvidenceContent([{ type: 'text', text: bigText }]),
+        )
+
+        // The inline tool/result stays bounded: a pointer, not the result.
+        const stored = findStoredToolResult(session, ToolCallId('call-test'))
+        if (stored === undefined) throw new Error('expected a stored tool/result')
+        const inline = stored.data.message.content
+          .filter((block) => block.type === 'text')
+          .map((block) => (block as { text: string }).text)
+          .join('\n')
+        expect(inline.length).toBeLessThanOrEqual(MAX_EVIDENCE_CHARS)
+        expect(inline).toContain('spilled to spill://tenant-test/big')
+        expect(inline).not.toContain(bigText)
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('driver budget accounting', () => {
+  interface BudgetFixture {
+    store: CoordinationStore
+    ledger: HandoffBudgetLedger
+    /** Reservation task ids in reservation order. */
+    taskIds: string[]
+  }
+
+  function budgetFixture(): BudgetFixture {
+    const store = new CoordinationStore({
+      clock: new SystemClock(),
+      ids: new SequentialIdGenerator(),
+    })
+    store.createBudgetPool('tenant-test', 'pool-budget', 1000)
+    const taskIds: string[] = []
+    const ledger: HandoffBudgetLedger = {
+      reserve: (tenantId, poolName, taskId, units, deadlineAt) => {
+        taskIds.push(taskId)
+        return store.reserve(tenantId, poolName, taskId, units, deadlineAt)
+      },
+      settle: (reservationId, actualUnits) => {
+        store.settle(reservationId, actualUnits)
+      },
+      release: (reservationId, cancelled) => {
+        store.release(reservationId, cancelled)
+      },
+      holdForReconciliation: (reservationId, claimedUnits, reason) => {
+        store.holdForReconciliation(reservationId, claimedUnits, reason)
+      },
+    }
+    return { store, ledger, taskIds }
+  }
+
+  function meteredProvider(): DecisionProvider {
+    return {
+      decide: async (input) => ({
+        ...testDecision('c1'),
+        decisionId: input.decisionId,
+        usage: { inputTokens: 30, outputTokens: 20 },
+      }),
+    }
+  }
+
+  it('reserves before and settles the Jev decision from host-observed usage', async () => {
+    const { store, ledger, taskIds } = budgetFixture()
+    const driver = makeDriver({
+      provider: meteredProvider(),
+      budget: {
+        ledger,
+        poolName: 'pool-budget',
+        jevRequestUnits: 100,
+        toolCallUnits: 10,
+      },
+    })
+    const turn = await runTurn('s-budget-metered', driver)
+    try {
+      expect(turn.toolRan()).toBe(true)
+      // Jev usage settled from metered tokens (30 + 20); the tool call
+      // settled its full unit charge.
+      expect(store.getPoolUtilization('tenant-test', 'pool-budget')).toEqual({
+        capacity: 1000,
+        reserved: 0,
+        consumed: 60,
+      })
+      // Reservations link to stable per-operation ids, not the bare request id.
+      expect(taskIds).toHaveLength(2)
+      expect(taskIds[0]).toMatch(/^req-test:jev-decide:dec-/)
+      expect(taskIds[1]).toBe('call-test')
+    } finally {
+      await turn.dispose()
+    }
+  })
+
+  it('retains a reconciliation hold when the provider reports no usage', async () => {
+    const { store, ledger } = budgetFixture()
+    // The default test decision reports null token counts: usage is
+    // unknown, so the reservation must hold, never settle at 0.
+    const driver = makeDriver({
+      budget: {
+        ledger,
+        poolName: 'pool-budget',
+        jevRequestUnits: 100,
+        toolCallUnits: 10,
+      },
+    })
+    const turn = await runTurn('s-budget-unmetered', driver)
+    try {
+      expect(turn.toolRan()).toBe(true)
+      // The Jev reservation stays encumbered as a hold; only the tool
+      // call consumed.
+      expect(store.getPoolUtilization('tenant-test', 'pool-budget')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 10,
+      })
+      const held = store.getReservation('res-000001')
+      expect(held.status).toBe('held')
+    } finally {
+      await turn.dispose()
+    }
+  })
+
+  it('retains a hold when metered usage exceeds the reservation', async () => {
+    const { store, ledger } = budgetFixture()
+    const driver = makeDriver({
+      provider: {
+        decide: async (input) => ({
+          ...testDecision('c1'),
+          decisionId: input.decisionId,
+          // 90 + 80 = 170 units against a 100-unit reservation.
+          usage: { inputTokens: 90, outputTokens: 80 },
+        }),
+      },
+      budget: {
+        ledger,
+        poolName: 'pool-budget',
+        jevRequestUnits: 100,
+        toolCallUnits: 10,
+      },
+    })
+    const turn = await runTurn('s-budget-overrun', driver)
+    try {
+      expect(turn.toolRan()).toBe(true)
+      // Over-reservation usage is never absorbed silently: the Jev
+      // reservation holds while the tool call settles normally.
+      expect(store.getPoolUtilization('tenant-test', 'pool-budget')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 10,
+      })
+    } finally {
+      await turn.dispose()
+    }
+  })
+
+  it('retains a hold when the usage meter throws', async () => {    const { store, ledger } = budgetFixture()
+    const driver = makeDriver({
+      provider: meteredProvider(),
+      budget: {
+        ledger,
+        poolName: 'pool-budget',
+        jevRequestUnits: 100,
+        toolCallUnits: 10,
+        meterJevUsage: () => {
+          throw new Error('meter bug')
+        },
+      },
+    })
+    const turn = await runTurn('s-budget-meter-throws', driver)
+    try {
+      expect(turn.toolRan()).toBe(true)
+      expect(store.getPoolUtilization('tenant-test', 'pool-budget')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 10,
+      })
+    } finally {
+      await turn.dispose()
+    }
+  })
+})

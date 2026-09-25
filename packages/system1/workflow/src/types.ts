@@ -16,6 +16,17 @@ import type { System1CoordinatorAgent } from './coordinator-agent.ts'
  */
 export type System1RequestId = Branded<'System1RequestId'>
 
+/**
+ * Opaque identifier for one inbox input, assigned at enqueue time. Stable
+ * across coordinator restarts so session-log transitions (claim, discard,
+ * request association) can be matched to the enqueue they settle, and
+ * {@linkcode recover} can rebuild exactly the inputs that are still
+ * pending.
+ *
+ * Use {@linkcode System1InputId} from `./input-id.ts` to construct one.
+ */
+export type System1InputId = Branded<'System1InputId'>
+
 /** Operating posture of the System 1 integration. */
 export type System1Mode =
   /** Plugin loaded but refuses coordinator creation; the standard DeepSeek path is untouched. */

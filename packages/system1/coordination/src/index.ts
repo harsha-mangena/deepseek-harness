@@ -8,7 +8,7 @@
 export const COORDINATION_PACKAGE_VERSION = '0.1.7-alpha.2'
 
 export { CoordinationStore } from './store.ts'
-export type { Reservation, Lease, CoordinationStoreOptions } from './store.ts'
+export type { Reservation, Lease, CoordinationStoreOptions, SettleOptions } from './store.ts'
 export { SystemClock, ManualClock, RandomIdGenerator, SequentialIdGenerator } from './deterministic.ts'
 export type { Clock, IdGenerator } from './deterministic.ts'
 export { RecordedDecisionProvider } from './recorded-provider.ts'

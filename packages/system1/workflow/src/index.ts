@@ -220,6 +220,7 @@ export class System1Workflows extends Service {
 export default System1Workflows
 
 export { System1RequestId } from './request-id.ts'
+export { System1InputId, newSystem1InputId } from './input-id.ts'
 export {
   TerminalInvariantError,
   finalizeTerminal,
@@ -252,10 +253,18 @@ export type {
   System1ContextSelectionData,
   System1TerminalData,
   System1InboxData,
+  System1InboxTransitionData,
   System1EventType,
 } from './events.ts'
 export { SYSTEM1_EVENT_TYPES } from './events.ts'
 export { System1Inbox } from './inbox.ts'
+export type {
+  ClaimedInboxInput,
+  InboxEntry,
+  InboxJournalEvent,
+  InboxRemovalDisposition,
+  System1InboxTarget,
+} from './inbox.ts'
 export { System1CoordinatorAgent } from './coordinator-agent.ts'
 export type { CoordinatorDriver } from './coordinator-agent.ts'
 export {
@@ -281,6 +290,7 @@ export type {
 } from './handoff.ts'
 export { spawnWorker } from './workers.ts'
 export type {
+  WorkerLimits,
   WorkerOptions,
   WorkerOutcome,
   WorkerSpec,

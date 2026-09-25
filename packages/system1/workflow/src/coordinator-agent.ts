@@ -31,7 +31,17 @@ import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import { System1Inbox } from './inbox.ts'
-import type { System1InboxData, System1VerificationData } from './events.ts'
+import type {
+  ClaimedInboxInput,
+  InboxJournalEvent,
+  System1InboxTarget,
+} from './inbox.ts'
+import type {
+  System1InboxData,
+  System1InboxTransitionData,
+  System1VerificationData,
+} from './events.ts'
+import { System1InputId } from './input-id.ts'
 import type { LeaseAuthority, System1RequestId } from './types.ts'
 
 /** Default cancellation cause when the caller names none. */
@@ -80,6 +90,12 @@ export class System1CoordinatorAgent implements Agent {
   #driver: CoordinatorDriver
   #dispatch: AgentEventDispatch
   #aborter: AbortController | undefined
+  /**
+   * Whether a driver turn currently owns the lifecycle. Inbox removals
+   * made while this is set are journaled as `claimed` (the turn took the
+   * input); removals outside a turn are journaled as `discarded`.
+   */
+  #driverTurnActive = false
   #maintenanceAborter: AbortController | undefined
   /**
    * The active maintenance task, when one owns the lifecycle. Wakes queue
@@ -115,7 +131,12 @@ export class System1CoordinatorAgent implements Agent {
     this.ctx = this.#scope.ctx
     this.id = session.id
     this.session = session
-    this.inbox = new System1Inbox()
+    // The inbox journals every mutation through the coordinator so each
+    // enqueue, removal, and replacement lands in the session log as a
+    // `system1/inbox` or `system1/inbox-transition` event. Recovery
+    // replays that log to rebuild exactly the inputs that are still
+    // pending.
+    this.inbox = new System1Inbox((event) => this.#journalInboxEvent(event))
     this.#driver = driver
     this.#dispatch = agentEvents(ctx, this)
   }
@@ -163,88 +184,224 @@ export class System1CoordinatorAgent implements Agent {
   }
 
   /**
+   * Persist one inbox mutation to the session log. Enqueues become
+   * `system1/inbox` events carrying the input's stable id; removals
+   * become `system1/inbox-transition` events labelled `claimed` when a
+   * driver turn owns the lifecycle (the turn took the input) and
+   * `discarded` otherwise (cancellation or an explicit clear dropped
+   * it). Replacements are recorded so replay rebuilds the replacement.
+   */
+  #journalInboxEvent(event: InboxJournalEvent): void {
+    const at = Date.now()
+    switch (event.kind) {
+      case 'enqueued':
+        this.session.append('system1/inbox', {
+          schemaVersion: 1,
+          inputId: event.entry.inputId,
+          target: event.target,
+          message: event.entry.message,
+          appendedAt: at,
+        } satisfies System1InboxData)
+        return
+      case 'replaced':
+        this.session.append('system1/inbox-transition', {
+          schemaVersion: 1,
+          inputId: event.entry.inputId,
+          target: event.target,
+          transition: 'replaced',
+          message: event.entry.message,
+          at,
+        } satisfies System1InboxTransitionData)
+        return
+      case 'removed': {
+        if (event.entries.length === 0) return
+        const transition: 'claimed' | 'discarded' =
+          event.disposition === 'claimed' ||
+          (event.disposition === 'auto' && this.#driverTurnActive)
+            ? 'claimed'
+            : 'discarded'
+        for (const entry of event.entries) {
+          this.session.append('system1/inbox-transition', {
+            schemaVersion: 1,
+            inputId: entry.inputId,
+            target: event.target,
+            transition,
+            at,
+          } satisfies System1InboxTransitionData)
+        }
+      }
+    }
+  }
+
+  /**
    * Route input to an inbox boundary and optionally wake the driver.
-   * The append is also written to the durable session log as a
-   * `system1/inbox` event, so a restarted coordinator can rebuild its
-   * pending work via {@link recover}.
+   * The enqueue is written to the durable session log as a
+   * `system1/inbox` event carrying the input's stable id, so a restarted
+   * coordinator can rebuild its pending work via {@link recover}.
    * @param message - the incoming message.
    * @param target - the next-turn or next-step inbox boundary.
    * @param wakeup - whether delivery may wake the driver.
+   * @returns the stable id assigned to the input at enqueue.
    * @throws when the coordinator is disposed.
    */
-  send(message: UserMessage, target: InboxTarget, wakeup: boolean): void {
+  send(message: UserMessage, target: InboxTarget, wakeup: boolean): System1InputId {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
-    this.inbox.append(target, message)
-    this.session.append('system1/inbox', {
-      schemaVersion: 1,
-      target,
-      message,
-      appendedAt: Date.now(),
-    } satisfies System1InboxData)
+    const entry = this.inbox.enqueue(target, message)
     if (wakeup) this.wake()
+    return entry.inputId
   }
 
   /**
-   * Queue an ordinary follow-up turn and wake the driver. The append is
+   * Queue an ordinary follow-up turn and wake the driver. The enqueue is
    * durable (see {@link send}).
    * @param message - the follow-up message.
+   * @returns the stable id assigned to the input at enqueue.
    * @throws when the coordinator is disposed.
    */
-  followup(message: UserMessage): void {
+  followup(message: UserMessage): System1InputId {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
-    this.inbox.append('next-turn', message)
-    this.session.append('system1/inbox', {
-      schemaVersion: 1,
-      target: 'next-turn',
-      message,
-      appendedAt: Date.now(),
-    } satisfies System1InboxData)
+    const entry = this.inbox.enqueue('next-turn', message)
     this.wake()
+    return entry.inputId
   }
 
   /**
-   * Submit steering for the nearest step and wake the driver. The append
+   * Submit steering for the nearest step and wake the driver. The enqueue
    * is durable (see {@link send}).
    * @param message - the steering message.
+   * @returns the stable id assigned to the input at enqueue.
    * @throws when the coordinator is disposed.
    */
-  steer(message: UserMessage): void {
+  steer(message: UserMessage): System1InputId {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
-    this.inbox.append('next-step', message)
-    this.session.append('system1/inbox', {
-      schemaVersion: 1,
-      target: 'next-step',
-      message,
-      appendedAt: Date.now(),
-    } satisfies System1InboxData)
+    const entry = this.inbox.enqueue('next-step', message)
     this.wake()
+    return entry.inputId
   }
 
   /**
-   * Queue model-facing context for the next step without waking the driver.
+   * Queue model-facing context for the next step without waking the
+   * driver. The enqueue goes through the same durable mechanism as
+   * {@link send}, so injected context survives recovery.
    * @param message - the context message.
+   * @returns the stable id assigned to the input at enqueue.
    * @throws when the coordinator is disposed.
    */
-  inject(message: UserMessage): void {
+  inject(message: UserMessage): System1InputId {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
-    this.inbox.append('next-step', message)
+    return this.inbox.enqueue('next-step', message).inputId
   }
 
   /**
-   * Rebuild the in-memory inbox by replaying durable `system1/inbox`
-   * events from the session log. Clears the current inbox first, so it
-   * is safe to call on a fresh coordinator sharing the session after a
-   * restart. Messages replay in log order per boundary.
+   * Rebuild the in-memory inbox by replaying the durable session log.
+   * Only inputs that are still pending are rebuilt: an input with a
+   * later `claimed` or `discarded` transition — a completed request, a
+   * drained turn, or cancelled work — is never requeued. Replacements
+   * are applied, and legacy `system1/inbox` events that predate stable
+   * input ids replay under a position-derived identity. Clears the
+   * current inbox first without journaling, so it is safe to call on a
+   * fresh coordinator sharing the session after a restart. Messages
+   * replay in log order per boundary.
    * @throws when the coordinator is disposed.
    */
   recover(): void {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
-    this.inbox.clear()
-    for (const event of this.session.snapshotEvents()) {
+    const settled = new Set<string>()
+    const replacements = new Map<string, UserMessage>()
+    const enqueues: Array<{ index: number; target: System1InboxTarget; inputId: System1InputId; message: UserMessage }> = []
+    const events = this.session.snapshotEvents()
+    events.forEach((event, index) => {
       if (event.type === 'system1/inbox') {
-        this.inbox.append(event.data.target, event.data.message)
+        // Logs written before stable input ids carry no inputId; derive a
+        // position-stable identity so they still replay as pending.
+        const inputId =
+          event.data.inputId ?? System1InputId(`legacy-inbox-input-${index}`)
+        enqueues.push({ index, target: event.data.target, inputId, message: event.data.message })
+      } else if (event.type === 'system1/inbox-transition') {
+        if (event.data.transition === 'claimed' || event.data.transition === 'discarded') {
+          settled.add(event.data.inputId)
+        } else if (event.data.transition === 'replaced') {
+          replacements.set(event.data.inputId, event.data.message)
+        }
+      }
+    })
+    this.inbox.resetForReplay()
+    for (const enqueue of enqueues) {
+      if (settled.has(enqueue.inputId)) continue
+      this.inbox.restorePending(
+        enqueue.target,
+        enqueue.inputId,
+        replacements.get(enqueue.inputId) ?? enqueue.message,
+      )
+    }
+  }
+
+  /**
+   * Claim every pending input for the current turn, next-step before
+   * next-turn. Claimed inputs leave the pending lists and are journaled
+   * as `claimed` transitions, so a later {@link recover} never requeues
+   * them. This is the durable drain primitive: claim first, persist
+   * request/attempt identities (see {@link associateInboxInput}), then
+   * dispatch.
+   * @returns the claimed inputs with their stable identities, in drain order.
+   * @throws when the coordinator is disposed.
+   */
+  claimInboxInput(): ClaimedInboxInput[] {
+    if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
+    return this.inbox.claimAll()
+  }
+
+  /**
+   * Link one inbox input to a workflow request. The association is
+   * journaled as a `system1/inbox-transition` event, so request/attempt
+   * identities are persisted before dispatch and the coordination
+   * store's consume-once checks can reattach attempts after a restart.
+   * @param inputId - stable id of the enqueued input.
+   * @param requestId - workflow request the input is attached to.
+   * @throws when the coordinator is disposed or the input id is unknown.
+   */
+  associateInboxInput(inputId: System1InputId, requestId: System1RequestId): void {
+    if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
+    let target: System1InboxTarget | undefined
+    for (const event of this.session.snapshotEvents()) {
+      if (event.type === 'system1/inbox' && event.data.inputId === inputId) {
+        target = event.data.target
+        break
       }
     }
+    if (target === undefined) {
+      throw new Error(
+        `System1CoordinatorAgent(${this.id}) cannot associate unknown inbox input ${inputId}`,
+      )
+    }
+    this.session.append('system1/inbox-transition', {
+      schemaVersion: 1,
+      inputId,
+      target,
+      transition: 'associated',
+      requestId,
+      at: Date.now(),
+    } satisfies System1InboxTransitionData)
+  }
+
+  /**
+   * The workflow request an inbox input was associated with, if any.
+   * @param inputId - stable id of the enqueued input.
+   * @returns the associated request id, or `undefined` when the input was
+   * never associated.
+   */
+  associatedRequest(inputId: System1InputId): System1RequestId | undefined {
+    let found: System1RequestId | undefined
+    for (const event of this.session.snapshotEvents()) {
+      if (
+        event.type === 'system1/inbox-transition' &&
+        event.data.inputId === inputId &&
+        event.data.transition === 'associated'
+      ) {
+        found = event.data.requestId
+      }
+    }
+    return found
   }
 
   /**
@@ -328,7 +485,9 @@ export class System1CoordinatorAgent implements Agent {
 
   /**
    * Clear queued work — unless `keepInbox` — and abort the active turn,
-   * any maintenance task, and all delegated work.
+   * any maintenance task, and all delegated work. Cleared work is
+   * journaled as `discarded`, so recovery preserves the cancellation
+   * instead of resurrecting it.
    * @param cause - why the turn is cancelled.
    * @param options - cancellation options; `keepInbox` preserves pending work.
    */
@@ -338,7 +497,7 @@ export class System1CoordinatorAgent implements Agent {
     this.#aborter?.abort()
     this.#maintenanceAborter?.abort()
     for (const aborter of this.#delegatedAborters) aborter.abort()
-    if (!options?.keepInbox) this.inbox.clear()
+    if (!options?.keepInbox) this.inbox.clear('discarded')
   }
 
   /**
@@ -468,6 +627,10 @@ export class System1CoordinatorAgent implements Agent {
     const causal = this.#causalInitiator
     this.#causalInitiator = undefined
     const initiator = causal instanceof System1CoordinatorAgent ? this : (causal ?? this)
+    // While the driver runs, inbox removals are the turn claiming its
+    // input, so the journal labels them `claimed`; outside a turn the
+    // same removals are `discarded`.
+    this.#driverTurnActive = true
     const run = (async (): Promise<void> => {
       try {
         await this.ctx.agents.withInitiator(initiator, () => this.#driver.run(this, aborter.signal))
@@ -476,6 +639,7 @@ export class System1CoordinatorAgent implements Agent {
           this.#lastError = error
         }
       } finally {
+        this.#driverTurnActive = false
         // A new turn cannot start while #currentRun is set, so #aborter is
         // still ours here; clear it unconditionally.
         this.#aborter = undefined

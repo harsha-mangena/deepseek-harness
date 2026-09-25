@@ -21,7 +21,7 @@ import {
 } from '@deepseek-ai/dsh-agent'
 import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-llm/types'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { Session, SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type { PromptSection } from '@deepseek-ai/dsh-system-prompt'
@@ -58,10 +58,21 @@ interface ChildScript {
   rawFinalMessage?: string
   /** Throw when the child is driven. */
   throwOnDrive?: boolean
+  /** Reject when the driven child is awaited for idleness. */
+  throwOnIdle?: boolean
   /** Abort this controller when the child is driven. */
   abortOnDrive?: AbortController
   /** Throw when the child handle is disposed. */
   failOnDispose?: boolean
+  /** Milliseconds the driven child stays busy before going idle. */
+  driveDelayMs?: number
+  /**
+   * Host-observed provider usage the fake records on its final assistant
+   * message — the telemetry the real provider adapter would log. When
+   * absent, the child's run is unmetered (settlement falls back to the
+   * conservative full-reservation charge).
+   */
+  usage?: { inputTokens: number; outputTokens: number }
 }
 
 class FakeChildAgent implements Agent {
@@ -86,6 +97,21 @@ class FakeChildAgent implements Agent {
   }
 
   whenIdle(): Promise<void> {
+    const delayMs = this.script.driveDelayMs ?? 0
+    if (delayMs > 0) {
+      return new Promise((resolve, reject) =>
+        setTimeout(
+          () =>
+            this.script.throwOnIdle === true
+              ? reject(new Error('scripted child idle failure'))
+              : resolve(),
+          delayMs,
+        ),
+      )
+    }
+    if (this.script.throwOnIdle === true) {
+      return Promise.reject(new Error('scripted child idle failure'))
+    }
     return Promise.resolve()
   }
 
@@ -118,7 +144,14 @@ class FakeChildAgent implements Agent {
       })
       this.session.append(
         'assistant/message',
-        { turn: 0, step: 0, message: assistant, stream: [] },
+        {
+          turn: 0,
+          step: 0,
+          message: assistant,
+          stream: [],
+          // Host-observed telemetry, like the real provider adapter logs.
+          ...(this.script.usage !== undefined ? { usage: this.script.usage } : {}),
+        },
         { surfaceOp: 'append' },
       )
     }
@@ -193,6 +226,10 @@ interface Fixture {
   store: CoordinationStore
   ledger: HandoffBudgetLedger
   ledgerCalls: { reserve: number; settle: number; release: number }
+  /** Reconciliation holds requested through the ledger. */
+  readonly holdCalls: number
+  /** Reservation ids in reserve order. */
+  readonly reservationIds: readonly string[]
   factoryState: FactoryState
   promptSections: PromptSection[]
   dispose: () => Promise<void>
@@ -211,10 +248,14 @@ async function setup(script: ChildScript = {}, withFactory = true): Promise<Fixt
   })
   store.createBudgetPool('tenant-1', 'pool-main', 1000)
   const ledgerCalls = { reserve: 0, settle: 0, release: 0 }
+  let holdCalls = 0
+  const reservationIds: string[] = []
   const ledger: HandoffBudgetLedger = {
     reserve: (tenantId, poolName, taskId, units) => {
       ledgerCalls.reserve += 1
-      return store.reserve(tenantId, poolName, taskId, units)
+      const reservation = store.reserve(tenantId, poolName, taskId, units)
+      reservationIds.push(reservation.reservationId)
+      return reservation
     },
     settle: (reservationId, actualUnits) => {
       ledgerCalls.settle += 1
@@ -223,6 +264,10 @@ async function setup(script: ChildScript = {}, withFactory = true): Promise<Fixt
     release: (reservationId, cancelled) => {
       ledgerCalls.release += 1
       store.release(reservationId, cancelled)
+    },
+    holdForReconciliation: (reservationId, claimedUnits, reason) => {
+      holdCalls += 1
+      store.holdForReconciliation(reservationId, claimedUnits, reason)
     },
   }
 
@@ -255,6 +300,10 @@ async function setup(script: ChildScript = {}, withFactory = true): Promise<Fixt
     store,
     ledger,
     ledgerCalls,
+    get holdCalls() {
+      return holdCalls
+    },
+    reservationIds,
     factoryState,
     promptSections,
     dispose: async () => {
@@ -419,8 +468,11 @@ describe('child result extraction', () => {
 
 describe('handoffToDeepSeek', () => {
   it('creates a real child with lineage metadata and settles measured usage', async () => {
+    // The child reports 37 units but host-observed telemetry measures
+    // 30 + 20 = 50: settlement must follow the telemetry, never the report.
     const fixture = await setup({
       result: { artifacts: ['artifact:report'], evidence: ['evidence:q3'], actualUnits: 37 },
+      usage: { inputTokens: 30, outputTokens: 20 },
     })
     try {
       const outcome = await handoffToDeepSeek(
@@ -438,7 +490,7 @@ describe('handoffToDeepSeek', () => {
         kind: 'completed',
         artifacts: ['artifact:report'],
         evidence: ['evidence:q3'],
-        actualUnits: 37,
+        actualUnits: 50,
       })
 
       // Child creation used the coordinator's registry with explicit lineage.
@@ -463,12 +515,13 @@ describe('handoffToDeepSeek', () => {
         .filter((event) => event.type === 'user/message')
       expect(childMessages).toHaveLength(1)
 
-      // Budget: reserved once, settled against measured usage, never released.
+      // Budget: reserved once, settled against host-observed usage (50, not
+      // the child's reported 37), never released.
       expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
       expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
         capacity: 1000,
         reserved: 0,
-        consumed: 37,
+        consumed: 50,
       })
 
       // The transfer is durable on the parent side.
@@ -480,6 +533,36 @@ describe('handoffToDeepSeek', () => {
 
       // The owned child handle is always disposed.
       expect(fixture.factoryState.disposed).toBe(1)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('settles zero measured usage as a completed run', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 0 },
+      usage: { inputTokens: 0, outputTokens: 0 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      // Zero is valid measured usage: the run completes and settles 0.
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 0,
+      })
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 0,
+        consumed: 0,
+      })
     } finally {
       await fixture.dispose()
     }
@@ -636,7 +719,7 @@ describe('handoffToDeepSeek', () => {
     }
   })
 
-  it('propagates cancellation raised while the child is running', async () => {
+  it('propagates cancellation raised while the child is running and retains the hold', async () => {
     const controller = new AbortController()
     const fixture = await setup({
       result: { artifacts: ['a:1'], evidence: [], actualUnits: 10 },
@@ -655,14 +738,22 @@ describe('handoffToDeepSeek', () => {
       }
       const call = fixture.factoryState.calls[0] as FactoryCall
       expect(call.agent.cancelCount).toBe(1)
-      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
+      // The child ran, so spend is uncertain: the hold is retained for
+      // reconciliation, never released free.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 0,
+      })
       expect(fixture.factoryState.disposed).toBe(1)
     } finally {
       await fixture.dispose()
     }
   })
 
-  it('releases the hold when the child drive fails', async () => {
+  it('retains a reconciliation hold when the child drive fails', async () => {
     const fixture = await setup({ throwOnDrive: true })
     try {
       const outcome = await handoffToDeepSeek(
@@ -675,13 +766,19 @@ describe('handoffToDeepSeek', () => {
       if (outcome.kind === 'failed') {
         expect(outcome.code).toBe('EXECUTION_FAILED')
         expect(outcome.reason).toMatch(/scripted child drive failure/)
+        expect(outcome.reason).toMatch(/held for reconciliation/)
       }
-      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
+      // The drive started, so spend is uncertain: hold, never release free.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
       expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
         capacity: 1000,
-        reserved: 0,
+        reserved: 100,
         consumed: 0,
       })
+      const reservation = fixture.store.getReservation(fixture.reservationIds[0] as string)
+      expect(reservation.status).toBe('held')
+      expect(reservation.holdReason).toMatch(/scripted child drive failure/)
       expect(fixture.factoryState.disposed).toBe(1)
     } finally {
       await fixture.dispose()
@@ -722,7 +819,7 @@ describe('handoffToDeepSeek', () => {
     }
   })
 
-  it('releases the hold when budget settlement fails', async () => {
+  it('retains a reconciliation hold when budget settlement fails', async () => {
     const fixture = await setup({
       result: { artifacts: [], evidence: [], actualUnits: 7 },
     })
@@ -730,8 +827,8 @@ describe('handoffToDeepSeek', () => {
       const ledger = fixture.ledger
       const originalSettle = ledger.settle
       ledger.settle = (...args: Parameters<HandoffBudgetLedger['settle']>) => {
-        // Count the attempt, then fail: the hold must release instead of
-        // settling.
+        // Count the attempt, then fail: the child ran, so the hold must be
+        // retained for reconciliation instead of settling or releasing.
         fixture.ledgerCalls.settle += 1
         throw new Error('scripted settle failure')
       }
@@ -746,9 +843,16 @@ describe('handoffToDeepSeek', () => {
         if (outcome.kind === 'failed') {
           expect(outcome.code).toBe('EXECUTION_FAILED')
           expect(outcome.reason).toMatch(/scripted settle failure/)
+          expect(outcome.reason).toMatch(/held for reconciliation/)
         }
-        // Settle threw, so the hold was released instead of settling.
-        expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 1 })
+        // Settle threw after the child ran: hold, never release free.
+        expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+        expect(fixture.holdCalls).toBe(1)
+        expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+          capacity: 1000,
+          reserved: 100,
+          consumed: 0,
+        })
         expect(fixture.factoryState.disposed).toBe(1)
       } finally {
         ledger.settle = originalSettle
@@ -758,7 +862,7 @@ describe('handoffToDeepSeek', () => {
     }
   })
 
-  it('maps a drive failure under abort to TASK_CANCELLED', async () => {
+  it('maps a drive failure under abort to TASK_CANCELLED and retains the hold', async () => {
     const controller = new AbortController()
     const fixture = await setup({ throwOnDrive: true, abortOnDrive: controller })
     try {
@@ -772,8 +876,9 @@ describe('handoffToDeepSeek', () => {
       if (outcome.kind === 'failed') {
         expect(outcome.code).toBe('TASK_CANCELLED')
       }
-      // The abort arrived mid-drive: the hold releases as cancelled.
-      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
+      // The abort arrived mid-drive: the hold is retained, not released.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
       expect(fixture.factoryState.disposed).toBe(1)
     } finally {
       await fixture.dispose()
@@ -781,7 +886,9 @@ describe('handoffToDeepSeek', () => {
   })
 
   it('reports when the budget hold release itself fails', async () => {
-    const fixture = await setup({ throwOnDrive: true })
+    // No factory: child creation fails before the drive, so the hold
+    // releases — and the release itself is scripted to fail.
+    const fixture = await setup({}, false)
     try {
       const ledger = fixture.ledger
       const originalRelease = ledger.release
@@ -802,7 +909,6 @@ describe('handoffToDeepSeek', () => {
           expect(outcome.reason).toMatch(/scripted release failure/)
         }
         expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
-        expect(fixture.factoryState.disposed).toBe(1)
       } finally {
         ledger.release = originalRelease
       }
@@ -812,7 +918,7 @@ describe('handoffToDeepSeek', () => {
   })
 
   it('describes a non-Error release failure', async () => {
-    const fixture = await setup({ throwOnDrive: true })
+    const fixture = await setup({}, false)
     try {
       const ledger = fixture.ledger
       const originalRelease = ledger.release
@@ -844,6 +950,7 @@ describe('handoffToDeepSeek', () => {
   it('keeps the outcome when child disposal fails', async () => {
     const fixture = await setup({
       result: { artifacts: [], evidence: [], actualUnits: 3 },
+      usage: { inputTokens: 2, outputTokens: 1 },
       failOnDispose: true,
     })
     try {
@@ -894,7 +1001,7 @@ describe('handoffToDeepSeek', () => {
     }
   })
 
-  it('rejects a non-JSON final message and releases the hold', async () => {
+  it('conservatively charges the full reservation on a non-JSON final message', async () => {
     const fixture = await setup({ rawFinalMessage: 'not json at all' })
     try {
       const outcome = await handoffToDeepSeek(
@@ -906,15 +1013,23 @@ describe('handoffToDeepSeek', () => {
       expect(outcome.kind).toBe('failed')
       if (outcome.kind === 'failed') {
         expect(outcome.code).toBe('VERIFICATION_FAILED')
+        expect(outcome.reason).toMatch(/conservatively/)
       }
-      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
+      // The child ran but produced no usable result: the full reservation
+      // settles instead of releasing free.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 0,
+        consumed: 100,
+      })
       expect(fixture.factoryState.disposed).toBe(1)
     } finally {
       await fixture.dispose()
     }
   })
 
-  it('rejects a child result with no assistant message', async () => {
+  it('conservatively charges the full reservation when the child produced no result', async () => {
     const fixture = await setup({})
     try {
       const outcome = await handoffToDeepSeek(
@@ -928,15 +1043,515 @@ describe('handoffToDeepSeek', () => {
         expect(outcome.code).toBe('VERIFICATION_FAILED')
         expect(outcome.reason).toMatch(/no valid result/)
       }
-      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 0,
+        consumed: 100,
+      })
     } finally {
       await fixture.dispose()
     }
   })
 
+describe('untrusted child usage reports', () => {
+  it('retains a hold when the child reports negative usage', async () => {
+    const fixture = await setup({
+      result: { artifacts: [], evidence: [], actualUnits: -50 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('VERIFICATION_FAILED')
+        expect(outcome.reason).toMatch(/invalid usage/)
+      }
+      // The fraudulent report settles nothing and releases nothing.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 0,
+      })
+      const reservation = fixture.store.getReservation(fixture.reservationIds[0] as string)
+      expect(reservation.status).toBe('held')
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('retains a hold when the child reports fractional usage', async () => {
+    const fixture = await setup({
+      result: { artifacts: [], evidence: [], actualUnits: 2.5 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('VERIFICATION_FAILED')
+      }
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('retains a hold when the child reports usage above the reservation', async () => {
+    const fixture = await setup({
+      result: { artifacts: [], evidence: [], actualUnits: 10_000 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('VERIFICATION_FAILED')
+        expect(outcome.reason).toMatch(/exceeds/)
+      }
+      // An over-reservation report is never absorbed silently.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main').consumed).toBe(0)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('keeps the reservation active when the ledger hold itself throws', async () => {
+    const fixture = await setup({ throwOnDrive: true })
+    try {
+      const ledger = fixture.ledger
+      const originalHold = ledger.holdForReconciliation
+      ledger.holdForReconciliation = () => {
+        throw new Error('scripted hold failure')
+      }
+      try {
+        const outcome = await handoffToDeepSeek(
+          fixture.coordinator,
+          validBundle(),
+          new AbortController().signal,
+          handoffOptions(fixture.ledger),
+        )
+        expect(outcome.kind).toBe('failed')
+        if (outcome.kind === 'failed') {
+          expect(outcome.code).toBe('EXECUTION_FAILED')
+        }
+        // The explicit hold failed, but the reservation stays active as an
+        // implicit hold: still encumbered, never released free.
+        expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+          capacity: 1000,
+          reserved: 100,
+          consumed: 0,
+        })
+        const reservation = fixture.store.getReservation(fixture.reservationIds[0] as string)
+        expect(reservation.status).toBe('active')
+      } finally {
+        ledger.holdForReconciliation = originalHold
+      }
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('retains a hold when conservative settlement also fails', async () => {
+    const fixture = await setup({ rawFinalMessage: 'not json at all' })
+    try {
+      const ledger = fixture.ledger
+      const originalSettle = ledger.settle
+      ledger.settle = (...args: Parameters<HandoffBudgetLedger['settle']>) => {
+        fixture.ledgerCalls.settle += 1
+        throw new Error('scripted conservative settle failure')
+      }
+      try {
+        const outcome = await handoffToDeepSeek(
+          fixture.coordinator,
+          validBundle(),
+          new AbortController().signal,
+          handoffOptions(fixture.ledger),
+        )
+        expect(outcome.kind).toBe('failed')
+        if (outcome.kind === 'failed') {
+          expect(outcome.code).toBe('VERIFICATION_FAILED')
+          expect(outcome.reason).toMatch(/conservative settlement also failed/)
+          expect(outcome.reason).toMatch(/held for reconciliation/)
+        }
+        // The child ran: the failed conservative charge retains the hold,
+        // never releases started work free.
+        expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+        expect(fixture.holdCalls).toBe(1)
+        expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+          capacity: 1000,
+          reserved: 100,
+          consumed: 0,
+        })
+        const reservation = fixture.store.getReservation(fixture.reservationIds[0] as string)
+        expect(reservation.status).toBe('held')
+      } finally {
+        ledger.settle = originalSettle
+      }
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
+describe('handoff child limits', () => {
+  it('rejects an invalid maxTokens before reserving', async () => {
+    for (const maxTokens of [0, -3, 1.5]) {
+      const fixture = await setup({
+        result: { artifacts: [], evidence: [], actualUnits: 1 },
+      })
+      try {
+        const outcome = await handoffToDeepSeek(
+          fixture.coordinator,
+          validBundle(),
+          new AbortController().signal,
+          handoffOptions(fixture.ledger, { childLimits: { maxTokens } }),
+        )
+        expect(outcome.kind).toBe('failed')
+        if (outcome.kind === 'failed') {
+          expect(outcome.code).toBe('INVALID_CONFIG')
+          expect(outcome.reason).toMatch(/maxTokens/)
+        }
+        expect(fixture.factoryState.calls).toHaveLength(0)
+        expect(fixture.ledgerCalls.reserve).toBe(0)
+      } finally {
+        await fixture.dispose()
+      }
+    }
+  })
+
+  it('rejects a non-finite deadline before reserving', async () => {
+    const fixture = await setup({
+      result: { artifacts: [], evidence: [], actualUnits: 1 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { deadlineAt: Number.NaN } }),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('INVALID_CONFIG')
+        expect(outcome.reason).toMatch(/deadlineAt/)
+      }
+      expect(fixture.factoryState.calls).toHaveLength(0)
+      expect(fixture.ledgerCalls.reserve).toBe(0)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('passes the token cap and deadline to the child', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 5 },
+      usage: { inputTokens: 3, outputTokens: 2 },
+    })
+    try {
+      const deadlineAt = Date.now() + 60_000
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { maxTokens: 500, deadlineAt } }),
+      )
+      expect(outcome.kind).toBe('completed')
+      expect(fixture.factoryState.calls).toHaveLength(1)
+      const call = fixture.factoryState.calls[0] as FactoryCall
+      // The token cap is enforced by the provider adapter through the
+      // child's agent options, not by the prompt.
+      expect(call.options.agentOptions).toMatchObject({ maxTokens: 500 })
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('treats empty limits as no limits', async () => {
+    const fixture = await setup({
+      result: { artifacts: [], evidence: [], actualUnits: 5 },
+      usage: { inputTokens: 3, outputTokens: 2 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: {} }),
+      )
+      expect(outcome.kind).toBe('completed')
+      const call = fixture.factoryState.calls[0] as FactoryCall
+      expect(call.options.agentOptions).toBeUndefined()
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('cancels the child when the deadline already passed, releasing the hold', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 10 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { deadlineAt: Date.now() - 1000 } }),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('TASK_CANCELLED')
+        expect(outcome.reason).toMatch(/deadline passed/)
+      }
+      // The child never started: no spend exists, so the hold releases.
+      const call = fixture.factoryState.calls[0] as FactoryCall
+      expect(call.agent.cancelCount).toBe(1)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 1 })
+      expect(fixture.holdCalls).toBe(0)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('cancels the child when the deadline fires mid-drive and retains the hold', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 10 },
+      driveDelayMs: 150,
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { deadlineAt: Date.now() + 30 } }),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('TASK_CANCELLED')
+        expect(outcome.reason).toMatch(/deadline exceeded/)
+      }
+      const call = fixture.factoryState.calls[0] as FactoryCall
+      expect(call.agent.cancelCount).toBe(1)
+      // The child ran past its deadline: spend is uncertain, so hold.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 0,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
+describe('handoff step limits', () => {
+  it('rejects a non-positive step limit before touching the registry', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 0 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { maxSteps: 0 } }),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('INVALID_CONFIG')
+        expect(outcome.reason).toContain('maxSteps')
+      }
+      expect(fixture.factoryState.calls).toHaveLength(0)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 0, settle: 0, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('rejects a fractional step limit before touching the registry', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 0 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { maxSteps: 2.5 } }),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('INVALID_CONFIG')
+        expect(outcome.reason).toContain('maxSteps')
+      }
+      expect(fixture.factoryState.calls).toHaveLength(0)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 0, settle: 0, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  /** Wait for the handoff to create its child. */
+  async function awaitChild(fixture: Fixture): Promise<FactoryCall> {
+    for (let i = 0; i < 200; i++) {
+      const call = fixture.factoryState.calls[0] as FactoryCall | undefined
+      if (call !== undefined) return call
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    throw new Error('timed out waiting for the handoff child')
+  }
+
+  /** Report one model step through the child's scope, like the loop would. */
+  function emitStep(call: FactoryCall, step: number): void {
+    call.agent.ctx.emit('session/event', call.agent.session, {
+      type: 'step/start',
+      seq: SessionSeq(step),
+      time: Date.now(),
+      data: { turn: 1, step },
+    })
+  }
+
+  it('cancels the child and retains the hold when steps exceed the bound', async () => {
+    const fixture = await setup({ driveDelayMs: 120 })
+    try {
+      const outcomePromise = handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { maxSteps: 2 } }),
+      )
+      const call = await awaitChild(fixture)
+      // Two steps are allowed; the third trips the watcher.
+      emitStep(call, 1)
+      emitStep(call, 2)
+      expect(call.agent.cancelCount).toBe(0)
+      emitStep(call, 3)
+      expect(call.agent.cancelCount).toBe(1)
+      // A further step does not re-trip the watcher, and non-step events
+      // are ignored.
+      emitStep(call, 4)
+      call.agent.ctx.emit('session/event', call.agent.session, {
+        type: 'turn/end',
+        seq: SessionSeq(5),
+        time: Date.now(),
+        data: { turn: 1, reason: { kind: 'completed' } },
+      })
+      expect(call.agent.cancelCount).toBe(1)
+
+      const outcome = await outcomePromise
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('TASK_CANCELLED')
+        expect(outcome.reason).toMatch(/step limit/)
+      }
+      // The child was stopped mid-run: spend is uncertain, so hold.
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 0,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('attributes a drive failure to the step limit when the bound tripped first', async () => {
+    const fixture = await setup({ driveDelayMs: 120, throwOnIdle: true })
+    try {
+      const outcomePromise = handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { maxSteps: 2 } }),
+      )
+      const call = await awaitChild(fixture)
+      emitStep(call, 1)
+      emitStep(call, 2)
+      emitStep(call, 3)
+      // The watcher already cancelled the child; the idle failure below
+      // must still report the step limit and retain the hold.
+      expect(call.agent.cancelCount).toBe(1)
+
+      const outcome = await outcomePromise
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('TASK_CANCELLED')
+        expect(outcome.reason).toMatch(/step limit/)
+      }
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 0,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('lets the child finish when steps stay within the bound', async () => {    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 6 },
+      usage: { inputTokens: 4, outputTokens: 2 },
+      driveDelayMs: 60,
+    })
+    try {
+      const outcomePromise = handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { childLimits: { maxSteps: 3 } }),
+      )
+      const call = await awaitChild(fixture)
+      emitStep(call, 1)
+      emitStep(call, 2)
+      const outcome = await outcomePromise
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 6,
+      })
+      expect(call.agent.cancelCount).toBe(0)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 0,
+        consumed: 6,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+})
+
+describe('handoff budget edge cases', () => {
   it('settles measured usage but fails the return contract on missing entries', async () => {
     const fixture = await setup({
       result: { artifacts: ['artifact:other'], evidence: [], actualUnits: 22 },
+      usage: { inputTokens: 15, outputTokens: 7 },
     })
     try {
       const outcome = await handoffToDeepSeek(
@@ -963,6 +1578,148 @@ describe('handoffToDeepSeek', () => {
         consumed: 22,
       })
       expect(fixture.factoryState.disposed).toBe(1)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('conservatively charges the full reservation when the child is unmetered', async () => {
+    // The child reports 37 units but recorded no provider telemetry: the
+    // report is untrusted and usage is unknown, so success settles the
+    // full reservation instead of the reported figure.
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 37 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 100,
+      })
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 0,
+        consumed: 100,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('retains a hold when measured usage exceeds the reservation', async () => {
+    // Host-observed usage (130) overruns the 100-unit reservation: the
+    // store's explicit overrun policy rejects the settlement, and the
+    // hold is retained for reconciliation instead of releasing free.
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 90 },
+      usage: { inputTokens: 90, outputTokens: 40 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('EXECUTION_FAILED')
+        expect(outcome.reason).toMatch(/held for reconciliation/)
+      }
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+      expect(fixture.holdCalls).toBe(1)
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main')).toEqual({
+        capacity: 1000,
+        reserved: 100,
+        consumed: 0,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('ignores a throwing usage meter and charges conservatively', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 37 },
+      usage: { inputTokens: 30, outputTokens: 20 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, {
+          measureChildUsage: () => {
+            throw new Error('scripted meter failure')
+          },
+        }),
+      )
+      // A throwing meter means usage is unknown: conservative full charge.
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 100,
+      })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main').consumed).toBe(100)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('ignores a negative usage meter result and charges conservatively', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 37 },
+      usage: { inputTokens: 30, outputTokens: 20 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger, { measureChildUsage: () => -12 }),
+      )
+      // A negative meter result is corrupt telemetry: conservative charge.
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 100,
+      })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main').consumed).toBe(100)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('treats corrupt recorded token counts as unmetered', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 37 },
+      usage: { inputTokens: -5, outputTokens: 20 },
+    })
+    try {
+      const outcome = await handoffToDeepSeek(
+        fixture.coordinator,
+        validBundle(),
+        new AbortController().signal,
+        handoffOptions(fixture.ledger),
+      )
+      // Negative recorded tokens fail closed to the conservative charge.
+      expect(outcome).toEqual({
+        kind: 'completed',
+        artifacts: ['a:1'],
+        evidence: [],
+        actualUnits: 100,
+      })
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-main').consumed).toBe(100)
     } finally {
       await fixture.dispose()
     }
@@ -996,4 +1753,5 @@ describe('handoffToDeepSeek', () => {
     expect(text).toContain('Rejected choices (do not retry without new evidence):')
     expect(text).toContain('local model: too slow')
   })
+})
 })

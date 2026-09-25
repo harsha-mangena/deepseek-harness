@@ -15,8 +15,9 @@
  *   capabilities, and unknown capability names fail loudly at setup.
  *
  * Workers share the parent's budget pool and cancellation signal, so a
- * cancelled parent always cancels its workers and their unspent holds are
- * released.
+ * cancelled parent always cancels its workers. Holds for work that never
+ * started release; holds for work that may have started are retained for
+ * reconciliation, never released free.
  *
  * @module @deepseek-ai/dsh-system1-workflow/workers
  */
@@ -33,6 +34,7 @@ import {
   handoffToDeepSeek,
   type HandoffBudgetLedger,
   type HandoffBundle,
+  type HandoffChildLimits,
   type HandoffOutcome,
   type HandoffReturnContract,
 } from './handoff.ts'
@@ -54,6 +56,31 @@ export interface WorkerSpec {
   readonly budgetUnits: number
   /** What the worker's result must contain. */
   readonly returnContract: HandoffReturnContract
+  /** Enforceable limits for the worker child. */
+  readonly limits?: WorkerLimits
+}
+
+/**
+ * Enforceable limits for a worker child. Every limit here is actually
+ * enforced: the token cap travels in the child's agent options (the
+ * provider adapter enforces it), the deadline cancels the child and is
+ * recorded on the budget reservation, and the step bound cancels the child
+ * through its own cancel path when its session exceeds the bound.
+ */
+export interface WorkerLimits {
+  /**
+   * Per-request output token cap. Must be a positive integer.
+   */
+  readonly maxTokens?: number
+  /**
+   * Wall-clock deadline for the worker run, in milliseconds from now.
+   * Must be a positive finite duration.
+   */
+  readonly deadlineMs?: number
+  /**
+   * Maximum model steps the worker child may run. Must be a positive integer.
+   */
+  readonly maxSteps?: number
 }
 
 /** Explicit capabilities a worker needs; nothing is inferred. */
@@ -117,6 +144,12 @@ export async function spawnWorker(
 ): Promise<WorkerOutcome> {
   const parentDepth = options.parentDepth ?? 0
 
+  // Worker limits are enforceable bounds, validated before delegation: a
+  // bad limit fails closed without touching the ledger or the registry.
+  const limitsResult = workerChildLimits(spec.limits)
+  if (limitsResult.kind === 'failed') return limitsResult.outcome
+  const childLimits = limitsResult.limits
+
   // The existing delegation machinery owns depth tracking and the budget
   // pre-check; a refusal here never touches the budget ledger or the agent
   // registry.
@@ -156,6 +189,11 @@ export async function spawnWorker(
     parentDepth,
     // exactOptionalPropertyTypes: an absent generator must stay absent.
     ...(options.newSessionId !== undefined ? { newSessionId: options.newSessionId } : {}),
+    // Worker limits become enforceable child limits: the token cap reaches
+    // the child's agent options, the deadline cancels the child and is
+    // recorded on the budget reservation, and the step bound watches the
+    // child's session and cancels it past the bound.
+    ...(childLimits !== undefined ? { childLimits } : {}),
     setupExtras: (agentCtx) => {
       // The worker sandbox: restrict the child's scoped tools to exactly the
       // spec's capabilities. Runs inside the child's unpublished setup scope.
@@ -181,6 +219,71 @@ export async function spawnWorker(
 function restrictWorkerTools(agentCtx: Context, capabilities: readonly string[]): void {
   const filter: ToolRestriction = { allow: [...capabilities] }
   agentCtx.tools.restrict(filter)
+}
+
+/**
+ * Validate worker limits and map them to enforceable child limits.
+ * @param limits - the spec's limits, if any.
+ * @returns the child limits, or a fail-closed worker outcome.
+ */
+function workerChildLimits(limits: WorkerLimits | undefined):
+  | { readonly kind: 'ok'; readonly limits: HandoffChildLimits | undefined }
+  | { readonly kind: 'failed'; readonly outcome: WorkerOutcome } {
+  if (limits === undefined) return { kind: 'ok', limits: undefined }
+  let maxTokens: number | undefined
+  let deadlineAt: number | undefined
+  let maxSteps: number | undefined
+  if (limits.maxTokens !== undefined) {
+    if (!Number.isInteger(limits.maxTokens) || limits.maxTokens <= 0) {
+      return {
+        kind: 'failed',
+        outcome: {
+          kind: 'failed',
+          code: 'INVALID_CONFIG',
+          reason: `Worker maxTokens must be a positive integer, got ${limits.maxTokens}`,
+        },
+      }
+    }
+    maxTokens = limits.maxTokens
+  }
+  if (limits.deadlineMs !== undefined) {
+    if (!Number.isFinite(limits.deadlineMs) || limits.deadlineMs <= 0) {
+      return {
+        kind: 'failed',
+        outcome: {
+          kind: 'failed',
+          code: 'INVALID_CONFIG',
+          reason: `Worker deadlineMs must be a positive finite duration, got ${limits.deadlineMs}`,
+        },
+      }
+    }
+    deadlineAt = Date.now() + limits.deadlineMs
+  }
+  if (limits.maxSteps !== undefined) {
+    if (!Number.isInteger(limits.maxSteps) || limits.maxSteps <= 0) {
+      return {
+        kind: 'failed',
+        outcome: {
+          kind: 'failed',
+          code: 'INVALID_CONFIG',
+          reason: `Worker maxSteps must be a positive integer, got ${limits.maxSteps}`,
+        },
+      }
+    }
+    maxSteps = limits.maxSteps
+  }
+  if (maxTokens === undefined && deadlineAt === undefined && maxSteps === undefined) {
+    return { kind: 'ok', limits: undefined }
+  }
+  return {
+    kind: 'ok',
+    limits: {
+      // exactOptionalPropertyTypes: absent limits stay absent.
+      ...(maxTokens !== undefined ? { maxTokens } : {}),
+      ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+      ...(maxSteps !== undefined ? { maxSteps } : {}),
+    },
+  }
 }
 
 function describeError(error: unknown): string {

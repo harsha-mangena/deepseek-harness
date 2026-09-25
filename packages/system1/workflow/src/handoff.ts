@@ -12,8 +12,17 @@
  * 2. Delegation depth is enforced: the child is created at
  *    `parentDepth + 1` and refused at or above {@link MAX_HANDOFF_DEPTH}.
  * 3. The remaining budget is reserved from the parent pool before the child
- *    exists; the hold is settled against measured usage on success and
- *    released (never consumed) on failure or cancellation.
+ *    exists. The reservation settles on success; on failure or cancellation
+ *    the outcome depends on whether work may have started:
+ *    - No work started (invalid bundle, depth/budget refusal, reservation or
+ *      creation failure, abort before the drive): the hold is released.
+ *    - Work started but spend unknown (child failure, malformed result,
+ *      mid-run abort): the reservation is retained as a reconciliation hold
+ *      or conservatively charged — never released free.
+ *    The child's reported `actualUnits` is untrusted: it is validated
+ *    (finite, non-negative integer, within the reservation) and never
+ *    settles blindly, so a fraudulent report can neither refund real spend
+ *    nor decrease the pool's consumed total.
  * 4. A durable `system1/handoff` event is appended to the parent session, so
  *    the transfer is reconstructable from the session log.
  * 5. The child is created with explicit `parentAgent` lineage,
@@ -62,6 +71,16 @@ export interface HandoffBudgetLedger {
   ): { reservationId: string; units: number }
   settle(reservationId: string, actualUnits: number): void
   release(reservationId: string, cancelled?: boolean): void
+  /**
+   * Retain an active reservation as a reconciliation hold when spend is
+   * uncertain (child failure, invalid result, mid-run abort). The hold
+   * keeps the reserved units encumbered until authoritative telemetry
+   * reconciles it; it is never released free.
+   *
+   * Optional: ledgers without explicit hold support leave the reservation
+   * active, which is itself a hold until settled or released.
+   */
+  holdForReconciliation?(reservationId: string, claimedUnits: number, reason: string): void
 }
 
 /** Budget remaining for the child, debited from the named parent pool. */
@@ -172,6 +191,22 @@ export interface HandoffOptions {
    */
   readonly requestId?: System1RequestIdBrand
   /**
+   * Enforceable child limits (token cap, deadline, step bound). Validated before the
+   * reservation: an invalid limit fails closed without touching the ledger
+   * or the registry.
+   */
+  readonly childLimits?: HandoffChildLimits
+  /**
+   * Host-observed usage meter for the child run. Called with the child's
+   * session after the drive; returns whole budget units, or null when the
+   * child's provider usage was not metered. Settlement never uses the
+   * child-reported `actualUnits`: a null meter result conservatively
+   * charges the full reservation on success, and a failed run retains the
+   * hold. Defaults to folding the child's `assistant/message` token usage
+   * at one unit per token.
+   */
+  readonly measureChildUsage?: (childSession: Session) => number | null
+  /**
    * Extra setup run inside the child's unpublished scope after the handoff
    * bundle is seeded — e.g. worker tool restriction. Runs before the child
    * is published, so it can only shape the child's scoped world.
@@ -185,8 +220,33 @@ export interface HandoffChildResult {
   readonly artifacts: readonly string[]
   /** Evidence references backing the result. */
   readonly evidence: readonly string[]
-  /** Budget units the child reports as consumed. */
+  /**
+   * Budget units the child reports as consumed. Untrusted: validated
+   * (finite, non-negative integer, within the reservation) before any
+   * settlement, and never the basis for decreasing pool totals.
+   */
   readonly actualUnits: number
+}
+
+/** Enforceable limits for the handoff child. */
+export interface HandoffChildLimits {
+  /**
+   * Per-request output token cap, enforced by the provider adapter through
+   * the child's agent options. Must be a positive integer.
+   */
+  readonly maxTokens?: number
+  /**
+   * Wall-clock deadline (ms since epoch). The child is cancelled when the
+   * deadline passes; the deadline is also recorded on the budget
+   * reservation. Must be finite.
+   */
+  readonly deadlineAt?: number
+  /**
+   * Maximum model steps the child may run. The handoff watches the child's
+   * session for `step/start` events and cancels the child through its own
+   * cancel path when the bound is exceeded. Must be a positive integer.
+   */
+  readonly maxSteps?: number
 }
 
 /** Outcome of {@link handoffToDeepSeek}. Never throws for expected failures. */
@@ -361,9 +421,12 @@ export function checkReturnContract(
  *
  * The child is created through the coordinator's own agent registry, so the
  * standard DeepSeek factory is used untouched. Budget is reserved from the
- * parent pool before creation, settled against measured usage on success,
- * and released on failure or cancellation. Parent cancellation propagates
- * to the child; the owned child handle is always disposed.
+ * parent pool before creation and settled from the child's validated usage
+ * report on success. When no work started the hold releases; when work may
+ * have started but spend is uncertain, the reservation is retained as a
+ * reconciliation hold or conservatively charged — never released free.
+ * Parent cancellation propagates to the child; the owned child handle is
+ * always disposed.
  *
  * This function never throws for expected failures: invalid bundles, depth
  * violations, budget exhaustion, child failures, cancellations, and invalid
@@ -380,13 +443,32 @@ export async function handoffToDeepSeek(
   signal: AbortSignal,
   options: HandoffOptions,
 ): Promise<HandoffOutcome> {
+  // The child signal combines parent cancellation with the deadline: a
+  // passing deadline aborts the child exactly like a parent cancel, so
+  // every abort check below covers both.
+  const childController = new AbortController()
+  let deadlineFired = false
+  // Set when the step watcher cancels the child: the budget hold is then
+  // retained for reconciliation, like every other cancelled run.
+  let stepLimitFired = false
+  let stopStepWatch: (() => boolean) | undefined
+  const onParentAbort = (): void => {
+    childController.abort()
+  }
+  if (signal.aborted) {
+    childController.abort()
+  } else {
+    signal.addEventListener('abort', onParentAbort, { once: true })
+  }
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined
   // Cancellation is wired before the first await: an abort racing any later
   // suspension still reaches the child once it exists.
   let childAgent: Agent | undefined
   const onAbort = (): void => {
     childAgent?.cancel({ kind: 'parent' })
   }
-  signal.addEventListener('abort', onAbort, { once: true })
+  const childSignal = childController.signal
+  childSignal.addEventListener('abort', onAbort, { once: true })
   try {
     let parsed: HandoffBundle
     try {
@@ -403,18 +485,40 @@ export async function handoffToDeepSeek(
         `Handoff refused: child depth ${childDepth} exceeds maximum ${MAX_HANDOFF_DEPTH}`,
       )
     }
-    // The schema types units as a number but cannot reject NaN; a
-    // non-positive or non-finite budget never reaches the ledger.
+    // The schema types units as a number but cannot reject NaN or
+    // fractions; only a positive integer budget reaches the ledger, so
+    // every later settlement validates.
     const units = parsed.remainingBudget.units
-    if (!Number.isFinite(units) || units <= 0) {
+    if (!Number.isInteger(units) || units <= 0) {
       return failed(
         'BUDGET_EXHAUSTED',
-        `Handoff refused: remaining budget must be finite and positive, got ${units}`,
+        `Handoff refused: remaining budget must be a positive integer, got ${units}`,
       )
     }
 
+    // Enforceable child limits are validated before the reservation: a bad
+    // limit never reaches the ledger or the registry.
+    const limitsCheck = validateChildLimits(options.childLimits)
+    if (!limitsCheck.ok) return limitsCheck.outcome
+    const { maxTokens, deadlineAt, maxSteps } = limitsCheck
+    if (deadlineAt !== undefined) {
+      const delayMs = deadlineAt - Date.now()
+      if (delayMs <= 0) {
+        deadlineFired = true
+        childController.abort()
+      } else {
+        deadlineTimer = setTimeout(() => {
+          deadlineFired = true
+          childController.abort()
+        }, delayMs)
+        // The deadline must not hold the process open by itself.
+        deadlineTimer.unref()
+      }
+    }
+
     // Reserve before the child exists: a creation failure must not strand
-    // unreserved spend, and a success must not exceed the parent pool.
+    // unreserved spend, and a success must not exceed the parent pool. The
+    // reservation carries the deadline so reconciliation can see it.
     let reservationId: string
     try {
       reservationId = options.ledger.reserve(
@@ -422,12 +526,14 @@ export async function handoffToDeepSeek(
         parsed.remainingBudget.poolName,
         parsed.taskId,
         units,
+        deadlineAt,
       ).reservationId
     } catch (error) {
       return failed('BUDGET_EXHAUSTED', `Handoff budget reservation failed: ${describeError(error)}`)
     }
 
-    // From here the hold is live: every path below settles or releases it.
+    // From here the hold is live: every path below settles it, retains it
+    // as a reconciliation hold, or releases it.
     const releaseAndFail = (
       code: System1ErrorCode,
       reason: string,
@@ -442,6 +548,29 @@ export async function handoffToDeepSeek(
         )
       }
       return failed(code, reason)
+    }
+    // Spend is uncertain (the child may have run): retain the reservation
+    // as a reconciliation hold instead of releasing it free. Consumed
+    // totals never decrease; the hold settles from authoritative telemetry.
+    const holdAndFail = (code: System1ErrorCode, reason: string): HandoffOutcome => {
+      retainHold(options.ledger, reservationId, units, reason)
+      return failed(code, `${reason}; spend held for reconciliation`)
+    }
+    // The child ran but produced no usable result: spend is unknown but
+    // bounded by the reservation, so conservatively charge the full
+    // reservation instead of releasing it free. If even the conservative
+    // settlement fails, retain the hold for reconciliation — started
+    // work is never released free.
+    const settleConservativeAndFail = (code: System1ErrorCode, reason: string): HandoffOutcome => {
+      try {
+        options.ledger.settle(reservationId, units)
+      } catch (settleError) {
+        return holdAndFail(
+          code,
+          `${reason} (conservative settlement also failed: ${describeError(settleError)})`,
+        )
+      }
+      return failed(code, `${reason}; charged the full ${units}-unit reservation conservatively`)
     }
 
     // The transfer itself is durable: reconstructable from the parent log.
@@ -469,14 +598,37 @@ export async function handoffToDeepSeek(
       handle = await coordinator.ctx.agents.create({
         sessionId,
         parentAgent: coordinator,
-        signal,
+        signal: childSignal,
         meta: {
           parentSession: coordinator.session.id,
           origin: 'subagent',
           delegationDepth: childDepth,
         },
+        // The token cap is enforced by the provider adapter, not by the
+        // prompt: it travels in the child's agent options.
+        // exactOptionalPropertyTypes: an absent cap must stay absent.
+        ...(maxTokens !== undefined ? { agentOptions: { maxTokens } } : {}),
         setup: (agentCtx, agent) => {
           seedHandoffSection(agentCtx.get('systemPrompt'), handoffText)
+          if (maxSteps !== undefined) {
+            // The step bound is enforced against the child's own session
+            // log: each step/start past the bound cancels the child through
+            // its own cancel path. Scope-filtered dispatch delivers the
+            // child's session events to this agent-scoped listener.
+            const childSession = agent.session
+            let steps = 0
+            stopStepWatch = agentCtx.on('session/event', (subject, event) => {
+              if (subject !== childSession || event.type !== 'step/start') return
+              steps += 1
+              if (steps > maxSteps && !stepLimitFired) {
+                stepLimitFired = true
+                // Abort exactly like a deadline: the abort listener cancels
+                // the child agent, and the run below attributes the
+                // reconciliation hold to the step limit.
+                childController.abort()
+              }
+            })
+          }
           return options.setupExtras?.(agentCtx, agent)
         },
       })
@@ -484,54 +636,110 @@ export async function handoffToDeepSeek(
       return releaseAndFail(
         'EXECUTION_FAILED',
         `DeepSeek child creation failed: ${describeError(error)}`,
-        signal.aborted,
+        childSignal.aborted,
       )
     }
     childAgent = handle.agent
 
     try {
-      if (signal.aborted) {
-        // Already aborted before the drive: cancel the fresh child directly.
+      if (childSignal.aborted) {
+        // Aborted before the drive (or the deadline already passed): the
+        // child never started, so no spend exists and the hold releases.
         childAgent.cancel({ kind: 'parent' })
-      } else {
+        return releaseAndFail(
+          'TASK_CANCELLED',
+          deadlineFired ? 'Handoff deadline passed before DeepSeek execution' : 'Handoff aborted before DeepSeek execution',
+          true,
+        )
+      }
+      try {
         // Drive the child through its real inbox: the message is logged in
         // the child's session, wakes its loop, and carries the bundle.
-        try {
-          handle.agent.followup(renderHandoffMessage(parsed))
-          await handle.agent.whenIdle()
-        } catch (error) {
-          return releaseAndFail(
-            signal.aborted ? 'TASK_CANCELLED' : 'EXECUTION_FAILED',
-            `DeepSeek child failed: ${describeError(error)}`,
-            signal.aborted,
+        handle.agent.followup(renderHandoffMessage(parsed))
+        await handle.agent.whenIdle()
+      } catch (error) {
+        // The drive failed after start: spend is uncertain — retain the
+        // hold instead of releasing it free.
+        if (stepLimitFired) {
+          return holdAndFail(
+            'TASK_CANCELLED',
+            `DeepSeek child exceeded the ${maxSteps}-step limit during execution`,
           )
         }
+        return holdAndFail(
+          childSignal.aborted ? 'TASK_CANCELLED' : 'EXECUTION_FAILED',
+          `DeepSeek child failed: ${describeError(error)}`,
+        )
       }
-      if (signal.aborted) {
-        return releaseAndFail('TASK_CANCELLED', 'Handoff aborted during DeepSeek execution', true)
+      if (childSignal.aborted) {
+        // Aborted mid-run (parent cancel, deadline, or step limit): the
+        // child may have spent budget — hold, don't release.
+        if (stepLimitFired) {
+          return holdAndFail(
+            'TASK_CANCELLED',
+            `DeepSeek child exceeded the ${maxSteps}-step limit during execution`,
+          )
+        }
+        return holdAndFail(
+          'TASK_CANCELLED',
+          deadlineFired
+            ? 'Handoff deadline exceeded during DeepSeek execution'
+            : 'Handoff aborted during DeepSeek execution',
+        )
       }
 
       let result: HandoffChildResult
       try {
         result = extractHandoffResult(handle.agent.session)
       } catch (error) {
-        return releaseAndFail(
+        return settleConservativeAndFail(
           'VERIFICATION_FAILED',
           `DeepSeek child returned no valid result: ${describeError(error)}`,
-          false,
+        )
+      }
+
+      // The child's reported usage is untrusted: validate it before any
+      // settlement. A fraudulent or out-of-range report fails closed and
+      // retains the hold — it never refunds real spend and never decreases
+      // the pool's consumed total.
+      const usageError = validateReportedUsage(result.actualUnits, units)
+      if (usageError !== null) {
+        return holdAndFail(
+          'VERIFICATION_FAILED',
+          `DeepSeek child reported invalid usage: ${usageError}`,
         )
       }
 
       const missing = checkReturnContract(result, parsed.returnContract)
-      // Settle against measured usage even when the contract fails: the
-      // child did the work, so its spend is real.
+      // The usage meter is host-observed but still untrusted at the
+      // boundary: a throwing meter, or a negative/non-integer meter result,
+      // means usage is unknown — settlement falls back to the full
+      // reservation rather than trusting the figure.
+      const measuredChildUsage = (childSession: Session): number | null => {
+        let measured: number | null
+        try {
+          measured = (options.measureChildUsage ?? foldChildSessionUsage)(childSession)
+        } catch {
+          return null
+        }
+        if (measured === null) return null
+        if (!Number.isInteger(measured) || measured < 0) return null
+        return measured
+      }
+      // Settlement is authoritative: the meter folds host-observed provider
+      // usage from the child's session — the child's reported actualUnits
+      // is untrusted and never determines the settled amount. When the
+      // meter observed nothing, conservatively charge the full reservation;
+      // when it measured an overrun, the ledger's explicit overrun policy
+      // decides. A settlement failure after the child ran retains the hold
+      // for reconciliation — real spend must never release free.
+      const settledUnits = measuredChildUsage(handle.agent.session) ?? units
       try {
-        options.ledger.settle(reservationId, result.actualUnits)
+        options.ledger.settle(reservationId, settledUnits)
       } catch (error) {
-        return releaseAndFail(
+        return holdAndFail(
           'EXECUTION_FAILED',
           `DeepSeek child result accepted but budget settlement failed: ${describeError(error)}`,
-          false,
         )
       }
       if (missing.length > 0) {
@@ -544,7 +752,7 @@ export async function handoffToDeepSeek(
         kind: 'completed',
         artifacts: result.artifacts,
         evidence: result.evidence,
-        actualUnits: result.actualUnits,
+        actualUnits: settledUnits,
       }
     } finally {
       // Best-effort: the outcome above already records the run, and a
@@ -552,7 +760,134 @@ export async function handoffToDeepSeek(
       await handle.dispose().catch(() => undefined)
     }
   } finally {
-    signal.removeEventListener('abort', onAbort)
+    if (deadlineTimer !== undefined) clearTimeout(deadlineTimer)
+    // Close the step watcher before disposal so late step events stay silent.
+    stopStepWatch?.()
+    signal.removeEventListener('abort', onParentAbort)
+    childSignal.removeEventListener('abort', onAbort)
+  }
+}
+
+/**
+ * Validate the child's reported usage without trusting it. The report is
+ * model output: it must be a non-negative integer within the reservation.
+ * @param actualUnits - the child's reported units.
+ * @param reservedUnits - the reservation bounding the child's spend.
+ * @returns the violation, or null when the report is usable.
+ */
+function validateReportedUsage(actualUnits: number, reservedUnits: number): string | null {
+  if (!Number.isInteger(actualUnits) || actualUnits < 0) {
+    return `usage ${actualUnits} is not a non-negative integer`
+  }
+  if (actualUnits > reservedUnits) {
+    return `usage ${actualUnits} exceeds the ${reservedUnits}-unit reservation`
+  }
+  return null
+}
+
+/**
+ * Default host-observed usage meter for a handoff child: fold the child's
+ * session log for `assistant/message` token usage, at one unit per token.
+ * These counts are recorded by the provider adapter's transport telemetry —
+ * the host's own observation of the child's provider calls — never by the
+ * model.
+ * @param session - the child's session after its run.
+ * @returns whole units, or null when no message carried usage telemetry.
+ */
+export function foldChildSessionUsage(session: Session): number | null {
+  let total = 0
+  let observed = false
+  for (const event of session.snapshotEvents()) {
+    if (event.type !== 'assistant/message') continue
+    const usage = event.data.usage
+    if (usage === undefined) continue
+    // Corrupt telemetry is unmetered: a negative or fractional token count
+    // fails closed to the conservative full-reservation charge.
+    if (!Number.isInteger(usage.inputTokens) || usage.inputTokens < 0) return null
+    if (!Number.isInteger(usage.outputTokens) || usage.outputTokens < 0) return null
+    observed = true
+    total += usage.inputTokens + usage.outputTokens
+  }
+  return observed ? total : null
+}
+
+/**
+ * Validate enforceable child limits before they reach the ledger or the
+ * registry.
+ * @param limits - the requested limits, if any.
+ * @returns the normalized limits, or a fail-closed outcome.
+ */
+function validateChildLimits(limits: HandoffChildLimits | undefined):
+  | { readonly ok: true; readonly maxTokens?: number; readonly deadlineAt?: number; readonly maxSteps?: number }
+  | { readonly ok: false; readonly outcome: HandoffOutcome } {
+  if (limits === undefined) return { ok: true }
+  let maxTokens: number | undefined
+  let deadlineAt: number | undefined
+  let maxSteps: number | undefined
+  if (limits.maxTokens !== undefined) {
+    if (!Number.isInteger(limits.maxTokens) || limits.maxTokens <= 0) {
+      return {
+        ok: false,
+        outcome: failed(
+          'INVALID_CONFIG',
+          `Handoff child maxTokens must be a positive integer, got ${limits.maxTokens}`,
+        ),
+      }
+    }
+    maxTokens = limits.maxTokens
+  }
+  if (limits.deadlineAt !== undefined) {
+    if (!Number.isFinite(limits.deadlineAt)) {
+      return {
+        ok: false,
+        outcome: failed(
+          'INVALID_CONFIG',
+          `Handoff child deadlineAt must be a finite timestamp, got ${limits.deadlineAt}`,
+        ),
+      }
+    }
+    deadlineAt = limits.deadlineAt
+  }
+  if (limits.maxSteps !== undefined) {
+    if (!Number.isInteger(limits.maxSteps) || limits.maxSteps <= 0) {
+      return {
+        ok: false,
+        outcome: failed(
+          'INVALID_CONFIG',
+          `Handoff child maxSteps must be a positive integer, got ${limits.maxSteps}`,
+        ),
+      }
+    }
+    maxSteps = limits.maxSteps
+  }
+  return {
+    ok: true,
+    // exactOptionalPropertyTypes: absent limits stay absent.
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+    ...(maxSteps !== undefined ? { maxSteps } : {}),
+  }
+}
+
+/**
+ * Retain a reservation as a reconciliation hold. Best-effort: ledgers
+ * without explicit hold support leave the reservation active, which is
+ * itself a hold until settled or released by reconciliation.
+ * @param ledger - the budget ledger.
+ * @param reservationId - the live reservation.
+ * @param claimedUnits - advisory claimed usage.
+ * @param reason - why the spend is uncertain.
+ */
+function retainHold(
+  ledger: HandoffBudgetLedger,
+  reservationId: string,
+  claimedUnits: number,
+  reason: string,
+): void {
+  try {
+    ledger.holdForReconciliation?.(reservationId, claimedUnits, reason)
+  } catch {
+    // The reservation stays active as an implicit hold.
   }
 }
 

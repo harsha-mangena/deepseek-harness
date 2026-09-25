@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
+import { Session, SessionId, SessionSeq, type UserMessage } from '@deepseek-ai/dsh-session'
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineTool } from '@deepseek-ai/dsh-tools'
 import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
@@ -38,17 +38,27 @@ interface ChildScript {
   result?: { artifacts: string[]; evidence: string[]; actualUnits: number }
   /** Throw when the child is driven. */
   throwOnDrive?: boolean
+  /** Step/start events to report through the child scope while driven. */
+  stepsOnDrive?: number
+  /**
+   * Host-observed provider usage the fake records on its final assistant
+   * message. When absent the worker run is unmetered (settlement falls
+   * back to the conservative full-reservation charge).
+   */
+  usage?: { inputTokens: number; outputTokens: number }
 }
 
 class FakeWorkerAgent implements Agent {
   readonly sessionId: SessionId
   readonly session: Session
   private readonly inbox = new Session(SessionId('worker-inbox'))
+  private readonly agentCtx: Context
+  cancelCount = 0
 
   constructor(sessionId: SessionId, agentCtx: Context, private readonly script: ChildScript) {
     this.sessionId = sessionId
     this.session = new Session(sessionId)
-    void agentCtx
+    this.agentCtx = agentCtx
   }
 
   get ctx(): Context {
@@ -70,9 +80,27 @@ class FakeWorkerAgent implements Agent {
       })
       this.session.append(
         'assistant/message',
-        { turn: 0, step: 0, message: assistant, stream: [] },
+        {
+          turn: 0,
+          step: 0,
+          message: assistant,
+          stream: [],
+          // Host-observed telemetry, like the real provider adapter logs.
+          ...(this.script.usage !== undefined ? { usage: this.script.usage } : {}),
+        },
         { surfaceOp: 'append' },
       )
+    }
+    // Report model steps through the child scope, like the loop would: the
+    // handoff's step watcher observes these and enforces the step bound.
+    const steps = this.script.stepsOnDrive ?? 0
+    for (let step = 1; step <= steps; step++) {
+      this.agentCtx.emit('session/event', this.session, {
+        type: 'step/start',
+        seq: SessionSeq(step),
+        time: Date.now(),
+        data: { turn: 1, step },
+      })
     }
   }
 
@@ -81,7 +109,7 @@ class FakeWorkerAgent implements Agent {
   }
 
   cancel(): void {
-    // Nothing to cancel: the fake has no running turn.
+    this.cancelCount += 1
   }
 }
 
@@ -147,6 +175,7 @@ function fakeFactory(mintCtx: Context, state: FactoryState): AgentFactory {
 
 interface Fixture {
   coordinator: System1CoordinatorAgent
+  store: CoordinationStore
   ledger: HandoffBudgetLedger
   ledgerCalls: { reserve: number; settle: number; release: number }
   factoryState: FactoryState
@@ -214,6 +243,7 @@ async function setup(
   const handle = await ctx.system1Workflows.create(session, idleDriver)
   return {
     coordinator: handle.coordinator,
+    store,
     ledger,
     ledgerCalls,
     factoryState,
@@ -249,6 +279,7 @@ describe('spawnWorker', () => {
   it('spawns a scoped child with restricted capabilities and settles usage', async () => {
     const fixture = await setup({
       result: { artifacts: ['a:1'], evidence: ['e:1'], actualUnits: 6 },
+      usage: { inputTokens: 4, outputTokens: 2 },
     })
     try {
       const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-1' })
@@ -317,6 +348,7 @@ describe('spawnWorker', () => {
   it('fails the return contract when the worker omits required artifacts', async () => {
     const fixture = await setup({
       result: { artifacts: ['a:other'], evidence: [], actualUnits: 3 },
+      usage: { inputTokens: 2, outputTokens: 1 },
     })
     try {
       const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-3' })
@@ -395,6 +427,7 @@ describe('spawnWorker', () => {
   it('completes with default session minting, constraints, and decision linkage', async () => {
     const fixture = await setup({
       result: { artifacts: ['a:1'], evidence: [], actualUnits: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
     })
     try {
       const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-6' })
@@ -451,6 +484,158 @@ describe('spawnWorker', () => {
       // The failure happened before reservation: nothing was held.
       expect(fixture.ledgerCalls).toEqual({ reserve: 0, settle: 0, release: 0 })
       expect(fixture.factoryState.calls).toHaveLength(0)
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('passes worker token and deadline limits to the child', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 4 },
+      usage: { inputTokens: 3, outputTokens: 1 },
+    })
+    try {
+      const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-8' })
+      const outcome = await spawnWorker(
+        fixture.coordinator,
+        workerSpec({ limits: { maxTokens: 50, deadlineMs: 60_000 } }),
+        new AbortController().signal,
+        fixture.workerOptions(delegation, 's-worker-child-8'),
+      )
+      expect(outcome.kind).toBe('completed')
+      expect(fixture.factoryState.calls).toHaveLength(1)
+      expect(fixture.factoryState.calls[0]!.options.agentOptions).toMatchObject({
+        maxTokens: 50,
+      })
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('rejects an invalid worker token limit before reserving', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 4 },
+    })
+    try {
+      const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-9' })
+      const outcome = await spawnWorker(
+        fixture.coordinator,
+        workerSpec({ limits: { maxTokens: 0 } }),
+        new AbortController().signal,
+        fixture.workerOptions(delegation, 's-worker-child-9'),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('INVALID_CONFIG')
+        expect(outcome.reason).toContain('maxTokens')
+      }
+      expect(fixture.factoryState.calls).toHaveLength(0)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 0, settle: 0, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('rejects an invalid worker step limit before reserving', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 4 },
+    })
+    try {
+      const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-10' })
+      const outcome = await spawnWorker(
+        fixture.coordinator,
+        workerSpec({ limits: { maxSteps: 0 } }),
+        new AbortController().signal,
+        fixture.workerOptions(delegation, 's-worker-child-10'),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('INVALID_CONFIG')
+        expect(outcome.reason).toContain('maxSteps')
+      }
+      expect(fixture.factoryState.calls).toHaveLength(0)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 0, settle: 0, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('enforces the worker step limit through the handoff', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 4 },
+      stepsOnDrive: 3,
+    })
+    try {
+      const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-11' })
+      const outcome = await spawnWorker(
+        fixture.coordinator,
+        workerSpec({ limits: { maxSteps: 2 } }),
+        new AbortController().signal,
+        fixture.workerOptions(delegation, 's-worker-child-11'),
+      )
+      // The third step trips the handoff's watcher: the child is cancelled
+      // and its spend is held for reconciliation.
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('TASK_CANCELLED')
+        expect(outcome.reason).toMatch(/step limit/)
+      }
+      const call = fixture.factoryState.calls[0]
+      expect(call).toBeDefined()
+      expect(call!.agent.cancelCount).toBe(1)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 0, release: 0 })
+      // The stopped worker's spend is uncertain: the reservation stays
+      // encumbered instead of releasing free.
+      expect(fixture.store.getPoolUtilization('tenant-1', 'pool-shared')).toEqual({
+        capacity: 100,
+        reserved: 10,
+        consumed: 0,
+      })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('rejects an invalid worker deadline before reserving', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 4 },
+    })
+    try {
+      const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-10' })
+      const outcome = await spawnWorker(
+        fixture.coordinator,
+        workerSpec({ limits: { deadlineMs: Number.NaN } }),
+        new AbortController().signal,
+        fixture.workerOptions(delegation, 's-worker-child-10'),
+      )
+      expect(outcome.kind).toBe('failed')
+      if (outcome.kind === 'failed') {
+        expect(outcome.code).toBe('INVALID_CONFIG')
+        expect(outcome.reason).toContain('deadlineMs')
+      }
+      expect(fixture.factoryState.calls).toHaveLength(0)
+      expect(fixture.ledgerCalls).toEqual({ reserve: 0, settle: 0, release: 0 })
+    } finally {
+      await fixture.dispose()
+    }
+  })
+
+  it('treats empty worker limits as no limits', async () => {
+    const fixture = await setup({
+      result: { artifacts: ['a:1'], evidence: [], actualUnits: 4 },
+      usage: { inputTokens: 3, outputTokens: 1 },
+    })
+    try {
+      const delegation = new DelegationManager({ newTaskId: () => 'delegated-task-12' })
+      const outcome = await spawnWorker(
+        fixture.coordinator,
+        workerSpec({ limits: {} }),
+        new AbortController().signal,
+        fixture.workerOptions(delegation, 's-worker-child-12'),
+      )
+      expect(outcome.kind).toBe('completed')
+      expect(fixture.ledgerCalls).toEqual({ reserve: 1, settle: 1, release: 0 })
     } finally {
       await fixture.dispose()
     }

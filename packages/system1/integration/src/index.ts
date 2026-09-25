@@ -18,7 +18,39 @@ export type {
 export { ReadOnlyProductionDriver, buildEscalationBundle } from './driver.ts'
 export type {
   EscalationBundleInput,
-  ResolvedToolCall,
   ToolVerificationContext,
   ProductionDriverConfig,
 } from './driver.ts'
+export {
+  MAX_ARGS_SUMMARY_CHARS,
+  MAX_EVIDENCE_CHARS,
+  evidenceText,
+  finalizeOnce,
+  findStoredToolResult,
+  hasTerminal,
+  hashEvidenceContent,
+  loadEvidenceBinding,
+  loadStoredVerifications,
+  nextToolStep,
+  parseReceiptRef,
+  recordDispatchPlan,
+  recordToolEvidence,
+  resolveCheckEvidence,
+  resolveHandoffRefs,
+  sanitizeToolResultContent,
+  serializeArguments,
+} from './evidence.ts'
+export type {
+  CheckEvidenceResolution,
+  DispatchPlanInput,
+  EvidenceSpillStore,
+  ExpectedCheckEvidence,
+  HandoffRefResolution,
+  ResolvedCheckEvidence,
+  ResolvedToolCall,
+  SpilledEvidenceRef,
+  StoredVerification,
+  System1DispatchPlanData,
+  System1EvidenceBindingData,
+  ToolEvidenceInput,
+} from './evidence.ts'

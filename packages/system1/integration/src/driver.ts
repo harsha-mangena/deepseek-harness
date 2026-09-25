@@ -46,6 +46,7 @@ import {
 import type {
   CoordinatorDriver,
   FinalizerVerification,
+  HandoffBudgetLedger,
   HandoffBundle,
   HandoffHandler,
   HandoffOutcome,
@@ -57,14 +58,20 @@ import type { TextBlock, UserMessage } from '@deepseek-ai/dsh-llm/types'
 import type { ToolExecutionSuccess } from '@deepseek-ai/dsh-tools'
 import { ReadOnlyCoordinator } from './coordinator.ts'
 import type { CoordinatorResult } from './coordinator.ts'
-
-/** A concrete tool call resolved from an admitted candidate. */
-export interface ResolvedToolCall {
-  /** Registered tool name in the coordinator's scoped tool runtime. */
-  readonly name: string
-  /** Losslessly JSON-serializable parsed arguments. */
-  readonly arguments: unknown
-}
+import {
+  finalizeOnce,
+  nextToolStep,
+  recordDispatchPlan,
+  recordToolEvidence,
+  resolveCheckEvidence,
+  resolveHandoffRefs,
+  serializeArguments,
+} from './evidence.ts'
+import type {
+  EvidenceSpillStore,
+  ResolvedToolCall,
+  SpilledEvidenceRef,
+} from './evidence.ts'
 
 /** Real tool result offered to the host verifier. */
 export interface ToolVerificationContext {
@@ -74,6 +81,10 @@ export interface ToolVerificationContext {
   readonly result: ToolExecutionSuccess
   /** Receipt reference recorded on the execution outcome. */
   readonly receiptRef: string
+  /** Evidence hash of the sanitized tool result persisted as `tool/result`. */
+  readonly evidenceHash: string
+  /** Spill reference, when the oversized result spilled by reference. */
+  readonly spilled?: SpilledEvidenceRef
 }
 
 /** Input for {@link buildEscalationBundle}. */
@@ -122,6 +133,43 @@ export function buildEscalationBundle(input: EscalationBundleInput): HandoffBund
     verifierRequirements: [],
     returnContract: { requiredArtifacts: [], requiredEvidence: [] },
   }
+}
+
+/** Budget accounting for the driver's own Jev and tool spend. */
+export interface DriverBudgetConfig {
+  /**
+   * Budget ledger; the production wiring passes the coordination store.
+   * Uncertain spend is retained through the ledger's optional
+   * `holdForReconciliation`; ledgers without it leave the reservation
+   * active as an implicit hold.
+   */
+  readonly ledger: HandoffBudgetLedger
+  /** Pool the driver's reservations draw from. */
+  readonly poolName: string
+  /**
+   * Units reserved per Jev decision request. Must cover the worst-case
+   * metered usage below: the reservation settles from provider-reported
+   * token usage (host-observed transport telemetry, never model content),
+   * and usage above the reservation fails closed or is held.
+   */
+  readonly jevRequestUnits: number
+  /** Units reserved per tool call; settled in full when the call executes. */
+  readonly toolCallUnits: number
+  /**
+   * Convert provider-reported usage to settled units. Defaults to
+   * `inputTokens + outputTokens`: units are tokens unless the deployment
+   * defines otherwise. Must return a non-negative integer, or `null`
+   * when usage is unknown (a null count means the provider did not
+   * report it — settling 0 would release real spend free). A null
+   * return, a throw, or an out-of-range value retains the reservation
+   * as a reconciliation hold.
+   */
+  readonly meterJevUsage?: (usage: {
+    readonly inputTokens: number | null
+    readonly outputTokens: number | null
+  }) => number | null
+  /** Reservation deadline (ms since epoch), applied to driver reservations. */
+  readonly deadlineAt?: number
 }
 
 /** Production driver configuration. */
@@ -186,6 +234,14 @@ export interface ProductionDriverConfig {
     /** Units reserved for the child. */
     readonly units: number
   }
+  /**
+   * Optional budget accounting for the driver's own Jev and tool spend.
+   * When set, every Jev decision request and every tool call reserves
+   * from `budget.poolName` before the operation and settles from
+   * host-observed usage after it. Uncertain spend is retained as a
+   * reconciliation hold, never released free.
+   */
+  readonly budget?: DriverBudgetConfig
 }
 
 /** Production driver: one durable read-only turn per wake. */
@@ -234,6 +290,9 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         )
       }
     }
+    if (config.budget !== undefined) {
+      validateBudgetConfig(config.budget)
+    }
     this.config = config
   }
 
@@ -276,12 +335,16 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     }
 
     // The executor captures the real dispatched tool result so the driver
-    // can verify fresh evidence before declaring success.
+    // can verify fresh evidence before declaring success. The provider
+    // wrapper captures the normalized decision the coordinator admitted,
+    // so the executor can record admission, decision identity, and the
+    // execution intent before anything dispatches.
     let dispatched: ToolVerificationContext | undefined
+    const decisionHolder: { decision?: NormalizedDecision } = {}
     const inner = new ReadOnlyCoordinator({
       policy: this.config.policy,
       capabilityProfile: this.config.capabilityProfile,
-      provider: this.config.provider,
+      provider: this.capturingProvider(this.meteredProvider(requestId), decisionHolder),
       calibration: this.config.calibration,
       expectedModel: this.config.expectedModel,
       tenantId: this.config.tenantId,
@@ -290,7 +353,22 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         : {}),
       executor: {
         execute: async (candidate, execSignal) => {
-          const dispatchedOutcome = await this.dispatch(coordinator, candidate, execSignal)
+          const captured = decisionHolder.decision
+          /* v8 ignore next -- defensive: the coordinator decides before it dispatches */
+          if (captured === undefined) {
+            throw system1Error(
+              'ILLEGAL_STATE_TRANSITION',
+              'dispatch ran without a captured provider decision',
+              { requestId },
+            )
+          }
+          const dispatchedOutcome = await this.dispatch(
+            coordinator,
+            requestId,
+            candidate,
+            captured,
+            execSignal,
+          )
           if (dispatchedOutcome.verification !== undefined) {
             dispatched = dispatchedOutcome.verification
           }
@@ -303,7 +381,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     try {
       result = await inner.run({ observations, catalog: this.config.catalog }, signal)
     } catch (error) {
-      finalizeTerminal({
+      finalizeOnce({
         session,
         requestId,
         outcome: 'failure',
@@ -315,7 +393,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     }
 
     if (signal.aborted) {
-      finalizeTerminal({
+      finalizeOnce({
         session,
         requestId,
         outcome: 'cancelled',
@@ -335,7 +413,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     // a missing captured result (or a non-success outcome) means there is
     // no real evidence to verify: fail closed.
     if (dispatched === undefined || result.outcome.kind !== 'succeeded') {
-      finalizeTerminal({
+      finalizeOnce({
         session,
         requestId,
         outcome: 'failure',
@@ -346,11 +424,29 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       return
     }
 
+    // The required verifier policy is resolved from the admitted
+    // candidate on every turn — never cached, never trusted from the
+    // caller. Without one the tool result cannot be verified: fail closed.
+    const requiredPolicy = dispatched.candidate.verificationPolicyId.trim()
+    if (requiredPolicy.length === 0) {
+      finalizeOnce({
+        session,
+        requestId,
+        outcome: 'failure',
+        summary:
+          `No verification policy for candidate ${dispatched.candidate.id}; ` +
+          `cannot verify the tool result`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+
     let verification: FinalizerVerification
     try {
       verification = this.config.verify(dispatched)
     } catch (error) {
-      finalizeTerminal({
+      finalizeOnce({
         session,
         requestId,
         outcome: 'failure',
@@ -360,17 +456,27 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
-    // Durable evidence: the verification record enters the session log
-    // before the terminal event, so getEvidence can retrieve it later.
+    // Durable evidence: the verification record and its evidence binding
+    // (the verifier version and the checked resource versions) enter the
+    // session log before the terminal event, so the finalizer resolves
+    // stored records instead of trusting caller-supplied booleans.
     session.append('system1/verification', {
       schemaVersion: 1,
       requestId,
       checkId: verification.checkId,
       passed: verification.passed,
-      evidence: `tool-call:${dispatched.receiptRef}`,
+      evidence: dispatched.receiptRef,
+    })
+    session.append('system1/evidence-binding', {
+      schemaVersion: 1,
+      requestId,
+      checkId: verification.checkId,
+      verifierVersion: requiredPolicy,
+      resourceVersions: { [dispatched.receiptRef]: dispatched.evidenceHash },
+      ...(dispatched.spilled === undefined ? {} : { spill: dispatched.spilled }),
     })
     if (!verification.passed) {
-      finalizeTerminal({
+      finalizeOnce({
         session,
         requestId,
         outcome: 'failure',
@@ -380,15 +486,159 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
+    // Finalize from the stored projection: the check backing success is
+    // re-read from the session log and must cite the dispatched receipt
+    // with matching evidence. Missing or stale evidence cannot produce
+    // success.
+    const resolution = resolveCheckEvidence(session, requestId, [
+      {
+        checkId: verification.checkId,
+        expectedReceiptRef: dispatched.receiptRef,
+        expectedHash: dispatched.evidenceHash,
+        expectedTenantId: this.config.tenantId,
+      },
+    ])
+    /* v8 ignore next -- defensive: the driver persisted the verification and tool/result above, so resolution cannot fail here; the resolver's failure modes are unit-tested */
+    if (!resolution.ok) {
+      finalizeOnce({
+        session,
+        requestId,
+        outcome: 'failure',
+        summary: `Stored evidence did not resolve: ${resolution.reason}`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
 
-    finalizeTerminal({
+    finalizeOnce({
       session,
       requestId,
       outcome: 'success',
-      summary: `Dispatched ${dispatched.candidate.id} (${dispatched.receiptRef})`,
+      summary:
+        `Dispatched ${dispatched.candidate.id} (${dispatched.receiptRef}); ` +
+        `check "${verification.checkId}" passed under policy ${requiredPolicy}`,
       verifiedBy: [verification.checkId],
-      verifications: [verification],
+      verifications: resolution.checks.map((check) => check.verification),
     })
+  }
+
+  /**
+   * Wrap the configured provider with budget accounting. Without a budget
+   * config this is the raw provider. With one, every decision request
+   * reserves `jevRequestUnits` from the pool before the provider call,
+   * under a per-call operation id (`<requestId>:jev-decide:<decisionId>`)
+   * linked to the owning request and the coordinator's decision identity,
+   * and settles from the host-observed token usage after it — never from
+   * model-claimed content. A failed or aborted call, an unmetered usage
+   * report (the provider did not report counts), a throwing meter, or a
+   * usage figure that fails validation retains the reservation as a
+   * reconciliation hold; the hold releases only when no request left the
+   * host (reservation failure itself, or the decision never ran).
+   * @param requestId - the workflow request id owning the turn.
+   * @returns the (possibly metered) provider.
+   */
+  private meteredProvider(requestId: ReturnType<typeof System1RequestId>): DecisionProvider {
+    const budget = this.config.budget
+    if (budget === undefined) return this.config.provider
+    const provider = this.config.provider
+    const tenantId = this.config.tenantId
+    const meter = budget.meterJevUsage ?? defaultJevMeter
+    return {
+      decide: async (input, signal) => {
+        // The coordinator mints a fresh decisionId per decide call
+        // (time+random by default), so the operation id is unique per
+        // call even across process restarts — no local sequence needed.
+        const operationId = `${requestId}:jev-decide:${input.decisionId}`
+        let reservationId: string
+        try {
+          reservationId = budget.ledger.reserve(
+            tenantId,
+            budget.poolName,
+            operationId,
+            budget.jevRequestUnits,
+            budget.deadlineAt,
+          ).reservationId
+        } catch (error) {
+          throw system1Error(
+            'BUDGET_EXHAUSTED',
+            `Decision budget reservation failed: ${failureSummary(error)}`,
+            { requestId },
+          )
+        }
+        let decision: NormalizedDecision
+        try {
+          decision = await provider.decide(input, signal)
+        } catch (error) {
+          retainLedgerHold(
+            budget.ledger,
+            reservationId,
+            budget.jevRequestUnits,
+            `Jev decision request failed: ${failureSummary(error)}`,
+          )
+          throw error
+        }
+        let usage: number | null
+        try {
+          usage = meter(decision.usage)
+        } catch (error) {
+          retainLedgerHold(
+            budget.ledger,
+            reservationId,
+            budget.jevRequestUnits,
+            `Jev usage meter threw: ${failureSummary(error)}`,
+          )
+          return decision
+        }
+        if (
+          usage === null ||
+          !Number.isInteger(usage) ||
+          usage < 0 ||
+          usage > budget.jevRequestUnits
+        ) {
+          retainLedgerHold(
+            budget.ledger,
+            reservationId,
+            budget.jevRequestUnits,
+            `Unmetered or out-of-range Jev usage for decision ${decision.decisionId}`,
+          )
+          return decision
+        }
+        try {
+          budget.ledger.settle(reservationId, usage)
+        } catch (error) {
+          retainLedgerHold(
+            budget.ledger,
+            reservationId,
+            budget.jevRequestUnits,
+            `Jev usage settlement failed: ${failureSummary(error)}`,
+          )
+        }
+        return decision
+      },
+    }
+  }
+
+  /**
+   * Wrap a provider to capture the normalized decision it returns for the
+   * turn. The coordinator decides before it dispatches, so the executor
+   * can record admission, decision identity, and execution intent before
+   * anything executes.
+   * @param provider - the (possibly metered) provider to wrap.
+   * @param holder - receives the decision from the turn's `decide` call.
+   * @returns a provider that captures and forwards the decision.
+   */
+  private capturingProvider(
+    provider: DecisionProvider,
+    holder: { decision?: NormalizedDecision },
+  ): DecisionProvider {
+    return {
+      decide: async (input, signal) => {
+        const decision = await provider.decide(input, signal)
+        holder.decision = decision
+        return decision
+      },
+    }
   }
 
   /**
@@ -415,7 +665,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     const inner = new ReadOnlyCoordinator({
       policy: this.config.policy,
       capabilityProfile: this.config.capabilityProfile,
-      provider: this.config.provider,
+      provider: this.meteredProvider(requestId),
       calibration: this.config.calibration,
       expectedModel: this.config.expectedModel,
       tenantId: this.config.tenantId,
@@ -556,25 +806,34 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       return
     }
     if (outcome.kind === 'completed') {
-      // The child's evidence enters the session log before the terminal
-      // event, so getEvidence can retrieve it later.
-      for (const ref of outcome.evidence) {
+      // Handoff evidence references resolve against the bundle's return
+      // contract before they are accepted: only well-formed,
+      // contract-satisfying references are recorded as passing
+      // verification evidence. Unresolved references are recorded as
+      // failed so they can never back a success claim.
+      const resolutions = resolveHandoffRefs(bundle, outcome)
+      for (const resolution of resolutions) {
         session.append('system1/verification', {
           schemaVersion: 1,
           requestId,
           checkId: 'deepseek-handoff',
-          passed: true,
-          evidence: ref,
+          passed: resolution.resolved,
+          evidence: resolution.ref,
         })
       }
+      const unresolved = resolutions.filter((resolution) => !resolution.resolved)
       finalizeTerminal({
         session,
         requestId,
         outcome: 'escalated',
         summary:
-          `Escalated to DeepSeek; child returned ${outcome.artifacts.length} ` +
-          `artifact(s) and ${outcome.evidence.length} evidence ref(s), ` +
-          `settling ${outcome.actualUnits} units`,
+          unresolved.length === 0
+            ? `Escalated to DeepSeek; child returned ${outcome.artifacts.length} ` +
+              `artifact(s) and ${outcome.evidence.length} evidence ref(s), ` +
+              `settling ${outcome.actualUnits} units`
+            : `Escalated to DeepSeek with ${unresolved.length} unresolved evidence ref(s): ` +
+              `${unresolved.map((resolution) => resolution.reason ?? resolution.ref).join('; ')}; ` +
+              `settling ${outcome.actualUnits} units`,
         verifiedBy: [],
         verifications: [],
       })
@@ -592,16 +851,25 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
 
   /**
    * Dispatch an admitted candidate through the coordinator's scoped tool
-   * runtime and materialize the execution outcome.
+   * runtime and materialize the execution outcome. With a budget config,
+   * the call reserves `toolCallUnits` before the tool runs and settles
+   * the full reservation when the tool executes — host-observed tool
+   * execution is the usage measure. A tool failure or a mid-call abort
+   * retains the reservation as a reconciliation hold instead of releasing
+   * it free; the hold releases only when the tool never ran.
    * @param coordinator - the coordinator whose scoped tools run the call.
+   * @param requestId - the workflow request id owning the turn.
    * @param candidate - the admitted candidate to dispatch.
+   * @param decision - the captured provider decision the candidate was admitted under.
    * @param signal - abort signal for the tool execution.
    * @returns the execution outcome and, on success, the verification
    * context built from the real tool result.
    */
   private async dispatch(
     coordinator: System1CoordinatorAgent,
+    requestId: ReturnType<typeof System1RequestId>,
     candidate: Candidate,
+    decision: NormalizedDecision,
     signal: AbortSignal,
   ): Promise<{ outcome: ExecutionOutcome; verification?: ToolVerificationContext }> {
     // Defense in depth: the coordinator already filtered the menu to
@@ -620,17 +888,82 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         operationRef: candidate.operationRef,
       })
     }
+    const session = coordinator.session
+    // Durable pre-dispatch evidence: admission, decision identity, the
+    // approved operation/argument digest, the attempt, and execution
+    // intent are all recorded before the tool runs.
+    const argsJson = serializeArguments(call.arguments)
+    recordDispatchPlan(session, {
+      requestId,
+      candidate,
+      decision,
+      callName: call.name,
+      argsJson,
+      expectedModel: this.config.expectedModel,
+    })
+    const budget = this.config.budget
+    // The tool call id is minted before the reservation so the budget
+    // reservation links to the stable operation id of this exact call.
     const newCallId =
       this.config.newCallId ??
       (() => ToolCallId(`call-${Date.now()}-${Math.random().toString(36).slice(2)}`))
     const callId = newCallId()
-    const result = await coordinator.ctx.tools.execute({
-      callId,
-      name: call.name,
-      arguments: call.arguments,
-      agent: coordinator,
-      signal,
-    })
+    let reservationId: string | undefined
+    if (budget !== undefined) {
+      try {
+        reservationId = budget.ledger.reserve(
+          this.config.tenantId,
+          budget.poolName,
+          callId,
+          budget.toolCallUnits,
+          budget.deadlineAt,
+        ).reservationId
+      } catch (error) {
+        throw system1Error(
+          'BUDGET_EXHAUSTED',
+          `Tool call budget reservation failed: ${failureSummary(error)}`,
+          { requestId, candidateId: candidate.id },
+        )
+      }
+    }
+    const settleTool = (): void => {
+      if (budget === undefined || reservationId === undefined) return
+      try {
+        budget.ledger.settle(reservationId, budget.toolCallUnits)
+      } catch (error) {
+        retainLedgerHold(
+          budget.ledger,
+          reservationId,
+          budget.toolCallUnits,
+          `Tool call settlement failed: ${failureSummary(error)}`,
+        )
+      }
+    }
+    // The tool may have run before throwing: retain the reservation as a
+    // hold instead of releasing it free.
+    const result = await coordinator.ctx.tools
+      .execute({
+        callId,
+        name: call.name,
+        arguments: call.arguments,
+        agent: coordinator,
+        signal,
+      })
+      .catch((error: unknown) => {
+        if (budget !== undefined && reservationId !== undefined) {
+          retainLedgerHold(
+            budget.ledger,
+            reservationId,
+            budget.toolCallUnits,
+            `Tool call threw: ${failureSummary(error)}`,
+          )
+        }
+        throw error
+      })
+    // The tool executed (error or not): its spend is real. A tool-level
+    // error return still ran the call, so it settles; only a throw above
+    // leaves spend uncertain.
+    settleTool()
     if (result.isError) {
       return {
         outcome: {
@@ -641,9 +974,35 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       }
     }
     const receiptRef = `tool-call:${callId}`
+    // Durable evidence: the tool call and the real sanitized tool result
+    // enter the session log before verification, so the verifier and the
+    // finalizer both resolve stored records. Oversized results spill by
+    // reference through the coordinator context's spill store when one is
+    // loaded; the store is best-effort and the inline evidence stays
+    // bounded either way.
+    const { turn, step } = nextToolStep(session)
+    const spillStore: EvidenceSpillStore | undefined =
+      coordinator.ctx.get('spillStore') ?? undefined
+    const { evidenceHash, spilled } = await recordToolEvidence(session, {
+      turn,
+      step,
+      callId,
+      name: call.name,
+      argsJson,
+      result,
+      ...(spillStore === undefined
+        ? {}
+        : { spill: { store: spillStore, tenantId: this.config.tenantId } }),
+    })
     return {
       outcome: { kind: 'succeeded', receiptRef, evidenceRefs: [receiptRef] },
-      verification: { candidate, result, receiptRef },
+      verification: {
+        candidate,
+        result,
+        receiptRef,
+        evidenceHash,
+        ...(spilled === undefined ? {} : { spilled }),
+      },
     }
   }
 }
@@ -692,4 +1051,70 @@ function messageText(message: UserMessage): string {
 function failureSummary(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+/**
+ * Default Jev usage meter: input tokens plus output tokens. A null
+ * count means the provider did not report that side, so usage is
+ * unknown and the reservation is retained as a hold — never settled
+ * at 0. The counts come from the provider adapter's transport
+ * telemetry (host-observed), never from model content.
+ * @param usage - the provider-reported token usage.
+ * @returns total tokens as whole units, or null when unmetered.
+ */
+function defaultJevMeter(usage: {
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+}): number | null {
+  if (usage.inputTokens === null || usage.outputTokens === null) return null
+  return usage.inputTokens + usage.outputTokens
+}
+
+/**
+ * Retain a reservation as a reconciliation hold. Best-effort: ledgers
+ * without explicit hold support leave the reservation active, which is
+ * itself a hold until settled or released by reconciliation.
+ * @param ledger - the budget ledger.
+ * @param reservationId - the live reservation.
+ * @param claimedUnits - advisory claimed usage.
+ * @param reason - why the spend is uncertain.
+ */
+function retainLedgerHold(
+  ledger: HandoffBudgetLedger,
+  reservationId: string,
+  claimedUnits: number,
+  reason: string,
+): void {
+  try {
+    ledger.holdForReconciliation?.(reservationId, claimedUnits, reason)
+  } catch {
+    // The reservation stays active as an implicit hold.
+  }
+}
+
+/**
+ * Validate the driver budget config at construction: misconfiguration
+ * fails loud, never silently runs unmetered.
+ * @param budget - the budget config to validate.
+ * @throws an Error describing the first violation.
+ */
+function validateBudgetConfig(budget: DriverBudgetConfig): void {
+  if (!budget.poolName) {
+    throw new Error('system1 misconfiguration: budget.poolName must be a non-empty pool name')
+  }
+  for (const [field, value] of [
+    ['jevRequestUnits', budget.jevRequestUnits],
+    ['toolCallUnits', budget.toolCallUnits],
+  ] as const) {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(
+        `system1 misconfiguration: budget.${field} must be a positive integer, got ${value}`,
+      )
+    }
+  }
+  if (budget.deadlineAt !== undefined && !Number.isFinite(budget.deadlineAt)) {
+    throw new Error(
+      `system1 misconfiguration: budget.deadlineAt must be a finite timestamp, got ${budget.deadlineAt}`,
+    )
+  }
 }
