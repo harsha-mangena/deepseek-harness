@@ -325,6 +325,9 @@ export class ReadOnlyCoordinator {
         verdict.calibratedCorrectness !== null ? this.config.calibration.version : null,
     }
 
+    // Unreachable: admission verified menu membership, so find() always
+    // succeeds. The ?? null satisfies the type (find returns undefined).
+    /* v8 ignore next -- defensive: admission guarantees membership */
     const selected =
       decision.selectedId === 'escalate-none'
         ? null

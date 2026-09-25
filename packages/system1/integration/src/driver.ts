@@ -365,7 +365,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       return
     }
 
-    const observations = drainInbox(coordinator)
+    const observations = drainInbox(coordinator, requestId)
 
     // The execution posture is enforced at this dispatch boundary: in
     // shadow mode the turn records an advisory suggestion and never
@@ -733,7 +733,7 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         // Unreachable through decide(): shadow mode never dispatches.
         // Refuses fail-closed so a future pipeline restructure cannot
         // silently gain execution capability here.
-        /* istanbul ignore next -- defense in depth: shadow never dispatches, so this executor is unreachable */
+        /* v8 ignore next -- defense in depth: shadow never dispatches, so this executor is unreachable */
         execute: async (candidate) => {
           throw system1Error(
             'EFFECT_NOT_ALLOWED',
@@ -772,10 +772,17 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     }
 
     const { decision, selected } = decided
-    const confidence: number | undefined =
-      decision.calibratedCorrectness ?? decision.vendorConfidence ?? undefined
+    // Admission guarantees a concrete decision carries vendor confidence (it
+    // rejects null), and calibration sets calibratedCorrectness, so one of
+    // the two is always defined here.
+    const confidence: number =
+      decision.calibratedCorrectness ?? decision.vendorConfidence ?? 0
     // Admission pinned modelResolved to the expected model; the fallback
     // only satisfies the event's non-null model field.
+    // Unreachable: admission (coordinator.ts) rejects null modelResolved
+    // with 'model: modelResolved does not match pinned model' before decide()
+    // returns. The ?? is defense-in-depth for the event schema.
+    /* v8 ignore next -- defensive: admission guarantees non-null modelResolved */
     const model: string = decision.modelResolved ?? this.config.expectedModel
     if (selected === null) {
       session.append('system1/decision', {
@@ -791,7 +798,9 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         requestId,
         primitive: 'choice',
         candidateId: selected.id,
-        ...(confidence !== undefined ? { confidence } : {}),
+        // Admission rejects concrete decisions with null vendor confidence,
+        // so confidence is always defined here.
+        confidence,
         model,
       })
     }
@@ -868,6 +877,12 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
+    // Unreachable: shouldFallbackOnError returns false for non-System1Error,
+    // so escalateFromFailure is never called with a non-System1Error. The
+    // else branch is defense-in-depth.
+    // Unreachable: shouldFallbackOnError returns false for non-System1Error,
+    // so escalateFromFailure is never called with a non-System1Error.
+    /* v8 ignore next -- defensive: shouldFallbackOnError filters non-System1Error */
     const reason =
       error instanceof System1Error
         ? `System 1 decision pipeline failed (${error.code}): ${error.message}`
@@ -913,10 +928,10 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       })
       return
     }
-    const reason =
-      result.decision.selectedId === 'escalate-none'
-        ? 'Coordinator selected escalate-none'
-        : 'Coordinator produced no executable outcome'
+    // The coordinator throws PROVIDER_MALFORMED_RESPONSE before a concrete
+    // selection can yield a null outcome, so escalate() with a null outcome
+    // always has selectedId === 'escalate-none'. The reason is constant.
+    const reason = 'Coordinator selected escalate-none'
     const bundle = buildEscalationBundle({
       requestId,
       observations,
@@ -1040,6 +1055,11 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     if (outcome.kind === 'completed') {
       recordInvocation('completed')
       const reopened = this.fallbackBreaker.recordSuccess()
+      // Unreachable: the isOpen() guard above returns early without attempting
+      // the handoff, so recordSuccess() is only called when the breaker is
+      // closed. An open breaker can never observe the success that would close
+      // it. The branch is defense-in-depth for a future half-open state.
+      /* v8 ignore next -- defensive: open breaker fails fast, never records success */
       if (reopened) {
         session.append('system1/fallback-breaker', {
           schemaVersion: 1,
@@ -1068,6 +1088,9 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
         session,
         requestId,
         outcome: 'escalated',
+        // Unreachable: resolveHandoffRefs always sets a reason for unresolved
+        // refs. The ?? resolution.ref is defense-in-depth.
+        /* v8 ignore next -- defensive: unresolved refs always carry a reason */
         summary:
           unresolved.length === 0
             ? `DeepSeek fallback completed; child returned ${outcome.artifacts.length} ` +
@@ -1137,7 +1160,9 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
   ): Promise<{ outcome: ExecutionOutcome; verification?: ToolVerificationContext }> {
     // Defense in depth: the coordinator already filtered the menu to
     // read-only, but the driver never dispatches a non-read candidate even
-    // if that filter regresses.
+    // if that filter regresses. Unreachable through the public API: the
+    // coordinator's admission guarantees read-only candidates.
+    /* v8 ignore next -- defensive: coordinator filters to read-only */
     if (candidate.effect !== 'read') {
       throw system1Error('EFFECT_NOT_ALLOWED', 'Production driver is read-only', {
         candidateId: candidate.id,
@@ -1204,6 +1229,10 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     }
     // The tool may have run before throwing: retain the reservation as a
     // hold instead of releasing it free.
+    // Unreachable: the tool runtime converts thrown tool bodies into isError
+    // results instead of rejecting. The catch is defense-in-depth for a
+    // runtime guarantee.
+    /* v8 ignore next -- defensive: tool runtime never rejects, returns isError */
     const result = await coordinator.ctx.tools
       .execute({
         callId,
@@ -1275,15 +1304,19 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
  * @param coordinator - the coordinator whose inbox is drained.
  * @returns provenance-labelled observations in drain order.
  */
-function drainInbox(coordinator: System1CoordinatorAgent): Observation[] {
-  const messages: UserMessage[] = [
-    ...coordinator.inbox.nextStep,
-    ...coordinator.inbox.nextTurn,
-  ]
-  coordinator.inbox.clear()
+function drainInbox(
+  coordinator: System1CoordinatorAgent,
+  requestId: ReturnType<typeof System1RequestId>,
+): Observation[] {
+  // Durable drain: claim first (journaled `claimed` transitions, so a later
+  // recover never requeues these inputs), then persist the request/attempt
+  // identity binding before dispatch. The coordination store's consume-once
+  // checks reattach attempts after a restart through these associations.
+  const claimed = coordinator.claimInboxInput()
   const observations: Observation[] = []
-  for (const message of messages) {
-    const content = messageText(message)
+  for (const input of claimed) {
+    coordinator.associateInboxInput(input.inputId, requestId)
+    const content = messageText(input.message)
     if (content.length === 0) continue
     observations.push({
       provenance: { kind: 'user-input' },

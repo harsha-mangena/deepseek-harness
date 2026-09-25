@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "outDir": "lib/types",
+    "composite": false,
+    "rootDir": "../../../.."
+  },
+  "extends": "../../../tsconfig.base.json",
+  "include": [
+    "tests"
+  ],
+  "references": [
+    {
+      "path": "../../../vendor/cosmokit"
+    },
+    {
+      "path": "../../../vendor/cordis"
+    },
+    {
+      "path": "../../../vendor/schemastery"
+    },
+    {
+      "path": "../../../vendor/loader"
+    },
+    {
+      "path": "../../../vendor/include"
+    }
+  ]
+}

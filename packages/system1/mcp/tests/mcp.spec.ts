@@ -884,3 +884,23 @@ describe('validateJsonSchemaArgs', () => {
     expect(violations[0]).toMatch(/tags\[1\]/)
   })
 })
+
+describe('json-schema coverage gaps', () => {
+  it('skips known properties when validating schema-valued additionalProperties', () => {
+    // 'count' is in `known` (declared in properties), so the `!(key in known)`
+    // branch takes the false path for it and the true path for 'note'.
+    const schema = {
+      type: 'object',
+      properties: { count: { type: 'integer' } },
+      additionalProperties: { type: 'string' },
+    }
+    expect(validateJsonSchemaArgs(schema, { count: 2, note: 'ok' })).toEqual([])
+    expect(validateJsonSchemaArgs(schema, { count: 2, note: 7 })).toHaveLength(1)
+  })
+
+  it('rejects non-record additionalProperties forms', () => {
+    expect(
+      validateJsonSchemaArgs({ type: 'object', additionalProperties: 'invalid' }, { a: 1 }),
+    ).toEqual(['$: unsupported additionalProperties form'])
+  })
+})

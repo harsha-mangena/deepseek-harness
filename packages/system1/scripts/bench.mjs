@@ -41,7 +41,7 @@ function packageNameFor(absFile) {
 
 function gitRevision() {
   return new Promise((resolveRev) => {
-    execFile('git', ['rev-parse', '--short', 'HEAD'], { cwd: root }, (error, stdout) => {
+    execFile('git', ['rev-parse', 'HEAD'], { cwd: root }, (error, stdout) => {
       resolveRev(error ? null : stdout.trim())
     })
   })

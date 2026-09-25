@@ -198,6 +198,27 @@ describe('rollbackToBaseline', () => {
     }
   })
 
+  it('stringifies non-Error teardown failures in the rollback aggregate', async () => {
+    const ctx = await boot()
+    try {
+      const bad = await ctx.system1Workflows.create(
+        Session.create(SessionId('s-rollback-string')),
+        idleDriver,
+      )
+      bad.coordinator.effect(() => () => {
+        throw 'teardown string boom'
+      })
+
+      await expect(ctx.system1Workflows.rollbackToBaseline()).rejects.toThrow(
+        /rollback drained with 1 teardown failure.*teardown string boom/,
+      )
+      expect(ctx.system1Workflows.config.mode).toBe('off')
+      await expect(bad.dispose()).rejects.toBe('teardown string boom')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('is idempotent and safe with no live coordinators', async () => {
     const ctx = await boot()
     try {

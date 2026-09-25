@@ -128,12 +128,11 @@ export function printSmokeDecision(decision: NormalizedDecision): void {
  * @param env - environment mapping (process.env in production).
  * @returns 0 on success, 1 on a live failure, 2 when skipped for no key.
  */
-export async function runSmoke(env: NodeJS.ProcessEnv): Promise<number> {
-  const config = resolveSmokeConfig(env)
-  if (config === null) {
-    console.error(`skipped: no credentials (${SMOKE_API_KEY_ENV} is not set)`)
-    return 2
-  }
+/**
+ * Run the live smoke against the TypeSafe API.
+ * In tests, the JevDecisionProvider is mocked; no network calls are made.
+ */
+async function runLiveSmoke(config: SmokeConfig): Promise<number> {
   const provider = new JevDecisionProvider({
     apiKey: config.apiKey,
     model: config.model,
@@ -153,11 +152,22 @@ export async function runSmoke(env: NodeJS.ProcessEnv): Promise<number> {
   }
 }
 
+export async function runSmoke(env: NodeJS.ProcessEnv): Promise<number> {
+  const config = resolveSmokeConfig(env)
+  if (config === null) {
+    console.error(`skipped: no credentials (${SMOKE_API_KEY_ENV} is not set)`)
+    return 2
+  }
+  return runLiveSmoke(config)
+}
+
 /** CLI entry: exit with the smoke run's code. */
+/* v8 ignore next -- CLI entry point; requires a live TYPESAFE_API_KEY via process.env */
 async function main(): Promise<void> {
   process.exitCode = await runSmoke(process.env)
 }
 
+/* v8 ignore next -- CLI guard; only runs when invoked directly as a script */
 if (
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href

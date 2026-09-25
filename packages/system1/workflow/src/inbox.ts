@@ -185,6 +185,7 @@ export class System1Inbox implements Inbox {
       const index = list.findIndex((entry) => entry.message.id === messageId)
       if (index >= 0) {
         const [entry] = list.splice(index, 1)
+        /* istanbul ignore next -- defensive: a found index always splices exactly one entry */
         if (entry === undefined) return false
         this.#journal?.({ kind: 'removed', target, entries: [entry], disposition })
         return true

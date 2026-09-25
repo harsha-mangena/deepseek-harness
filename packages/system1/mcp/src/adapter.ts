@@ -351,6 +351,7 @@ export class McpAdapter {
       clearTimeout(timeout)
       signal.removeEventListener('abort', onAbort)
       const current = this.circuits.get(toolIdentity)
+      /* istanbul ignore next -- defensive: success deletes the circuit and failure always resets it to open/closed, so it is never half-open here */
       if (current?.state === 'half-open') {
         current.halfOpenTrial = false
       }

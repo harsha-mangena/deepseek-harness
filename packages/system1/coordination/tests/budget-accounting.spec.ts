@@ -352,3 +352,20 @@ describe('restarted executions', () => {
     expect(store.getReservation('res-000001').status).toBe('held')
   })
 })
+
+describe('unknown reservations', () => {
+  it('rejects settlement of an unknown reservation', () => {
+    store = makeStore()
+    expect(() => store!.settle('reservation:does-not-exist', 10)).toThrow(/Unknown reservation/)
+  })
+
+  it('rejects release of an unknown reservation', () => {
+    store = makeStore()
+    expect(() => store!.release('reservation:does-not-exist')).toThrow(/Unknown reservation/)
+  })
+
+  it('rejects reconcileHold of an unknown reservation', () => {
+    store = makeStore()
+    expect(() => store!.reconcileHold('reservation:does-not-exist', 10)).toThrow(/Unknown reservation/)
+  })
+})

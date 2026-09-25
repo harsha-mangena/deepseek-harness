@@ -16,7 +16,9 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 import {
   System1Inbox,
+  System1RequestId,
   System1Workflows,
+  newSystem1InputId,
   type CoordinatorDriver,
 } from '@deepseek-ai/dsh-system1-workflow'
 
@@ -334,8 +336,128 @@ describe('system1 coordinator input seams', () => {
   })
 })
 
-describe('system1 service disposal seams', () => {
-  it('applies defaults on direct construction without Cordis config resolution', async () => {
+describe('system1 coordinator coverage seams', () => {
+  it('runs an effect disposer twice but untracks it once', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(Session.create(SessionId('s-effect-twice')), idleDriver)
+      try {
+        const order: string[] = []
+        const disposer = handle.coordinator.effect(() => () => { order.push('ran') })
+        disposer()
+        // The second call takes the idempotent untrack path; the Cordis
+        // disposer itself runs only once.
+        disposer()
+        expect(order).toEqual(['ran'])
+        await handle.coordinator.dispose()
+        // Already untracked: disposal must not run it again.
+        expect(order).toEqual(['ran'])
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('tolerates an effect disposer invoked after disposal unwound the registry', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(Session.create(SessionId('s-effect-late')), idleDriver)
+      const order: string[] = []
+      const disposer = handle.coordinator.effect(() => () => { order.push('late') })
+      await handle.coordinator.dispose()
+      expect(order).toEqual(['late'])
+      // The tracked list was spliced by disposal, so untracking finds
+      // nothing to remove; the already-run disposer stays silent.
+      disposer()
+      expect(order).toEqual(['late'])
+      await handle.dispose()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects lifecycle entry points once disposed', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(Session.create(SessionId('s-disposed-entry')), idleDriver)
+      await handle.dispose()
+      expect(() => handle.coordinator.recover()).toThrow(/is disposed/)
+      expect(() => handle.coordinator.claimInboxInput()).toThrow(/is disposed/)
+      expect(() => handle.coordinator.associateInboxInput(newSystem1InputId(), System1RequestId('r-late'))).toThrow(/is disposed/)
+      await expect(handle.coordinator.delegate(1, 0, async () => {})).rejects.toThrow(/is disposed/)
+      expect(() => handle.coordinator.bindLeaseAuthority(undefined)).toThrow(/is disposed/)
+      expect(() => handle.coordinator.runMaintenance(async () => 'late')).toThrow(/is disposed/)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('waits for delegated work in whenIdle', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(Session.create(SessionId('s-delegated-idle')), idleDriver)
+      try {
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        const delegated = handle.coordinator.delegate(1, 0, async () => { await gate })
+        const idle = handle.coordinator.whenIdle()
+        let settled = false
+        void idle.then(() => { settled = true })
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        release()
+        await delegated
+        await idle
+        expect(settled).toBe(true)
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('aborts in-flight delegated work on dispose', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(Session.create(SessionId('s-delegated-dispose')), idleDriver)
+      let aborted = false
+      const delegated = handle.coordinator.delegate(1, 0, async (signal) => {
+        if (signal.aborted) {
+          aborted = true
+          return
+        }
+        await new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => {
+            aborted = true
+            resolve()
+          }, { once: true })
+        })
+      })
+      await handle.coordinator.dispose()
+      await delegated
+      expect(aborted).toBe(true)
+      await handle.dispose()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('skips the removal journal when a splice removes nothing', () => {
+    const journaled: string[] = []
+    const inbox = new System1Inbox((event) => { journaled.push(event.kind) })
+    inbox.append('next-step', userMessage('a'))
+    journaled.length = 0
+    const removed = inbox.splice('next-step', 0, 0, [])
+    expect(removed).toHaveLength(0)
+    expect(inbox.nextStep).toHaveLength(1)
+    expect(journaled).toHaveLength(0)
+  })
+})
+
+describe('system1 service disposal seams', () => {  it('applies defaults on direct construction without Cordis config resolution', async () => {
     const ctx = new Context()
     await ctx.plugin(AgentRegistry)
     try {

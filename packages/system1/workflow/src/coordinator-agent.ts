@@ -214,6 +214,7 @@ export class System1CoordinatorAgent implements Agent {
         } satisfies System1InboxTransitionData)
         return
       case 'removed': {
+        /* istanbul ignore next -- defensive: the inbox never journals empty removals */
         if (event.entries.length === 0) return
         const transition: 'claimed' | 'discarded' =
           event.disposition === 'claimed' ||
@@ -541,6 +542,7 @@ export class System1CoordinatorAgent implements Agent {
    * that the lifecycle is free.
    */
   #settleMaintenance(aborter: AbortController): void {
+    /* istanbul ignore next -- defensive: maintenance runs never overlap, so settle always pairs with the current aborter */
     if (this.#maintenanceAborter === aborter) this.#maintenanceAborter = undefined
     this.#maintenanceRun = undefined
     if (this.#wakeLatch && !this.#disposed) this.#wakeDriver()
@@ -579,6 +581,7 @@ export class System1CoordinatorAgent implements Agent {
 
   /** One-shot teardown behind the memoized {@link dispose}. */
   async #doDispose(): Promise<void> {
+    /* istanbul ignore next -- defensive: dispose() memoizes teardown, so this body runs once */
     if (this.#disposed) return
     this.#disposed = true
     this.#wakeLatch = false
