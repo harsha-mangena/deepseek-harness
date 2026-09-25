@@ -24,6 +24,7 @@ calibration data, no load/chaos testing, and no production deployment.
 | C — durable state, authoritative accounting, persisted evidence | `9bc95eb` | `9bc95eb6f3c3fa1c497e055cfafc7eb60b7cb33b` |
 | D — supported composition and bounded DeepSeek fallback | `6e6d5ea` | `6e6d5ea64ff77fdb35456fb11725b9e9a029e555` |
 | E — evaluation and release evidence | `83501e7` | `83501e772a8f1e41738dcde2bc5d0e76673c007b` |
+| E (cert SHA record) | `0d0210f` | `0d0210feda26d78115de146e6c1218decfc8a17c` |
 
 ## Finding → commit → test matrix
 
