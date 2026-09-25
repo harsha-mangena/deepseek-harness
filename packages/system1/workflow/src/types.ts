@@ -57,6 +57,22 @@ export interface ResolvedSystem1WorkflowConfig {
 }
 
 /**
+ * Checks fencing tokens against the live lease authority backing a
+ * coordinator's delegations. An implementation consults the current lease
+ * (for example the coordination store's lease table) and throws when the
+ * presented token is stale or unknown, so an old token is never mistaken
+ * for the current holder.
+ */
+export interface LeaseAuthority {
+  /**
+   * Verify a fencing token against the current lease.
+   * @param fencingToken - token presented by the delegating caller.
+   * @throws when the token is stale or unknown to the authority.
+   */
+  checkFencingToken(fencingToken: number): void
+}
+
+/**
  * Owned lifecycle for one coordinator: drains the driver, unwinds the
  * coordinator's owned effects, then unregisters the agent. Session
  * detachment stays with the session store; the handle never closes a

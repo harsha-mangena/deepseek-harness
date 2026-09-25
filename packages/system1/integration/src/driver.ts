@@ -8,6 +8,12 @@
  * runtime, verify the real tool result, and record the outcome with the
  * shipped `finalizeTerminal` finalizer.
  *
+ * Execution posture is fixed at construction via {@link ProductionDriverConfig.mode},
+ * threaded from the workflow plugin's resolved mode. In `shadow` mode the
+ * driver runs the decision pipeline only: it records the decision as an
+ * advisory `system1/decision` suggestion event and never dispatches a tool
+ * or spawns a handoff worker — the baseline DeepSeek path owns execution.
+ *
  * Fail-closed: admission failures, policy denials, provider errors,
  * unresolvable tool mappings, tool failures, failed verification, and
  * aborts all end the turn without dispatching. Nothing ever executes on an
@@ -32,6 +38,7 @@ import type {
   PolicyEngine,
 } from '@deepseek-ai/dsh-system1-policy'
 import type { IsotonicCalibration } from '@deepseek-ai/dsh-system1-calibration'
+import type { Session } from '@deepseek-ai/dsh-session'
 import {
   finalizeTerminal,
   System1RequestId,
@@ -43,6 +50,7 @@ import type {
   HandoffHandler,
   HandoffOutcome,
   System1CoordinatorAgent,
+  System1Mode,
 } from '@deepseek-ai/dsh-system1-workflow'
 import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
 import type { TextBlock, UserMessage } from '@deepseek-ai/dsh-llm/types'
@@ -118,6 +126,15 @@ export function buildEscalationBundle(input: EscalationBundleInput): HandoffBund
 
 /** Production driver configuration. */
 export interface ProductionDriverConfig {
+  /**
+   * Execution posture for this driver instance. Thread the workflow
+   * plugin's resolved mode here (`workflows.config.mode`); the driver
+   * never reads ambient plugin state. `shadow` records advisory
+   * suggestions with no execution capability; `enforce` dispatches
+   * admitted decisions. `off` is rejected: while the plugin is off,
+   * coordinator creation is refused and no driver should be constructed.
+   */
+  readonly mode: System1Mode
   readonly policy: PolicyEngine
   readonly capabilityProfile: CapabilityProfile
   /** Jev decision provider; only the HTTP boundary is mocked in tests. */
@@ -126,7 +143,12 @@ export interface ProductionDriverConfig {
   readonly calibration: IsotonicCalibration
   /** Pinned model id; the decision's modelResolved must match exactly. */
   readonly expectedModel: string
-  /** Tenant id used for policy evaluation. Never defaults. */
+  /**
+   * Authenticated tenant identity from admission, for policy evaluation.
+   * Never defaults. The capability profile must be issued to this same
+   * tenant; the engine rejects any mismatch (`TENANT_MISMATCH`) at the
+   * authoritative dispatch decision, before effects, routes, or guards.
+   */
   readonly tenantId: string
   /** Minimum calibrated correctness for execution. Defaults to 0.5. */
   readonly minCalibratedConfidence?: number
@@ -172,9 +194,20 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
 
   /**
    * @param config - driver configuration.
-   * @throws when tenantId or expectedModel is missing.
+   * @throws when mode, tenantId, or expectedModel is missing, or when
+   * mode is `off`.
    */
   constructor(config: ProductionDriverConfig) {
+    if (config.mode === undefined) {
+      throw system1Error('INVALID_CONFIG', 'Production driver requires an explicit mode', {})
+    }
+    if (config.mode === 'off') {
+      throw system1Error(
+        'INVALID_CONFIG',
+        'Production driver cannot run with mode "off"; do not construct a System 1 driver while the workflow plugin is off',
+        {},
+      )
+    }
     if (!config.tenantId) {
       throw system1Error('INVALID_CONFIG', 'Production driver requires an explicit tenantId', {})
     }
@@ -205,7 +238,9 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
   }
 
   /**
-   * Run one read-only turn for the coordinator.
+   * Run one read-only turn for the coordinator. In `shadow` mode the turn
+   * records an advisory suggestion and never dispatches; in `enforce`
+   * mode the admitted candidate is dispatched and verified.
    * @param coordinator - the coordinator being driven.
    * @param signal - aborts when the coordinator is cancelled or disposed.
    * @returns resolves when the turn settles; the outcome is recorded with
@@ -231,6 +266,14 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
     }
 
     const observations = drainInbox(coordinator)
+
+    // The execution posture is enforced at this dispatch boundary: in
+    // shadow mode the turn records an advisory suggestion and never
+    // dispatches, so the baseline DeepSeek path owns execution.
+    if (this.config.mode === 'shadow') {
+      await this.runShadow(coordinator, requestId, observations, signal)
+      return
+    }
 
     // The executor captures the real dispatched tool result so the driver
     // can verify fresh evidence before declaring success.
@@ -345,6 +388,116 @@ export class ReadOnlyProductionDriver implements CoordinatorDriver {
       summary: `Dispatched ${dispatched.candidate.id} (${dispatched.receiptRef})`,
       verifiedBy: [verification.checkId],
       verifications: [verification],
+    })
+  }
+
+  /**
+   * Run one shadow-mode turn: the decision pipeline runs over a bounded
+   * copy of the drained observations and the admitted decision is
+   * recorded as an advisory `system1/decision` suggestion event. The
+   * shadow path has no execution capability — the executor below refuses
+   * unconditionally (defense in depth; `decide()` never invokes it), no
+   * DeepSeek handoff worker is spawned, and nothing is dispatched. The
+   * baseline DeepSeek path owns execution.
+   * @param coordinator - the coordinator being driven.
+   * @param requestId - the workflow request for this turn.
+   * @param observations - the bounded observation copy for the turn.
+   * @param signal - aborts when the coordinator is cancelled or disposed.
+   * @returns resolves when the suggestion is recorded.
+   */
+  private async runShadow(
+    coordinator: System1CoordinatorAgent,
+    requestId: ReturnType<typeof System1RequestId>,
+    observations: readonly Observation[],
+    signal: AbortSignal,
+  ): Promise<void> {
+    const session: Session = coordinator.session
+    const inner = new ReadOnlyCoordinator({
+      policy: this.config.policy,
+      capabilityProfile: this.config.capabilityProfile,
+      provider: this.config.provider,
+      calibration: this.config.calibration,
+      expectedModel: this.config.expectedModel,
+      tenantId: this.config.tenantId,
+      ...(this.config.minCalibratedConfidence !== undefined
+        ? { minCalibratedConfidence: this.config.minCalibratedConfidence }
+        : {}),
+      executor: {
+        // Unreachable through decide(): shadow mode never dispatches.
+        // Refuses fail-closed so a future pipeline restructure cannot
+        // silently gain execution capability here.
+        /* istanbul ignore next -- defense in depth: shadow never dispatches, so this executor is unreachable */
+        execute: async (candidate) => {
+          throw system1Error(
+            'EFFECT_NOT_ALLOWED',
+            'Shadow mode never dispatches System 1 tools',
+            { candidateId: candidate.id },
+          )
+        },
+      },
+    })
+
+    let decided: Awaited<ReturnType<ReadOnlyCoordinator['decide']>>
+    try {
+      decided = await inner.decide({ observations, catalog: this.config.catalog }, signal)
+    } catch (error) {
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'failure',
+        summary: `Shadow suggestion failed: ${failureSummary(error)}`,
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+
+    if (signal.aborted) {
+      finalizeTerminal({
+        session,
+        requestId,
+        outcome: 'cancelled',
+        summary: 'Shadow turn aborted after decision',
+        verifiedBy: [],
+        verifications: [],
+      })
+      return
+    }
+
+    const { decision, selected } = decided
+    const confidence: number | undefined =
+      decision.calibratedCorrectness ?? decision.vendorConfidence ?? undefined
+    // Admission pinned modelResolved to the expected model; the fallback
+    // only satisfies the event's non-null model field.
+    const model: string = decision.modelResolved ?? this.config.expectedModel
+    if (selected === null) {
+      session.append('system1/decision', {
+        schemaVersion: 1,
+        requestId,
+        primitive: 'noul',
+        noulReason: 'escalate-none: advisory suggestion only; baseline DeepSeek path owns execution',
+        model,
+      })
+    } else {
+      session.append('system1/decision', {
+        schemaVersion: 1,
+        requestId,
+        primitive: 'choice',
+        candidateId: selected.id,
+        ...(confidence !== undefined ? { confidence } : {}),
+        model,
+      })
+    }
+    finalizeTerminal({
+      session,
+      requestId,
+      outcome: 'escalated',
+      summary:
+        `Shadow mode: recorded suggestion for decision ${decision.decisionId} ` +
+        `(${selected?.id ?? 'escalate-none'}); baseline DeepSeek path owns execution; ` +
+        `no System 1 tool dispatched`,
+      verifiedBy: [],
+      verifications: [],
     })
   }
 

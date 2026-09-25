@@ -2,7 +2,7 @@
 
 import { describe, expect, it } from 'vitest'
 import { McpAdapter } from '@deepseek-ai/dsh-system1-mcp'
-import type { McpExecutor, McpToolDefinition } from '@deepseek-ai/dsh-system1-mcp'
+import type { McpDispatchTarget, McpExecutor, McpToolDefinition } from '@deepseek-ai/dsh-system1-mcp'
 import { System1Error, system1Error } from '@deepseek-ai/dsh-system1-contracts'
 import type { Candidate } from '@deepseek-ai/dsh-system1-contracts'
 import { checkSchemaSupport, validateJsonSchemaArgs } from '../src/json-schema.ts'
@@ -104,10 +104,11 @@ describe('McpAdapter', () => {
 
   it('executes candidates via MCP', async () => {
     const executor: McpExecutor = {
-      execute: async (toolName, args) => ({ toolName, args, ok: true }),
+      execute: async (target, args) => ({ toolName: target.toolName, args, ok: true }),
     }
     const adapter = new McpAdapter({ executor })
-    const candidate = testCandidate('op:mcp:read-file:v1')
+    const tool = adapter.adaptTool(readDef, 'v1')
+    const candidate = testCandidate(tool.operationRef)
     const result = await adapter.executeCandidate(candidate, { path: '/tmp' }, new AbortController().signal)
     expect(result).toEqual({ toolName: 'read-file', args: { path: '/tmp' }, ok: true })
   })
@@ -116,20 +117,170 @@ describe('McpAdapter', () => {
     let seenName: string | null = null
     const adapter = new McpAdapter({
       executor: {
-        execute: async (toolName) => {
-          seenName = toolName
+        execute: async (target) => {
+          seenName = target.toolName
           return 'ok'
         },
       },
     })
     const tool = adapter.adaptTool(readDef, 'verify:read:v1', { serverId: 'github', catalogVersion: 'c7' })
     const result = await adapter.executeCandidate(
-      testCandidate(tool.operationRef),
+      testCandidate(tool.operationRef, 'read', 'verify:read:v1'),
       {},
       new AbortController().signal,
     )
     expect(result).toBe('ok')
     expect(seenName).toBe('read-file')
+  })
+
+  it('delivers the bound server identity to the executor', async () => {
+    let seen: McpDispatchTarget | null = null
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async (target) => {
+          seen = target
+          return 'ok'
+        },
+      },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1', { serverId: 'github', catalogVersion: 'c7' })
+    await adapter.executeCandidate(
+      testCandidate(tool.operationRef, 'read', 'verify:read:v1'),
+      {},
+      new AbortController().signal,
+    )
+    expect(seen).toMatchObject({
+      toolName: 'read-file',
+      toolIdentity: 'mcp:github:read-file',
+      serverId: 'github',
+      catalogVersion: 'c7',
+    })
+  })
+
+  it('rejects unregistered operationRefs with zero executor calls', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'ran'
+        },
+      },
+    })
+    const candidate = testCandidate('op:mcp:never-adapted:v1')
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, {}, new AbortController().signal),
+      'CANDIDATE_NOT_ADMISSIBLE',
+    )
+    expect(executed).toBe(false)
+  })
+
+  it('rejects candidates whose effect or verifier no longer matches the adapted tool', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'ran'
+        },
+      },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1')
+    const signal = (): AbortSignal => new AbortController().signal
+    await rejectedWithCode(
+      adapter.executeCandidate(
+        testCandidate(tool.operationRef, 'write', 'verify:read:v1'),
+        {},
+        signal(),
+      ),
+      'CANDIDATE_NOT_ADMISSIBLE',
+    )
+    await rejectedWithCode(
+      adapter.executeCandidate(
+        testCandidate(tool.operationRef, 'read', 'verify:other:v9'),
+        {},
+        signal(),
+      ),
+      'CANDIDATE_NOT_ADMISSIBLE',
+    )
+    expect(executed).toBe(false)
+  })
+
+  it('validates nested properties without a redundant type keyword', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'ran'
+        },
+      },
+    })
+    const tool = adapter.adaptTool(
+      {
+        name: 'read',
+        description: 'read',
+        mutates: false,
+        inputSchema: { type: 'object', properties: { filters: { properties: { repo: { type: 'string' } } } } },
+      },
+      'v',
+    )
+    const candidate = testCandidate(tool.operationRef, 'read', 'v')
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, { filters: { repo: 42 } }, new AbortController().signal),
+      'SCHEMA_VALIDATION_FAILED',
+    )
+    expect(executed).toBe(false)
+    // A matching nested value still dispatches.
+    const result = await adapter.executeCandidate(
+      candidate,
+      { filters: { repo: 'deepseek-harness' } },
+      new AbortController().signal,
+    )
+    expect(result).toBe('ran')
+  })
+
+  it('enforces schema-valued additionalProperties', async () => {
+    let executed = false
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          executed = true
+          return 'ran'
+        },
+      },
+    })
+    const tool = adapter.adaptTool(
+      {
+        name: 'read',
+        description: 'read',
+        mutates: false,
+        inputSchema: { type: 'object', additionalProperties: { type: 'string' } },
+      },
+      'v',
+    )
+    const candidate = testCandidate(tool.operationRef, 'read', 'v')
+    await rejectedWithCode(
+      adapter.executeCandidate(candidate, { repo: 42 }, new AbortController().signal),
+      'SCHEMA_VALIDATION_FAILED',
+    )
+    expect(executed).toBe(false)
+    const result = await adapter.executeCandidate(
+      candidate,
+      { repo: 'deepseek-harness' },
+      new AbortController().signal,
+    )
+    expect(result).toBe('ran')
+  })
+
+  it('rejects input schemas with unsupported nested additionalProperties at adapt time', () => {
+    const adapter = new McpAdapter({ executor: { execute: async () => null } })
+    expect(() =>
+      adapter.adaptTool(
+        { ...readDef, inputSchema: { type: 'object', additionalProperties: { allOf: [] } } },
+        'verify:read:v1',
+      ),
+    ).toThrow(/cannot validate/)
   })
 
   it('rejects non-MCP candidates', async () => {
@@ -215,7 +366,7 @@ describe('McpAdapter', () => {
       },
     })
     const tool = adapter.adaptTool(ciDef, 'verify-ci')
-    const candidate = testCandidate(tool.operationRef)
+    const candidate = testCandidate(tool.operationRef, 'read', 'verify-ci')
     await rejectedWithCode(
       adapter.executeCandidate(candidate, { repo: 42 }, new AbortController().signal),
       'SCHEMA_VALIDATION_FAILED',
@@ -226,7 +377,7 @@ describe('McpAdapter', () => {
   it('R28: rejects missing required and unexpected arguments', async () => {
     const adapter = new McpAdapter({ executor: { execute: async () => 'ran' } })
     const tool = adapter.adaptTool(ciDef, 'verify-ci')
-    const candidate = testCandidate(tool.operationRef)
+    const candidate = testCandidate(tool.operationRef, 'read', 'verify-ci')
     const signal = (): AbortSignal => new AbortController().signal
     await rejectedWithCode(adapter.executeCandidate(candidate, {}, signal()), 'SCHEMA_VALIDATION_FAILED')
     await rejectedWithCode(
@@ -236,10 +387,10 @@ describe('McpAdapter', () => {
   })
 
   it('R28: dispatches arguments that satisfy the input schema', async () => {
-    const adapter = new McpAdapter({ executor: { execute: async (_tool, args) => args } })
+    const adapter = new McpAdapter({ executor: { execute: async (_target, args) => args } })
     const tool = adapter.adaptTool(ciDef, 'verify-ci')
     const result = await adapter.executeCandidate(
-      testCandidate(tool.operationRef),
+      testCandidate(tool.operationRef, 'read', 'verify-ci'),
       { repo: 'deepseek-harness' },
       new AbortController().signal,
     )
@@ -267,23 +418,8 @@ describe('McpAdapter', () => {
     expect((error as System1Error).message).toMatch(/reconcile/)
   })
 
-  it('rethrows read failures unchanged', async () => {
-    const failure = new Error('MCP down')
-    const adapter = new McpAdapter({
-      executor: {
-        execute: async () => {
-          throw failure
-        },
-      },
-    })
-    const tool = adapter.adaptTool(readDef, 'verify:read:v1')
-    await expect(
-      adapter.executeCandidate(testCandidate(tool.operationRef), {}, new AbortController().signal),
-    ).rejects.toBe(failure)
-  })
-
-  it('preserves structured errors thrown by the executor', async () => {
-    const inner = system1Error('PROVIDER_TRANSPORT_FAILED', 'client exploded')
+  it('reports typed transport failures after a mutating dispatch as unknown outcomes', async () => {
+    const inner = system1Error('PROVIDER_TIMEOUT', 'receipt lost')
     const adapter = new McpAdapter({
       executor: {
         execute: async () => {
@@ -295,6 +431,44 @@ describe('McpAdapter', () => {
     await expect(
       adapter.executeCandidate(
         testCandidate(tool.operationRef, 'write', 'verify:write:v1'),
+        {},
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: 'EXECUTION_UNKNOWN' })
+  })
+
+  it('rethrows read failures unchanged', async () => {
+    const failure = new Error('MCP down')
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          throw failure
+        },
+      },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1')
+    await expect(
+      adapter.executeCandidate(
+        testCandidate(tool.operationRef, 'read', 'verify:read:v1'),
+        {},
+        new AbortController().signal,
+      ),
+    ).rejects.toBe(failure)
+  })
+
+  it('preserves structured errors thrown by the executor on read calls', async () => {
+    const inner = system1Error('PROVIDER_TRANSPORT_FAILED', 'client exploded')
+    const adapter = new McpAdapter({
+      executor: {
+        execute: async () => {
+          throw inner
+        },
+      },
+    })
+    const tool = adapter.adaptTool(readDef, 'verify:read:v1')
+    await expect(
+      adapter.executeCandidate(
+        testCandidate(tool.operationRef, 'read', 'verify:read:v1'),
         {},
         new AbortController().signal,
       ),
@@ -310,7 +484,8 @@ describe('McpAdapter', () => {
       },
     }
     const adapter = new McpAdapter({ executor, failureThreshold: 2, resetTimeoutMs: 1000 })
-    const candidate = testCandidate('op:mcp:failing-tool:v1')
+    const tool = adapter.adaptTool({ ...readDef, name: 'failing-tool' }, 'v1')
+    const candidate = testCandidate(tool.operationRef)
 
     // First failure: circuit closed.
     await expect(
@@ -347,14 +522,14 @@ describe('McpAdapter', () => {
     const signal = (): AbortSignal => new AbortController().signal
 
     await expect(
-      adapter.executeCandidate(testCandidate(toolA.operationRef), {}, signal()),
+      adapter.executeCandidate(testCandidate(toolA.operationRef, 'read', 'v'), {}, signal()),
     ).rejects.toThrow(/MCP down/)
     expect(adapter.getCircuitState('mcp:a:deploy')).toBe('open')
     // Same tool name on another server keeps its own closed circuit.
     expect(adapter.getCircuitState('mcp:b:deploy')).toBe('closed')
 
     await expect(
-      adapter.executeCandidate(testCandidate(toolB.operationRef), {}, signal()),
+      adapter.executeCandidate(testCandidate(toolB.operationRef, 'read', 'v'), {}, signal()),
     ).rejects.toThrow(/MCP down/)
     expect(calls).toBe(2)
     expect(adapter.getCircuitState('mcp:b:deploy')).toBe('open')
@@ -375,7 +550,8 @@ describe('McpAdapter', () => {
       resetTimeoutMs: 1000,
       now: () => now,
     })
-    const candidate = testCandidate('op:mcp:flaky:v1')
+    const tool = adapter.adaptTool({ ...readDef, name: 'flaky' }, 'v1')
+    const candidate = testCandidate(tool.operationRef)
 
     await expect(
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
@@ -396,10 +572,79 @@ describe('McpAdapter', () => {
     expect(adapter.getCircuitState('mcp:flaky')).toBe('closed')
   })
 
+  it('admits exactly one concurrent half-open trial', async () => {
+    let calls = 0
+    let releaseTrial!: () => void
+    const trialGate = new Promise<void>((resolve) => {
+      releaseTrial = resolve
+    })
+    const executor: McpExecutor = {
+      execute: async () => {
+        calls++
+        if (calls === 1) throw new Error('offline')
+        await trialGate
+        return 'ok'
+      },
+    }
+    let now = 0
+    const adapter = new McpAdapter({
+      executor,
+      failureThreshold: 1,
+      resetTimeoutMs: 1,
+      now: () => now,
+    })
+    const tool = adapter.adaptTool({ ...readDef, name: 'read' }, 'v')
+    const candidate = testCandidate(tool.operationRef, 'read', 'v')
+    const signal = (): AbortSignal => new AbortController().signal
+
+    await expect(adapter.executeCandidate(candidate, {}, signal())).rejects.toThrow(/offline/)
+    expect(adapter.getCircuitState('mcp:read')).toBe('open')
+
+    now = 2
+    const first = adapter.executeCandidate(candidate, {}, signal())
+    // The second concurrent call must reject without dispatching.
+    await rejectedWithCode(adapter.executeCandidate(candidate, {}, signal()), 'PROVIDER_TRANSPORT_FAILED')
+    expect(calls).toBe(2)
+    releaseTrial()
+    await expect(first).resolves.toBe('ok')
+    expect(adapter.getCircuitState('mcp:read')).toBe('closed')
+  })
+
+  it('keeps the circuit open when a half-open trial fails', async () => {
+    const executor: McpExecutor = {
+      execute: async () => {
+        throw new Error('still down')
+      },
+    }
+    let now = 0
+    const adapter = new McpAdapter({
+      executor,
+      failureThreshold: 1,
+      resetTimeoutMs: 1000,
+      now: () => now,
+    })
+    const tool = adapter.adaptTool({ ...readDef, name: 'flaky' }, 'v1')
+    const candidate = testCandidate(tool.operationRef)
+    await expect(
+      adapter.executeCandidate(candidate, {}, new AbortController().signal),
+    ).rejects.toThrow(/still down/)
+    expect(adapter.getCircuitState('mcp:flaky')).toBe('open')
+    now = 1500
+    await expect(
+      adapter.executeCandidate(candidate, {}, new AbortController().signal),
+    ).rejects.toThrow(/still down/)
+    // A failed trial reopens the circuit instead of admitting more traffic.
+    expect(adapter.getCircuitState('mcp:flaky')).toBe('open')
+    now = 1600
+    await expect(
+      adapter.executeCandidate(candidate, {}, new AbortController().signal),
+    ).rejects.toThrow(/Circuit open/)
+  })
+
   it('propagates abort to MCP execution', async () => {
     let receivedSignal: AbortSignal | null = null
     const executor: McpExecutor = {
-      execute: async (_tool, _args, signal) => {
+      execute: async (_target, _args, signal) => {
         receivedSignal = signal
         // Wait until aborted.
         await new Promise<void>((resolve, reject) => {
@@ -409,7 +654,8 @@ describe('McpAdapter', () => {
       },
     }
     const adapter = new McpAdapter({ executor })
-    const candidate = testCandidate('op:mcp:slow:v1')
+    const tool = adapter.adaptTool({ ...readDef, name: 'slow' }, 'v1')
+    const candidate = testCandidate(tool.operationRef)
     const controller = new AbortController()
 
     const promise = adapter.executeCandidate(candidate, {}, controller.signal)
@@ -423,7 +669,7 @@ describe('McpAdapter', () => {
 
   it('times out slow MCP calls', async () => {
     const executor: McpExecutor = {
-      execute: async (_tool, _args, signal) => {
+      execute: async (_target, _args, signal) => {
         // Never resolves unless aborted.
         await new Promise<void>((_resolve, reject) => {
           signal.addEventListener('abort', () => reject(new Error('timeout-aborted')), { once: true })
@@ -432,7 +678,8 @@ describe('McpAdapter', () => {
       },
     }
     const adapter = new McpAdapter({ executor, callTimeoutMs: 10 })
-    const candidate = testCandidate('op:mcp:slow:v1')
+    const tool = adapter.adaptTool({ ...readDef, name: 'slow' }, 'v1')
+    const candidate = testCandidate(tool.operationRef)
 
     await expect(
       adapter.executeCandidate(candidate, {}, new AbortController().signal),
@@ -553,6 +800,49 @@ describe('validateJsonSchemaArgs', () => {
     ).toHaveLength(1)
     expect(
       validateJsonSchemaArgs({ type: 'object', additionalProperties: false }, {}),
+    ).toEqual([])
+  })
+
+  it('applies object keywords by instance type even without a type keyword', () => {
+    const schema = { properties: { filters: { properties: { repo: { type: 'string' } } } } }
+    expect(validateJsonSchemaArgs(schema, { filters: { repo: 'x' } })).toEqual([])
+    const violations = validateJsonSchemaArgs(schema, { filters: { repo: 42 } })
+    expect(violations).toHaveLength(1)
+    expect(violations[0]).toMatch(/repo/)
+    // Non-object instances ignore object keywords.
+    expect(validateJsonSchemaArgs(schema, 'not-an-object')).toEqual([])
+    expect(validateJsonSchemaArgs({ required: ['a'] }, ['a'])).toEqual([])
+  })
+
+  it('applies array items by instance type even without a type keyword', () => {
+    const schema = { items: { type: 'string' } }
+    expect(validateJsonSchemaArgs(schema, ['a', 'b'])).toEqual([])
+    expect(validateJsonSchemaArgs(schema, ['a', 1])).toHaveLength(1)
+    expect(validateJsonSchemaArgs(schema, {})).toEqual([])
+  })
+
+  it('validates schema-valued additionalProperties', () => {
+    const schema = { type: 'object', additionalProperties: { type: 'string' } }
+    expect(validateJsonSchemaArgs(schema, { repo: 'x' })).toEqual([])
+    expect(validateJsonSchemaArgs(schema, { repo: 42 })).toHaveLength(1)
+    expect(validateJsonSchemaArgs(schema, {})).toEqual([])
+    // Named properties are not treated as additional.
+    const named = {
+      type: 'object',
+      properties: { count: { type: 'integer' } },
+      additionalProperties: { type: 'string' },
+    }
+    expect(validateJsonSchemaArgs(named, { count: 2, note: 'ok' })).toEqual([])
+    expect(validateJsonSchemaArgs(named, { count: 2, note: 7 })).toHaveLength(1)
+    expect(validateJsonSchemaArgs({ additionalProperties: { type: 'string' } }, { repo: 42 })).toHaveLength(1)
+  })
+
+  it('rejects unsupported keywords nested in additionalProperties', () => {
+    expect(
+      checkSchemaSupport({ type: 'object', additionalProperties: { allOf: [] } }),
+    ).toHaveLength(1)
+    expect(
+      checkSchemaSupport({ type: 'object', additionalProperties: { type: 'string' } }),
     ).toEqual([])
   })
 

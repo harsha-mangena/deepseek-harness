@@ -122,6 +122,82 @@ describe('rollbackToBaseline', () => {
     }
   })
 
+  it('drains a creation still suspended on registration', async () => {
+    const ctx = await boot()
+    try {
+      const sessionId = SessionId('s-rollback-pending')
+      // Start creation but do not await it: registration is in flight when
+      // the rollback barrier latches, so the drain must pick up the pending
+      // handle instead of leaving a half-created coordinator running.
+      const pendingCreate = ctx.system1Workflows.create(Session.create(sessionId), idleDriver)
+      const rollback = ctx.system1Workflows.rollbackToBaseline()
+      const handle = await pendingCreate
+      await rollback
+
+      expect(ctx.system1Workflows.config.mode).toBe('off')
+      expect(ctx.system1Workflows.get(sessionId)).toBeUndefined()
+      await handle.dispose()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('shares one drain across simultaneous rollbacks', async () => {
+    const ctx = await boot()
+    try {
+      let unwinds = 0
+      const track = async (id: string) => {
+        const handle = await ctx.system1Workflows.create(Session.create(SessionId(id)), idleDriver)
+        handle.coordinator.effect(() => () => {
+          unwinds += 1
+        })
+        return handle
+      }
+      const a = await track('s-rollback-sim-a')
+      const b = await track('s-rollback-sim-b')
+
+      await Promise.all([
+        ctx.system1Workflows.rollbackToBaseline(),
+        ctx.system1Workflows.rollbackToBaseline(),
+      ])
+
+      // One shared drain: each coordinator unwound exactly once.
+      expect(unwinds).toBe(2)
+      expect(ctx.system1Workflows.get(SessionId('s-rollback-sim-a'))).toBeUndefined()
+      expect(ctx.system1Workflows.get(SessionId('s-rollback-sim-b'))).toBeUndefined()
+      await a.dispose()
+      await b.dispose()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('surfaces teardown failures while still draining the rest and latching off', async () => {
+    const ctx = await boot()
+    try {
+      const bad = await ctx.system1Workflows.create(
+        Session.create(SessionId('s-rollback-bad')),
+        idleDriver,
+      )
+      bad.coordinator.effect(() => () => {
+        throw new Error('teardown boom')
+      })
+      const goodId = SessionId('s-rollback-good')
+      const good = await ctx.system1Workflows.create(Session.create(goodId), idleDriver)
+
+      await expect(ctx.system1Workflows.rollbackToBaseline()).rejects.toThrow(
+        /rollback drained with 1 teardown failure.*teardown boom/,
+      )
+      expect(ctx.system1Workflows.config.mode).toBe('off')
+      // The healthy coordinator is still drained and unregistered.
+      expect(ctx.system1Workflows.get(goodId)).toBeUndefined()
+      await good.dispose()
+      await expect(bad.dispose()).rejects.toThrow('teardown boom')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('is idempotent and safe with no live coordinators', async () => {
     const ctx = await boot()
     try {

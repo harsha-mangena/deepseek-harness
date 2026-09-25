@@ -7,8 +7,12 @@ MCP tool adapter with resilience and controlled mutations for System 1 (Jev-only
 - **McpAdapter**: adapts MCP tool definitions to System 1 catalog tools.
 - **Controlled execution**: every dispatch runs pre-dispatch checks in order —
   caller cancellation, MCP identity, verification policy for mutating effects,
-  then argument validation against the tool's JSON inputSchema.
-- **Circuit breaker**: per tool identity; opens after N consecutive failures (default 3); half-opens after reset timeout (default 30s).
+  authoritative operation registration (unknown or stale operationRefs are rejected
+  with zero executor calls), candidate-metadata binding (effect and verification
+  policy must match the adapted tool), then argument validation against the tool's
+  JSON inputSchema. The executor receives the bound server/tool/catalog target.
+- **Circuit breaker**: per tool identity; opens after N consecutive failures (default 3);
+  half-opens after reset timeout (default 30s) with exactly one concurrent trial.
 - **Timeouts**: per-call timeout (default 30s); abort propagation.
 - **Controlled mutations**: write/external effects require an explicit verification policy ID;
   a failed mutating call reports an unknown outcome instead of claiming exactly-once.
@@ -22,11 +26,16 @@ MCP tool adapter with resilience and controlled mutations for System 1 (Jev-only
   keeps the legacy `mcp:<name>` / `op:mcp:<name>:v1` shape. Circuits are keyed by
   the namespaced identity, so same-named tools on different servers do not share breakers.
 - Argument validation supports a documented JSON Schema subset (`type`, `properties`,
-  `required`, `additionalProperties`, `items`, `enum`, `const`, plus annotation keywords).
+  `required`, `additionalProperties` as boolean or schema, `items`, `enum`, `const`,
+  plus annotation keywords). Type-specific keywords apply by instance type even when
+  the schema omits `type` (for example, `properties` still constrains an object instance).
   Anything else fails closed: `adaptTool` rejects the tool definition rather than
   silently skipping validation at dispatch.
 - No exactly-once: an interrupted or failed mutating call may have taken effect.
   The adapter reports `EXECUTION_UNKNOWN` and the caller must reconcile before retrying.
+  Effect certainty is derived from the dispatch phase and the candidate's effect, not
+  from the error class: any failure after a mutating dispatch — including a typed
+  transport error — reports unknown.
 
 ## Known Limitations and Deferred Work
 

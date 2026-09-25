@@ -43,7 +43,7 @@ const catalog: CatalogTool[] = [
 ]
 
 const profile: CapabilityProfile = {
-  tenantId: 'default',
+  tenantId: 'tenant-test',
   profileVersion: 'v1',
   allowedEffects: new Set(['read']),
   allowedRoutes: new Set(['tool', 'stop']),
@@ -405,7 +405,7 @@ describe('ReadOnlyCoordinator', () => {
       executor: { execute: async () => testOutcome() },
       calibration: testCalibration(),
       expectedModel: EXPECTED_MODEL,
-      tenantId: 't',
+      tenantId: 'tenant-test',
     })
 
     const result = await coordinator.run(

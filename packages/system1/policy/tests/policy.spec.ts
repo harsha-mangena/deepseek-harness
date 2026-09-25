@@ -164,13 +164,16 @@ describe('policy engine', () => {
     }
   })
 
-  it('denies cross-tenant access via a tenant-isolation guard', async () => {
+  it('denies cross-tenant access at the authoritative evaluation', async () => {
     const engine = makeEngine()
+    // Even with a permissive tenant-isolation guard registered, a request
+    // for a different tenant must be denied by the engine itself: the
+    // guard check alone can be bypassed by evaluating with another profile.
     engine.registerGuard({
       id: 'tenant-isolation',
       evaluate: (c: GuardContext) => ({
         guardId: 'tenant-isolation',
-        verdict: c.tenantId === 'tenant-a' ? 'pass' : 'fail',
+        verdict: 'pass' as const,
         detail: c.tenantId === 'tenant-a' ? undefined : 'tenant mismatch',
       }),
     })
@@ -180,7 +183,10 @@ describe('policy engine', () => {
     })
     expect(otherTenant.allowed).toBe(false)
     if (!otherTenant.allowed) {
-      expect(otherTenant.code).toBe('GUARD_BLOCKED')
+      expect(otherTenant.code).toBe('TENANT_MISMATCH')
+      expect(otherTenant.reason).toContain('tenant-a')
+      expect(otherTenant.reason).toContain('tenant-b')
+      expect(otherTenant.evaluatedGuards).toEqual([])
     }
   })
 })

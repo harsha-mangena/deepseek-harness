@@ -123,6 +123,56 @@ describe('system1 coordinator lifecycle invariants', () => {
     }
   })
 
+  it('rejects overlapping maintenance tasks (N07)', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(
+        Session.create(SessionId('s-maint-overlap')),
+        idleDriver,
+      )
+      try {
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        const first = handle.coordinator.runMaintenance(() => gate)
+        expect(() => handle.coordinator.runMaintenance(async () => undefined)).toThrow(
+          /another maintenance task is active/,
+        )
+        release()
+        await first
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('releases maintenance ownership when the task rejects (N07)', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(
+        Session.create(SessionId('s-maint-reject')),
+        idleDriver,
+      )
+      try {
+        await expect(
+          handle.coordinator.runMaintenance(async () => {
+            throw new Error('maintenance boom')
+          }),
+        ).rejects.toThrow('maintenance boom')
+        // Ownership is released: a new maintenance task may run.
+        const seen = await handle.coordinator.runMaintenance(async () => 'recovered')
+        expect(seen).toBe('recovered')
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('aborts owned maintenance on cancel (R33)', async () => {
     const ctx = await boot()
     try {

@@ -18,7 +18,12 @@ End-to-end read-only coordinator for System 1 (Jev-only).
 
 `ReadOnlyProductionDriver` implements the workflow package's `CoordinatorDriver`: one durable read-only turn per coordinator wake.
 
-Turn lifecycle:
+The driver takes an explicit `mode` (`ProductionDriverConfig.mode`), threaded from the workflow plugin's resolved mode (`workflows.config.mode`); it never reads ambient plugin state. Constructing a driver with mode `off` throws: while the plugin is off, coordinator creation is refused and no driver should exist.
+
+- `enforce`: the turn below runs in full; admitted decisions dispatch.
+- `shadow`: the driver runs the decision pipeline over the drained observations and records the admitted decision as an advisory `system1/decision` suggestion event. The shadow path has no execution capability — no tool is dispatched, no handoff worker is spawned, and the turn finalizes `escalated` with a shadow summary. The baseline DeepSeek path owns execution.
+
+Turn lifecycle (enforce mode):
 
 1. Drain the coordinator inbox (next-step before next-turn) into provenance-labelled observations.
 2. Run the real `ReadOnlyCoordinator` decision loop: policy filter → Jev decision → `admitDecision` (correlation, model pinning, menu membership, calibration gate) → dispatch recheck.

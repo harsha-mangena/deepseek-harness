@@ -12,6 +12,7 @@ export type {
   McpToolDefinition,
   McpAdaptOptions,
   McpExecutor,
+  McpDispatchTarget,
   CircuitState,
   McpAdapterConfig,
 } from './adapter.ts'

@@ -24,6 +24,11 @@ export interface GuardResult {
 
 /** Context passed to every guard. */
 export interface GuardContext {
+  /**
+   * Authenticated tenant identity for this request, derived from admission.
+   * The capability profile used for evaluation must be issued to this same
+   * tenant; the engine enforces that binding in {@link PolicyEngine.evaluate}.
+   */
   readonly tenantId: string
   readonly taskId: string
   readonly candidate: Candidate
@@ -38,6 +43,11 @@ export interface Guard {
 
 /** What a tenant or workload is permitted to do. */
 export interface CapabilityProfile {
+  /**
+   * Tenant the profile is issued to. The engine rejects evaluation when the
+   * request tenant differs, so a profile can never authorize another
+   * tenant's dispatch regardless of guards.
+   */
   readonly tenantId: string
   readonly profileVersion: string
   readonly allowedEffects: ReadonlySet<Effect>
@@ -63,6 +73,7 @@ export type PolicyDecision =
       readonly code:
         | 'EFFECT_NOT_ALLOWED'
         | 'CAPABILITY_NOT_GRANTED'
+        | 'TENANT_MISMATCH'
         | 'GUARD_BLOCKED'
         | 'GUARD_MISSING'
         | 'GUARD_UNKNOWN'
@@ -103,6 +114,13 @@ export class PolicyEngine {
    * Evaluate whether a candidate may be dispatched.
    * Compiles the required guard list from the capability profile and the
    * candidate's effect policy, then evaluates every required guard.
+   *
+   * The tenant binding is enforced here, at the operation that makes the
+   * dispatch decision: the capability profile is issued to exactly one
+   * tenant, and any request whose tenant differs is denied with
+   * `TENANT_MISMATCH` before effects, routes, or guards are consulted. A
+   * guard-based tenant check alone is not enforcement, because a caller
+   * can bypass guards by evaluating with a different profile.
    * @param candidate - candidate operation to check.
    * @param profile - tenant capability profile.
    * @param ctx - guard evaluation context.
@@ -114,6 +132,16 @@ export class PolicyEngine {
     ctx: Omit<GuardContext, 'candidate'>,
   ): Promise<PolicyDecision> {
     const fullCtx: GuardContext = { ...ctx, candidate }
+
+    // Tenant binding: the profile only authorizes its own tenant.
+    if (profile.tenantId !== ctx.tenantId) {
+      return {
+        allowed: false,
+        reason: `Capability profile is issued to tenant ${profile.tenantId}, not tenant ${ctx.tenantId}`,
+        code: 'TENANT_MISMATCH',
+        evaluatedGuards: [],
+      }
+    }
 
     // Effect must be allowed by both the profile and the effect policy.
     if (!profile.allowedEffects.has(candidate.effect)) {

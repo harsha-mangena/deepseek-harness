@@ -7,9 +7,14 @@
  * schema can never silently pass validation.
  *
  * Supported keywords: `type` (single type name), `properties`, `required`,
- * `additionalProperties`, `items` (single schema), `enum`, `const`, plus the
- * annotation keywords `title`, `description`, `default`, `examples`, and
- * `$schema`, which carry no validation effect.
+ * `additionalProperties` (boolean or schema), `items` (single schema), `enum`,
+ * `const`, plus the annotation keywords `title`, `description`, `default`,
+ * `examples`, and `$schema`, which carry no validation effect.
+ *
+ * Conformance note: per JSON Schema, type-specific keywords apply based on
+ * the instance's type even when the schema omits `type` (for example,
+ * `properties` still constrains an object instance). `additionalProperties`
+ * may be a schema that constrains properties not named in `properties`.
  *
  * @module @deepseek-ai/dsh-system1-mcp/json-schema
  */
@@ -62,6 +67,10 @@ function checkKeywords(schema: unknown, path: string, out: string[]): void {
     for (const [name, subSchema] of Object.entries(properties)) {
       checkKeywords(subSchema, `${path}.${name}`, out)
     }
+  }
+  const additionalProperties = schema.additionalProperties
+  if (isRecord(additionalProperties) || typeof additionalProperties === 'boolean') {
+    checkKeywords(additionalProperties, `${path}.<additionalProperties>`, out)
   }
   checkKeywords(schema.items, `${path}[]`, out)
 }
@@ -129,6 +138,61 @@ function validateTyped(
 }
 
 /**
+ * Validate a record value against an `object` schema's instance keywords.
+ * Applies `required`, `properties`, and `additionalProperties` (boolean or
+ * schema-valued) to an already-known record.
+ * @param schema - the schema node.
+ * @param value - the record value to validate.
+ * @param path - JSON path of the value for diagnostics.
+ * @param out - collected violation messages.
+ */
+function validateObjectKeywords(
+  schema: Record<string, unknown>,
+  value: Record<string, unknown>,
+  path: string,
+  out: string[],
+): void {
+  const required = schema.required
+  if (Array.isArray(required)) {
+    for (const key of required) {
+      if (typeof key === 'string' && !(key in value)) {
+        out.push(`${path}: missing required property "${key}"`)
+      }
+    }
+  }
+  const properties = schema.properties
+  const known = isRecord(properties) ? properties : {}
+  if (isRecord(properties)) {
+    for (const [key, subSchema] of Object.entries(properties)) {
+      if (key in value) {
+        validateNode(subSchema, value[key], `${path}.${key}`, out)
+      }
+    }
+  }
+  const additionalProperties = schema.additionalProperties
+  if (additionalProperties === false) {
+    for (const key of Object.keys(value)) {
+      if (!(key in known)) {
+        out.push(`${path}: unexpected property "${key}"`)
+      }
+    }
+    return
+  }
+  if (typeof additionalProperties === 'boolean' || additionalProperties === undefined) {
+    return
+  }
+  if (isRecord(additionalProperties)) {
+    for (const [key, propertyValue] of Object.entries(value)) {
+      if (!(key in known)) {
+        validateNode(additionalProperties, propertyValue, `${path}.${key}`, out)
+      }
+    }
+    return
+  }
+  out.push(`${path}: unsupported additionalProperties form`)
+}
+
+/**
  * Validate a value against an `object` schema.
  * @param schema - the schema node.
  * @param value - the value to validate.
@@ -145,29 +209,27 @@ function validateObject(
     out.push(`${path}: expected object`)
     return
   }
-  const required = schema.required
-  if (Array.isArray(required)) {
-    for (const key of required) {
-      if (typeof key === 'string' && !(key in value)) {
-        out.push(`${path}: missing required property "${key}"`)
-      }
-    }
-  }
-  const properties = schema.properties
-  if (isRecord(properties)) {
-    for (const [key, subSchema] of Object.entries(properties)) {
-      if (key in value) {
-        validateNode(subSchema, value[key], `${path}.${key}`, out)
-      }
-    }
-  }
-  if (schema.additionalProperties === false) {
-    const known = isRecord(properties) ? properties : {}
-    for (const key of Object.keys(value)) {
-      if (!(key in known)) {
-        out.push(`${path}: unexpected property "${key}"`)
-      }
-    }
+  validateObjectKeywords(schema, value, path, out)
+}
+
+/**
+ * Validate array items against the schema's `items` subschema.
+ * @param schema - the schema node.
+ * @param value - the array value to validate.
+ * @param path - JSON path of the value for diagnostics.
+ * @param out - collected violation messages.
+ */
+function validateArrayItems(
+  schema: Record<string, unknown>,
+  value: unknown[],
+  path: string,
+  out: string[],
+): void {
+  const items = schema.items
+  if (items !== undefined) {
+    value.forEach((item, index) => {
+      validateNode(items, item, `${path}[${index}]`, out)
+    })
   }
 }
 
@@ -188,12 +250,7 @@ function validateArray(
     out.push(`${path}: expected array`)
     return
   }
-  const items = schema.items
-  if (items !== undefined) {
-    value.forEach((item, index) => {
-      validateNode(items, item, `${path}[${index}]`, out)
-    })
-  }
+  validateArrayItems(schema, value, path, out)
 }
 
 /**
@@ -222,6 +279,12 @@ function validateNode(schema: unknown, value: unknown, path: string, out: string
     out.push(`${path}: value is not one of the allowed values`)
   }
   if (!('type' in schema)) {
+    // JSON Schema keywords apply by instance type even without `type`.
+    if (isRecord(value)) {
+      validateObjectKeywords(schema, value, path, out)
+    } else if (Array.isArray(value)) {
+      validateArrayItems(schema, value, path, out)
+    }
     return
   }
   validateTyped(schema, schema.type, value, path, out)

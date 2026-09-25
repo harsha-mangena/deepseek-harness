@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
@@ -29,6 +29,7 @@ import {
   type HandoffBundle,
   type HandoffHandler,
   type System1CoordinatorAgent,
+  type System1Mode,
   type System1Workflows,
 } from '@deepseek-ai/dsh-system1-workflow'
 import {
@@ -70,7 +71,7 @@ const catalog: CatalogTool[] = [
 ]
 
 const profile: CapabilityProfile = {
-  tenantId: 'default',
+  tenantId: 'tenant-test',
   profileVersion: 'v1',
   allowedEffects: new Set(['read']),
   allowedRoutes: new Set(['tool', 'stop']),
@@ -130,7 +131,7 @@ function userMessage(text: string): UserMessage {
 }
 
 /** Boot the workflow plugin through the real Loader. */
-async function boot(): Promise<{ ctx: Context; workflows: System1Workflows }> {
+async function boot(mode: System1Mode = 'enforce'): Promise<{ ctx: Context; workflows: System1Workflows }> {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-system1-driver-'))
   tempRoots.push(dir)
   ;(globalThis as Record<string, unknown>)[MODULE_KEY] = WorkflowModule
@@ -146,7 +147,7 @@ async function boot(): Promise<{ ctx: Context; workflows: System1Workflows }> {
   const fixtureUrl = pathToFileURL(join(dir, 'system1-entry.mjs')).href
   writeFileSync(
     join(dir, 'cordis.yml'),
-    ['- id: system1', `  name: ${fixtureUrl}`, '  config:', '    mode: shadow', ''].join(
+    ['- id: system1', `  name: ${fixtureUrl}`, '  config:', `    mode: ${mode}`, ''].join(
       '\n',
     ),
   )
@@ -173,6 +174,7 @@ function makeDriver(
       decide: async (input) => ({ ...testDecision('c1'), decisionId: input.decisionId }),
     }
   return new ReadOnlyProductionDriver({
+    mode: 'enforce',
     policy: makePolicy(),
     capabilityProfile: profile,
     provider,
@@ -414,6 +416,227 @@ describe('ReadOnlyProductionDriver', () => {
       expect(recorded[0].verifiedBy).toBeUndefined()
     } finally {
       await setup.dispose()
+    }
+  })
+})
+
+describe('driver execution modes', () => {
+  const counters = { system1Dispatches: 0, baselineRuns: 0 }
+  beforeEach(() => {
+    counters.system1Dispatches = 0
+    counters.baselineRuns = 0
+  })
+
+  /** The read the CI tool performs. */
+  async function ciStatusLogic(): Promise<Array<{ type: 'text'; text: string }>> {
+    return [{ type: 'text', text: 'CI is green' }]
+  }
+
+  /** Baseline DeepSeek path: owns execution outside System 1. */
+  async function baselineRunCI(): Promise<string> {
+    counters.baselineRuns += 1
+    const blocks = await ciStatusLogic()
+    return blocks.map((block) => block.text).join('')
+  }
+
+  /** Register the CI tool so System 1 dispatches are observable. */
+  function registerCITool(coordinator: System1CoordinatorAgent): void {
+    coordinator.ctx.tools.register(
+      defineContentToolFixture({
+        name: 'ci-status',
+        description: 'CI status reader',
+        parameters: {},
+        async execute() {
+          counters.system1Dispatches += 1
+          return ciStatusLogic()
+        },
+      }),
+    )
+  }
+
+  /** Advisory suggestion events recorded by shadow turns. */
+  function suggestions(session: Session): Array<{ candidateId?: string; model?: string }> {
+    return session
+      .snapshotEvents()
+      .filter((event) => event.type === 'system1/decision')
+      .map((event) => event.data as { candidateId?: string; model?: string })
+  }
+
+  it('off: coordinator creation is refused; the baseline path is untouched', async () => {
+    const { ctx, workflows } = await boot('off')
+    try {
+      const session = Session.create(SessionId('s-mode-off'))
+      const driver = makeDriver({ mode: 'enforce' })
+      await expect(workflows.create(session, driver)).rejects.toThrow(/off/)
+      // Baseline owns execution: unchanged output, no System 1 involved.
+      expect(await baselineRunCI()).toBe('CI is green')
+      expect(counters.system1Dispatches).toBe(0)
+      expect(counters.baselineRuns).toBe(1)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects a driver constructed with mode off', () => {
+    expect(() => makeDriver({ mode: 'off' })).toThrow(/mode "off"/)
+  })
+
+  it('rejects a driver constructed without a mode', () => {
+    expect(() => makeDriver({ mode: undefined })).toThrow(/explicit mode/)
+  })
+
+  it('shadow: an aborted turn finalizes cancelled without deciding or dispatching', async () => {
+    let providerCalled = false
+    const { ctx, workflows } = await boot('shadow')
+    try {
+      const driver = makeDriver({
+        mode: 'shadow',
+        provider: {
+          decide: async (input) => {
+            providerCalled = true
+            return { ...testDecision('c1'), decisionId: input.decisionId }
+          },
+        },
+      })
+      const session = Session.create(SessionId('s-mode-shadow-abort'))
+      const handle = await workflows.create(session, driver)
+      try {
+        registerCITool(handle.coordinator)
+        const aborter = new AbortController()
+        aborter.abort()
+        await driver.run(handle.coordinator, aborter.signal)
+        expect(providerCalled).toBe(false)
+        expect(counters.system1Dispatches).toBe(0)
+        expect(suggestions(session)).toHaveLength(0)
+        const recorded = terminals(session)
+        expect(recorded).toHaveLength(1)
+        expect(recorded[0]?.outcome).toBe('cancelled')
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('shadow: baseline executes with unchanged output; System 1 records a suggestion with zero dispatches', async () => {
+    const { ctx, workflows } = await boot('shadow')
+    try {
+      const driver = makeDriver({ mode: 'shadow' })
+      const session = Session.create(SessionId('s-mode-shadow'))
+      const handle = await workflows.create(session, driver)
+      try {
+        registerCITool(handle.coordinator)
+        const before = await baselineRunCI()
+        handle.coordinator.followup(userMessage('Check CI status'))
+        await handle.coordinator.whenIdle()
+        const after = await baselineRunCI()
+        // Baseline output is unchanged and System 1 dispatched nothing.
+        expect(before).toBe('CI is green')
+        expect(after).toBe('CI is green')
+        expect(counters.baselineRuns).toBe(2)
+        expect(counters.system1Dispatches).toBe(0)
+        // The advisory suggestion is durable in the session log.
+        const recorded = suggestions(session)
+        expect(recorded).toHaveLength(1)
+        expect(recorded[0]?.candidateId).toBe('c1')
+        expect(recorded[0]?.model).toBe(EXPECTED_MODEL)
+        const recordedTerminals = terminals(session)
+        expect(recordedTerminals).toHaveLength(1)
+        expect(recordedTerminals[0]?.outcome).toBe('escalated')
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('shadow: an escalate-none decision records a suggestion without a candidate and never calls the handoff worker', async () => {
+    let handoffCalls = 0
+    const { ctx, workflows } = await boot('shadow')
+    try {
+      const driver = makeDriver({
+        mode: 'shadow',
+        provider: {
+          decide: async (input) => ({
+            ...testDecision('escalate-none', null),
+            decisionId: input.decisionId,
+            probabilities: {},
+            selectedProbability: 0,
+          }),
+        },
+        handoff: async () => {
+          handoffCalls += 1
+          return { kind: 'completed', artifacts: [], evidence: [], actualUnits: 0 }
+        },
+        handoffBudget: { poolName: 'pool-main', units: 10 },
+      })
+      const session = Session.create(SessionId('s-mode-shadow-escalate'))
+      const handle = await workflows.create(session, driver)
+      try {
+        registerCITool(handle.coordinator)
+        handle.coordinator.followup(userMessage('Check CI status'))
+        await handle.coordinator.whenIdle()
+        expect(counters.system1Dispatches).toBe(0)
+        expect(handoffCalls).toBe(0)
+        const recorded = suggestions(session)
+        expect(recorded).toHaveLength(1)
+        expect(recorded[0]?.candidateId).toBeUndefined()
+        expect(terminals(session)[0]?.outcome).toBe('escalated')
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('shadow: an unadmitted decision fails the turn with no suggestion and no dispatch', async () => {
+    const { ctx, workflows } = await boot('shadow')
+    try {
+      const driver = makeDriver({
+        mode: 'shadow',
+        provider: {
+          decide: async (input) => ({ ...testDecision('c1'), decisionId: 'wrong-id' }),
+        },
+      })
+      const session = Session.create(SessionId('s-mode-shadow-denied'))
+      const handle = await workflows.create(session, driver)
+      try {
+        registerCITool(handle.coordinator)
+        handle.coordinator.followup(userMessage('Check CI status'))
+        await handle.coordinator.whenIdle()
+        expect(counters.system1Dispatches).toBe(0)
+        expect(suggestions(session)).toHaveLength(0)
+        const recordedTerminals = terminals(session)
+        expect(recordedTerminals).toHaveLength(1)
+        expect(recordedTerminals[0]?.outcome).toBe('failure')
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('enforce: System 1 dispatches the admitted tool', async () => {
+    const { ctx, workflows } = await boot('enforce')
+    try {
+      const driver = makeDriver({ mode: 'enforce' })
+      const session = Session.create(SessionId('s-mode-enforce'))
+      const handle = await workflows.create(session, driver)
+      try {
+        registerCITool(handle.coordinator)
+        handle.coordinator.followup(userMessage('Check CI status'))
+        await handle.coordinator.whenIdle()
+        expect(counters.system1Dispatches).toBe(1)
+        expect(terminals(session)[0]?.outcome).toBe('success')
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
     }
   })
 })

@@ -56,7 +56,12 @@ export interface CoordinatorConfig {
   readonly calibration: IsotonicCalibration
   /** Pinned model id; the decision's modelResolved must match exactly. */
   readonly expectedModel: string
-  /** Tenant id used for policy evaluation. Never defaults. */
+  /**
+   * Authenticated tenant identity from admission, for policy evaluation.
+   * Never defaults. The capability profile must be issued to this same
+   * tenant; the engine rejects any mismatch (`TENANT_MISMATCH`) at the
+   * authoritative dispatch decision, before effects, routes, or guards.
+   */
   readonly tenantId: string
   /**
    * Minimum calibrated correctness for execution. Defaults to 0.5.
@@ -83,6 +88,22 @@ export interface CoordinatorResult {
   readonly decision: NormalizedDecision
   readonly outcome: ExecutionOutcome | null
   readonly calibratedCorrectness: number | null
+}
+
+/** The admitted decision, before any execution. */
+export interface DecideResult {
+  /** The calibrated normalized decision. */
+  readonly decision: NormalizedDecision
+  /**
+   * The selected candidate, or `null` when the decision escalates. The
+   * candidate passed the menu policy filter; the dispatch recheck still
+   * runs at execution time.
+   */
+  readonly selected: Candidate | null
+  /** Calibrated correctness, `null` for escalations. */
+  readonly calibratedCorrectness: number | null
+  /** Task id the decision was made under; reused for the dispatch recheck. */
+  readonly taskId: string
 }
 
 /** Context for decision admission. */
@@ -214,12 +235,16 @@ export class ReadOnlyCoordinator {
   }
 
   /**
-   * Run the read-only decision loop.
+   * Run the decision pipeline without executing: observations → candidate
+   * menu → policy filter → Jev decision → admission → calibration gate.
+   * Shadow mode uses this to record an advisory suggestion; the returned
+   * candidate is never executed by this method.
    * @param input - coordinator input.
    * @param signal - abort signal.
-   * @returns the decision and execution outcome.
+   * @returns the admitted decision and the selected candidate, if any.
+   * @throws when no candidate is admissible or the decision is rejected.
    */
-  async run(input: CoordinatorInput, signal: AbortSignal): Promise<CoordinatorResult> {
+  async decide(input: CoordinatorInput, signal: AbortSignal): Promise<DecideResult> {
     const taskId = this.config.newTaskId()
     const decisionId = this.config.newDecisionId()
     const policyVersion = input.policyVersion ?? 'p1'
@@ -292,17 +317,50 @@ export class ReadOnlyCoordinator {
       })
     }
 
+    // Attach calibration to the decision for the result.
+    const calibratedDecision: NormalizedDecision = {
+      ...decision,
+      calibratedCorrectness: verdict.calibratedCorrectness,
+      calibrationVersion:
+        verdict.calibratedCorrectness !== null ? this.config.calibration.version : null,
+    }
+
+    const selected =
+      decision.selectedId === 'escalate-none'
+        ? null
+        : (admittedCandidates.find((c) => c.id === decision.selectedId) ?? null)
+    // Unreachable: admission already verified menu membership.
+    /* istanbul ignore next -- defensive: admission guarantees membership */
+    if (decision.selectedId !== 'escalate-none' && selected === null) {
+      throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Selected candidate not in menu', {
+        selectedId: decision.selectedId,
+      })
+    }
+    return {
+      decision: calibratedDecision,
+      selected,
+      calibratedCorrectness: verdict.calibratedCorrectness,
+      taskId,
+    }
+  }
+
+  /**
+   * Run the read-only decision loop: decide, then execute the selected
+   * candidate if the decision is concrete.
+   * @param input - coordinator input.
+   * @param signal - abort signal.
+   * @returns the decision and execution outcome.
+   */
+  async run(input: CoordinatorInput, signal: AbortSignal): Promise<CoordinatorResult> {
+    const policyVersion = input.policyVersion ?? 'p1'
+    const { decision, selected, calibratedCorrectness, taskId } = await this.decide(
+      input,
+      signal,
+    )
+
     // 6. Execute if a concrete candidate was selected (not escalate).
     let outcome: ExecutionOutcome | null = null
-    if (decision.selectedId !== 'escalate-none') {
-      const selected = admittedCandidates.find((c) => c.id === decision.selectedId)
-      // Unreachable: admission already verified menu membership.
-      /* istanbul ignore next -- defensive: admission guarantees membership */
-      if (!selected) {
-        throw system1Error('PROVIDER_MALFORMED_RESPONSE', 'Selected candidate not in menu', {
-          selectedId: decision.selectedId,
-        })
-      }
+    if (selected !== null) {
       // Defense in depth: coordinator never executes non-read effects.
       // Unreachable when the read-only filter above is correct; it guards
       // against future filter regressions.
@@ -329,18 +387,10 @@ export class ReadOnlyCoordinator {
       outcome = await this.config.executor.execute(selected, signal)
     }
 
-    // Attach calibration to the decision for the result.
-    const calibratedDecision: NormalizedDecision = {
-      ...decision,
-      calibratedCorrectness: verdict.calibratedCorrectness,
-      calibrationVersion:
-        verdict.calibratedCorrectness !== null ? this.config.calibration.version : null,
-    }
-
     return {
-      decision: calibratedDecision,
+      decision,
       outcome,
-      calibratedCorrectness: verdict.calibratedCorrectness,
+      calibratedCorrectness,
     }
   }
 }

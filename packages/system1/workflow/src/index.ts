@@ -54,11 +54,28 @@ export class System1Workflows extends Service {
   readonly config: ResolvedSystem1WorkflowConfig
 
   /**
-   * Dispose callbacks for live coordinators. The plugin fiber runs them on
-   * unload (HMR reload or shutdown) so every AgentRegistry registration is
-   * removed and a reloaded plugin starts clean.
+   * Dispose callbacks for live coordinators. Pending creations are
+   * tracked here too, before their registration settles, so a rollback
+   * that starts mid-registration still drains the coordinator once it
+   * settles. The plugin fiber runs them on unload (HMR reload or shutdown)
+   * so every AgentRegistry registration is removed and a reloaded plugin
+   * starts clean.
    */
   private readonly liveCoordinators = new Set<() => Promise<void>>()
+
+  /**
+   * Creation barrier latched synchronously when a rollback starts, before
+   * any drain await. While latched, {@link create} is refused even though
+   * the mode is not yet `'off'`, so no coordinator can slip in between the
+   * drain snapshot and the mode latch.
+   */
+  private draining = false
+
+  /**
+   * Memoized rollback drain: simultaneous {@link rollbackToBaseline}
+   * callers share one drain instead of racing two.
+   */
+  private rollbackPromise: Promise<void> | undefined
 
   constructor(ctx: Context, config: System1WorkflowConfig = {}) {
     super(ctx, 'system1Workflows')
@@ -83,8 +100,9 @@ export class System1Workflows extends Service {
    *   equal the session id.
    * @param driver - driver the coordinator wakes; it runs one turn per wake.
    * @returns the coordinator and its owned teardown handle.
-   * @throws when the plugin mode is `off`, when the session already has a
-   *   registered agent, or when an `agent/created` listener vetoes.
+   * @throws when the plugin mode is `off`, when a rollback drain is in
+   *   flight, when the session already has a registered agent, or when an
+   *   `agent/created` listener vetoes.
    */
   async create(
     session: Session,
@@ -93,28 +111,45 @@ export class System1Workflows extends Service {
     if (this.config.mode === 'off') {
       throw new Error('system1: coordinator creation refused while mode is "off"')
     }
+    if (this.draining) {
+      throw new Error('system1: coordinator creation refused while rollback is draining')
+    }
     const coordinator = new System1CoordinatorAgent(this.ctx, session, driver)
     const unregister = this.ctx.agents.register(coordinator)
+    // Gate that settles once registration finished, successfully or not.
+    let settleRegistration!: () => void
+    const registrationGate = new Promise<void>((resolve) => {
+      settleRegistration = resolve
+    })
+    let registered = false
+    // One teardown per handle: concurrent callers share it instead of each
+    // marking disposed and racing the cleanup.
+    let teardown: Promise<void> | undefined
+    const dispose = (): Promise<void> =>
+      (teardown ??= (async (): Promise<void> => {
+        this.liveCoordinators.delete(dispose)
+        // A creation still suspended on registration is drained once the
+        // registration settles, so rollback never leaves a half-created
+        // coordinator running.
+        await registrationGate
+        await coordinator.dispose()
+        if (registered) await unregister()
+      })())
+    // Track pending creations as well as live agents: a rollback that
+    // starts while registration is in flight drains this handle.
+    this.liveCoordinators.add(dispose)
     // Awaiting the disposer settles the registration effect (enter plus the
     // serial agent/created announcement) without disposing it, so creation
     // failures reject here instead of surfacing as unhandled rejections.
     try {
       await unregister
+      registered = true
     } catch (error) {
-      // The coordinator acquired no effects yet, but dispose is idempotent
-      // and keeps the failure path correct if the constructor ever does.
-      await coordinator.dispose()
+      settleRegistration()
+      await dispose()
       throw error
     }
-    let disposed = false
-    const dispose = async (): Promise<void> => {
-      if (disposed) return
-      disposed = true
-      this.liveCoordinators.delete(dispose)
-      await coordinator.dispose()
-      await unregister()
-    }
-    this.liveCoordinators.add(dispose)
+    settleRegistration()
     return { coordinator, dispose }
   }
 
@@ -140,14 +175,45 @@ export class System1Workflows extends Service {
    * mode is latched to `'off'`, so coordinator creation is refused and
    * new work takes the standard DeepSeek path. The transition is
    * one-way; re-enabling requires reloading the plugin with new
-   * configuration.
+   * configuration. The drain is memoized: simultaneous callers share it.
+   * Creation is refused while the drain is in flight. Teardown failures are
+   * surfaced, not swallowed: every coordinator is still drained and the mode
+   * is still latched, then an aggregate error is thrown.
    * @returns resolves once every live coordinator is drained and the
    *   mode is latched to `'off'`.
+   * @throws an aggregate error when any coordinator teardown fails.
    */
   async rollbackToBaseline(): Promise<void> {
-    const disposers = [...this.liveCoordinators]
-    await Promise.allSettled(disposers.map((dispose) => dispose()))
-    this.config.mode = 'off'
+    return (this.rollbackPromise ??= this.doRollback())
+  }
+
+  /**
+   * Rollback body. The creation barrier is latched synchronously — this
+   * method runs to its first await without yielding — so a {@link create}
+   * that starts after this call is refused even while drains are pending.
+   *
+   * This stays a TypeScript-private (not `#`-private) method because the
+   * service is reached through a Cordis proxy, which cannot satisfy the
+   * `#` brand check.
+   */
+  private doRollback(): Promise<void> {
+    this.draining = true
+    return (async (): Promise<void> => {
+      const failures: string[] = []
+      for (const dispose of [...this.liveCoordinators]) {
+        try {
+          await dispose()
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error))
+        }
+      }
+      this.config.mode = 'off'
+      if (failures.length > 0) {
+        throw new Error(
+          `system1: rollback drained with ${failures.length} teardown failure(s): ${failures.join('; ')}`,
+        )
+      }
+    })()
   }
 }
 
@@ -163,6 +229,7 @@ export type {
   FinalizerVerification,
 } from './finalizer.ts'
 export type {
+  LeaseAuthority,
   System1Mode,
   System1Provider,
   System1WorkflowConfig,

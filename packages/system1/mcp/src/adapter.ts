@@ -11,13 +11,23 @@
  * 1. Cancellation: an already-aborted caller signal rejects before dispatch.
  * 2. Identity: the candidate must reference an MCP tool identity.
  * 3. Verification policy: non-read effects require a verification policy ID.
- * 4. Argument validation: arguments are validated against the tool's
- *    inputSchema (supported JSON Schema subset, see ./json-schema.ts).
+ * 4. Registration: the operationRef must resolve to a tool adapted by this
+ *    adapter; unknown or stale operationRefs are rejected with zero executor
+ *    calls, and the candidate's effect and verification policy must match the
+ *    adapted record (schema, effect, verifier, server, and catalog generation
+ *    stay bound together).
+ * 5. Argument validation: arguments are validated against the tool's
+ *    inputSchema (supported JSON Schema subset, see ./json-schema.ts). The
+ *    validated argument object is dispatched unchanged.
+ * 6. Circuit: a half-open circuit admits exactly one trial at a time.
  *
  * Controlled mutations:
  * - Write/external effects are allowed only with an explicit verification policy.
  * - A failed mutating call reports EXECUTION_UNKNOWN: the adapter never
- *   claims exactly-once. The caller must reconcile before retrying.
+ *   claims exactly-once. The caller must reconcile before retrying. Effect
+ *   certainty is derived from the dispatch phase and the candidate's effect,
+ *   not from the error class: any failure after a mutating dispatch is
+ *   unknown, including typed transport errors.
  *
  * @module @deepseek-ai/dsh-system1-mcp/adapter
  */
@@ -49,16 +59,28 @@ export interface McpAdaptOptions {
   readonly catalogVersion?: string
 }
 
+/** Dispatch target: an MCP tool plus its server and catalog binding. */
+export interface McpDispatchTarget {
+  /** MCP tool name on the server. */
+  readonly toolName: string
+  /** Namespaced tool identity (`mcp:<name>` or `mcp:<serverId>:<name>`). */
+  readonly toolIdentity: string
+  /** MCP server identity, when the tool was adapted with one. */
+  readonly serverId?: string
+  /** Catalog generation embedded in the operationRef. */
+  readonly catalogVersion: string
+}
+
 /** MCP tool executor (injected; wraps the MCP client). */
 export interface McpExecutor {
   /**
    * Execute an MCP tool.
-   * @param toolName - MCP tool name.
-   * @param args - tool arguments.
+   * @param target - tool, server, and catalog binding from the adapter registry.
+   * @param args - tool arguments (the exact object that passed validation).
    * @param signal - abort signal.
    * @returns the tool result.
    */
-  execute(toolName: string, args: unknown, signal: AbortSignal): Promise<unknown>
+  execute(target: McpDispatchTarget, args: unknown, signal: AbortSignal): Promise<unknown>
 }
 
 /** Circuit breaker state. */
@@ -81,7 +103,19 @@ export interface McpAdapterConfig {
 interface AdaptedTool {
   readonly toolName: string
   readonly toolIdentity: string
+  readonly serverId: string | undefined
+  readonly catalogVersion: string
+  readonly effect: Effect
+  readonly verificationPolicyId: string
   readonly inputSchema: Readonly<Record<string, unknown>>
+}
+
+/** Circuit breaker record. `halfOpenTrial` reserves the single half-open trial. */
+interface Circuit {
+  failures: number
+  state: CircuitState
+  openedAt: number
+  halfOpenTrial: boolean
 }
 
 /** Adapts MCP tools with circuit breaking. */
@@ -91,8 +125,8 @@ export class McpAdapter {
   private readonly resetTimeoutMs: number
   private readonly callTimeoutMs: number
   private readonly now: () => number
-  private readonly circuits = new Map<string, { failures: number; state: CircuitState; openedAt: number }>()
-  /** inputSchema registry keyed by operationRef, for pre-dispatch argument validation. */
+  private readonly circuits = new Map<string, Circuit>()
+  /** Authoritative operation registry keyed by operationRef. */
   private readonly adaptedTools = new Map<string, AdaptedTool>()
 
   /**
@@ -138,7 +172,15 @@ export class McpAdapter {
     const operationRef = options.serverId
       ? `op:mcp:${options.serverId}:${def.name}:${catalogVersion}`
       : `op:mcp:${def.name}:${catalogVersion}`
-    this.adaptedTools.set(operationRef, { toolName: def.name, toolIdentity, inputSchema: def.inputSchema })
+    this.adaptedTools.set(operationRef, {
+      toolName: def.name,
+      toolIdentity,
+      serverId: options.serverId,
+      catalogVersion,
+      effect,
+      verificationPolicyId,
+      inputSchema: def.inputSchema,
+    })
     return {
       toolId: toolIdentity,
       label: def.description,
@@ -155,7 +197,8 @@ export class McpAdapter {
    * breaking, and timeout.
    *
    * Checks run in order: caller cancellation, MCP identity, verification
-   * policy for mutating effects, then argument validation. The caller signal
+   * policy for mutating effects, authoritative operation registration,
+   * candidate-metadata binding, then argument validation. The caller signal
    * still aborts a dispatched call mid-flight. A failed mutating call reports
    * EXECUTION_UNKNOWN: the adapter never claims exactly-once.
    * @param candidate - the candidate (must be an MCP tool).
@@ -183,8 +226,6 @@ export class McpAdapter {
         candidateId: candidate.id,
       })
     }
-    const serverId = match[1]
-    const toolIdentity = serverId ? `mcp:${serverId}:${toolName}` : `mcp:${toolName}`
 
     // 3. Verification policy: only read effects may dispatch without one.
     if (candidate.effect !== 'read' && candidate.verificationPolicyId.trim() === '') {
@@ -195,66 +236,124 @@ export class McpAdapter {
       )
     }
 
-    // 4. Argument validation against the schema retained by adaptTool.
+    // 4. Authoritative registration: the operationRef must resolve to a tool
+    // adapted by this adapter. Unknown or stale refs never reach the executor.
     const adapted = this.adaptedTools.get(candidate.operationRef)
-    if (adapted) {
-      const violations = validateJsonSchemaArgs(adapted.inputSchema, args)
-      if (violations.length > 0) {
-        throw system1Error(
-          'SCHEMA_VALIDATION_FAILED',
-          `MCP arguments failed input schema validation for ${toolIdentity}`,
-          { candidateId: candidate.id, toolIdentity, violations },
-        )
-      }
+    if (!adapted) {
+      throw system1Error(
+        'CANDIDATE_NOT_ADMISSIBLE',
+        `Unknown MCP operationRef ${candidate.operationRef}: the tool was never adapted by this adapter`,
+        { candidateId: candidate.id, operationRef: candidate.operationRef },
+      )
     }
 
-    // 5. Circuit breaker, keyed by namespaced tool identity.
+    // 5. Metadata binding: the candidate must carry the adapted tool's effect
+    // and verification policy, so a stale or forged candidate cannot dispatch
+    // under different authority. Server, catalog generation, and tool name are
+    // bound by the exact operationRef lookup above.
+    if (candidate.effect !== adapted.effect || candidate.verificationPolicyId !== adapted.verificationPolicyId) {
+      throw system1Error(
+        'CANDIDATE_NOT_ADMISSIBLE',
+        `MCP candidate metadata does not match the adapted tool ${adapted.toolIdentity}`,
+        {
+          candidateId: candidate.id,
+          operationRef: candidate.operationRef,
+          expectedEffect: adapted.effect,
+          expectedVerificationPolicyId: adapted.verificationPolicyId,
+        },
+      )
+    }
+
+    // 6. Argument validation against the schema retained by adaptTool. The
+    // validated `args` object is dispatched unchanged below.
+    const violations = validateJsonSchemaArgs(adapted.inputSchema, args)
+    if (violations.length > 0) {
+      throw system1Error(
+        'SCHEMA_VALIDATION_FAILED',
+        `MCP arguments failed input schema validation for ${adapted.toolIdentity}`,
+        { candidateId: candidate.id, toolIdentity: adapted.toolIdentity, violations },
+      )
+    }
+
+    // 7. Circuit breaker, keyed by namespaced tool identity. A half-open
+    // circuit admits exactly one concurrent trial; further trials reject
+    // without dispatching.
+    const toolIdentity = adapted.toolIdentity
     const circuit = this.circuits.get(toolIdentity)
-    if (circuit && circuit.state === 'open') {
+    if (circuit?.state === 'open') {
       if (this.now() - circuit.openedAt < this.resetTimeoutMs) {
         throw system1Error('PROVIDER_TRANSPORT_FAILED', `Circuit open for ${toolIdentity}`, {
           toolIdentity,
         })
       }
-      // Half-open: allow one trial.
       circuit.state = 'half-open'
+      circuit.halfOpenTrial = false
+    }
+    if (circuit?.state === 'half-open') {
+      if (circuit.halfOpenTrial) {
+        throw system1Error(
+          'PROVIDER_TRANSPORT_FAILED',
+          `Circuit half-open trial already in progress for ${toolIdentity}`,
+          { toolIdentity },
+        )
+      }
+      circuit.halfOpenTrial = true
     }
 
-    // 6. Dispatch with timeout; the caller signal still aborts mid-flight.
+    // 8. Dispatch with timeout; the caller signal still aborts mid-flight.
+    // `dispatched` records the dispatch phase so effect certainty is derived
+    // from whether the executor was reached, not from the error class.
+    const target: McpDispatchTarget = {
+      toolName: adapted.toolName,
+      toolIdentity,
+      catalogVersion: adapted.catalogVersion,
+      ...(adapted.serverId === undefined ? {} : { serverId: adapted.serverId }),
+    }
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.callTimeoutMs)
     const onAbort = (): void => controller.abort()
     signal.addEventListener('abort', onAbort, { once: true })
+    let dispatched = false
 
     try {
-      const result = await this.executor.execute(toolName, args, controller.signal)
+      dispatched = true
+      const result = await this.executor.execute(target, args, controller.signal)
       // Success: reset circuit.
       this.circuits.delete(toolIdentity)
       return result
     } catch (error) {
-      // Failure: record and possibly open circuit.
-      const current = this.circuits.get(toolIdentity) ?? { failures: 0, state: 'closed' as CircuitState, openedAt: 0 }
-      const failures = current.failures + 1
-      if (failures >= this.failureThreshold) {
-        this.circuits.set(toolIdentity, { failures, state: 'open', openedAt: this.now() })
+      // Failure: record and possibly open circuit. A failed half-open trial
+      // reopens immediately regardless of the failure threshold.
+      const prior = this.circuits.get(toolIdentity)
+      const failures = (prior?.failures ?? 0) + 1
+      if (prior?.state === 'half-open' || failures >= this.failureThreshold) {
+        this.circuits.set(toolIdentity, { failures, state: 'open', openedAt: this.now(), halfOpenTrial: false })
       } else {
-        this.circuits.set(toolIdentity, { failures, state: current.state, openedAt: current.openedAt })
+        this.circuits.set(toolIdentity, { failures, state: 'closed', openedAt: prior?.openedAt ?? 0, halfOpenTrial: false })
       }
-      if (error instanceof System1Error) {
-        throw error
-      }
-      if (candidate.effect !== 'read') {
+      if (dispatched && candidate.effect !== 'read') {
         // No exactly-once: the mutation may have applied before the failure.
+        // Effect certainty comes from the dispatch phase and effect class, so
+        // even typed transport errors report unknown here.
         throw system1Error(
           'EXECUTION_UNKNOWN',
           `MCP ${candidate.effect} call failed with unknown outcome; reconcile before retrying`,
-          { candidateId: candidate.id, toolIdentity, cause: String(error) },
+          {
+            candidateId: candidate.id,
+            toolIdentity,
+            cause: String(error),
+            errorCode: error instanceof System1Error ? error.code : undefined,
+          },
         )
       }
       throw error
     } finally {
       clearTimeout(timeout)
       signal.removeEventListener('abort', onAbort)
+      const current = this.circuits.get(toolIdentity)
+      if (current?.state === 'half-open') {
+        current.halfOpenTrial = false
+      }
     }
   }
 

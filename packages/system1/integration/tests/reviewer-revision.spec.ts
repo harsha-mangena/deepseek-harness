@@ -7,6 +7,13 @@
  * `decide` function, never a fake coordinator). Assertions target durable,
  * lifecycle-visible output: dispatched tool calls and `system1/terminal`
  * session events.
+ *
+ * The driver is constructed with the same mode as the plugin config
+ * (threaded explicitly through `ProductionDriverConfig.mode`, never read
+ * from ambient plugin state). V01 boots shadow mode and asserts the
+ * selected tool never dispatches; the other probes run under enforce mode
+ * so each demonstrates its own defect rather than passing by disabled
+ * execution.
  */
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -29,6 +36,7 @@ import {
   type HandoffBundle,
   type HandoffHandler,
   type System1CoordinatorAgent,
+  type System1Mode,
   type System1Workflows,
 } from '@deepseek-ai/dsh-system1-workflow'
 import {
@@ -70,7 +78,7 @@ const catalog: CatalogTool[] = [
 ]
 
 const profile: CapabilityProfile = {
-  tenantId: 'default',
+  tenantId: 'tenant-test',
   profileVersion: 'v1',
   allowedEffects: new Set(['read']),
   allowedRoutes: new Set(['tool', 'stop']),
@@ -130,7 +138,7 @@ function userMessage(text: string): UserMessage {
 }
 
 /** Boot the workflow plugin through the real Loader. */
-async function boot(): Promise<{ ctx: Context; workflows: System1Workflows }> {
+async function boot(mode: System1Mode = 'shadow'): Promise<{ ctx: Context; workflows: System1Workflows }> {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-system1-driver-'))
   tempRoots.push(dir)
   ;(globalThis as Record<string, unknown>)[MODULE_KEY] = WorkflowModule
@@ -146,7 +154,7 @@ async function boot(): Promise<{ ctx: Context; workflows: System1Workflows }> {
   const fixtureUrl = pathToFileURL(join(dir, 'system1-entry.mjs')).href
   writeFileSync(
     join(dir, 'cordis.yml'),
-    ['- id: system1', `  name: ${fixtureUrl}`, '  config:', '    mode: shadow', ''].join(
+    ['- id: system1', `  name: ${fixtureUrl}`, '  config:', `    mode: ${mode}`, ''].join(
       '\n',
     ),
   )
@@ -173,6 +181,7 @@ function makeDriver(
       decide: async (input) => ({ ...testDecision('c1'), decisionId: input.decisionId }),
     }
   return new ReadOnlyProductionDriver({
+    mode: 'shadow',
     policy: makePolicy(),
     capabilityProfile: profile,
     provider,
@@ -203,8 +212,9 @@ interface TurnSetup {
 async function runTurn(
   sessionId: string,
   driver: ReadOnlyProductionDriver,
+  pluginMode: System1Mode = 'shadow',
 ): Promise<TurnSetup> {
-  const { ctx, workflows } = await boot()
+  const { ctx, workflows } = await boot(pluginMode)
   const session = Session.create(SessionId(sessionId))
   const handle = await workflows.create(session, driver)
   let ran = false
@@ -258,7 +268,7 @@ describe('independent revision probes', () => {
     try { expect(s.toolRan()).toBe(false) } finally { await s.dispose() }
   })
   it('V02 recovery does not requeue a completed request', async () => {
-    const s = await runTurn('v02', makeDriver())
+    const s = await runTurn('v02', makeDriver({ mode: 'enforce' }), 'enforce')
     try { s.coordinator.recover(); expect(s.coordinator.inbox.nextTurn).toHaveLength(0) }
     finally { await s.dispose() }
   })
@@ -303,27 +313,29 @@ describe('independent revision probes', () => {
   })
   it('V09 low confidence invokes the configured DeepSeek fallback', async () => {
     let calls=0; const s=await runTurn('v09',makeDriver({
+      mode:'enforce',
       provider:{decide:async input=>({...testDecision('c1',0.1),decisionId:input.decisionId})},
       handoff:async()=>{calls++; return {kind:'completed',artifacts:[],evidence:[],actualUnits:0}},
       handoffBudget:{poolName:'pool',units:10}
-    }))
+    }), 'enforce')
     try { expect(calls).toBe(1) } finally { await s.dispose() }
   })
   it('V10 provider outage invokes the configured DeepSeek fallback', async () => {
     let calls=0; const s=await runTurn('v10',makeDriver({
+      mode:'enforce',
       provider:{decide:async()=>{throw system1Error('PROVIDER_TIMEOUT','timeout',{})}},
       handoff:async()=>{calls++; return {kind:'completed',artifacts:[],evidence:[],actualUnits:0}},
       handoffBudget:{poolName:'pool',units:10}
-    }))
+    }), 'enforce')
     try { expect(calls).toBe(1) } finally { await s.dispose() }
   })
   it('V11 verified tool evidence is retrievable from the session', async () => {
-    const s=await runTurn('v11',makeDriver())
+    const s=await runTurn('v11',makeDriver({mode:'enforce'}), 'enforce')
     try { expect(s.session.snapshotEvents().some(e=>e.type==='tool/result')).toBe(true) }
     finally { await s.dispose() }
   })
   it('V12 tenant mismatch between profile and request denies dispatch', async () => {
-    const s=await runTurn('v12',makeDriver({capabilityProfile:{...profile,tenantId:'tenant-a'},tenantId:'tenant-b'}))
+    const s=await runTurn('v12',makeDriver({mode:'enforce',capabilityProfile:{...profile,tenantId:'tenant-a'},tenantId:'tenant-b'}), 'enforce')
     try { expect(s.toolRan()).toBe(false) } finally { await s.dispose() }
   })
   it('V13 delegation cancellation reaches active delegated work', async () => {

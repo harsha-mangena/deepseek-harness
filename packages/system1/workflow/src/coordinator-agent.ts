@@ -13,7 +13,9 @@
  * registration order, then the owned scope is disposed to remove any
  * direct registrations. Disposal is memoized: simultaneous callers share
  * one teardown, and asynchronous disposers are awaited before dispose
- * resolves.
+ * resolves. Driver turns, maintenance tasks, and delegated work are owned
+ * activities of one lifecycle: cancellation aborts all of them, wakes
+ * queue behind maintenance, and disposal drains everything.
  */
 import type { Context } from '@deepseek-ai/cordis'
 import { agentEvents } from '@deepseek-ai/dsh-agent'
@@ -30,7 +32,7 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import type { Scope } from '@deepseek-ai/dsh-scope'
 import { System1Inbox } from './inbox.ts'
 import type { System1InboxData, System1VerificationData } from './events.ts'
-import type { System1RequestId } from './types.ts'
+import type { LeaseAuthority, System1RequestId } from './types.ts'
 
 /** Default cancellation cause when the caller names none. */
 const DEFAULT_CANCEL_CAUSE: AgentCancelCause = { kind: 'parent' }
@@ -79,9 +81,24 @@ export class System1CoordinatorAgent implements Agent {
   #dispatch: AgentEventDispatch
   #aborter: AbortController | undefined
   #maintenanceAborter: AbortController | undefined
+  /**
+   * The active maintenance task, when one owns the lifecycle. Wakes queue
+   * behind it; disposal drains it.
+   */
+  #maintenanceRun: Promise<unknown> | undefined
+  /** In-flight delegated work; cancelled with the coordinator and drained on dispose. */
+  #delegatedActivities = new Set<Promise<void>>()
+  /** Abort controllers for delegated work, so parent cancellation reaches it. */
+  #delegatedAborters = new Set<AbortController>()
   #currentRun: Promise<void> | undefined
   #wakeLatch = false
-  #initiator: Agent | undefined
+  /**
+   * The agent whose context issued the current wake, kept separately from
+   * the initiator the coordinator establishes for its own turn.
+   */
+  #causalInitiator: Agent | undefined
+  /** Optional live-lease check consulted by {@link delegate}. */
+  #leaseAuthority: LeaseAuthority | undefined
   #lastError: unknown
   #lastCancelCause: AgentCancelCause | undefined
   #effectDisposers: Array<() => void | Promise<void>> = []
@@ -231,9 +248,12 @@ export class System1CoordinatorAgent implements Agent {
   }
 
   /**
-   * Delegate a unit of work with fencing and depth enforcement. The
-   * fencing token binds the delegation to the coordinator's lease; a
-   * stale or invalid token is refused. Delegation deeper than
+   * Delegate a unit of work with fencing and depth enforcement. The work
+   * runs as an owned activity of the coordinator: parent cancellation
+   * aborts it, and disposal drains it. When a lease authority is bound via
+   * {@link bindLeaseAuthority} the fencing token is checked against the
+   * live lease and a stale token is refused; without a bound authority only
+   * the token format is checked. Delegation deeper than
    * {@link MAX_DELEGATION_DEPTH} fails closed.
    * @param fencingToken - positive integer fencing token from the
    * coordinator's lease.
@@ -241,8 +261,8 @@ export class System1CoordinatorAgent implements Agent {
    * @param work - the delegated work; receives an abort signal and the
    * fencing token.
    * @returns resolves when the delegated work completes.
-   * @throws when the coordinator is disposed, the token is invalid, or
-   * depth exceeds the maximum.
+   * @throws when the coordinator is disposed, the token is invalid or
+   * stale, or depth exceeds the maximum.
    */
   async delegate(
     fencingToken: number,
@@ -255,13 +275,38 @@ export class System1CoordinatorAgent implements Agent {
         `System1CoordinatorAgent(${this.id}) refuses delegation with invalid fencing token`,
       )
     }
+    this.#leaseAuthority?.checkFencingToken(fencingToken)
     if (depth >= MAX_DELEGATION_DEPTH) {
       throw new Error(
         `System1CoordinatorAgent(${this.id}) refuses delegation at depth ${depth} (max ${MAX_DELEGATION_DEPTH})`,
       )
     }
     const aborter = new AbortController()
-    await work(aborter.signal, fencingToken)
+    this.#delegatedAborters.add(aborter)
+    let activity!: Promise<void>
+    activity = (async (): Promise<void> => {
+      try {
+        await work(aborter.signal, fencingToken)
+      } finally {
+        this.#delegatedAborters.delete(aborter)
+        this.#delegatedActivities.delete(activity)
+      }
+    })()
+    this.#delegatedActivities.add(activity)
+    await activity
+  }
+
+  /**
+   * Bind the lease authority consulted by {@link delegate}. A bound
+   * authority lets delegation reject stale fencing tokens against the live
+   * lease instead of trusting the token format alone. Pass `undefined` to
+   * unbind.
+   * @param authority - the lease authority, or `undefined` to unbind.
+   * @throws when the coordinator is disposed.
+   */
+  bindLeaseAuthority(authority: LeaseAuthority | undefined): void {
+    if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
+    this.#leaseAuthority = authority
   }
 
   /**
@@ -282,8 +327,8 @@ export class System1CoordinatorAgent implements Agent {
   }
 
   /**
-   * Clear queued work — unless `keepInbox` — and abort the active turn and
-   * any maintenance task.
+   * Clear queued work — unless `keepInbox` — and abort the active turn,
+   * any maintenance task, and all delegated work.
    * @param cause - why the turn is cancelled.
    * @param options - cancellation options; `keepInbox` preserves pending work.
    */
@@ -292,37 +337,72 @@ export class System1CoordinatorAgent implements Agent {
     this.#wakeLatch = false
     this.#aborter?.abort()
     this.#maintenanceAborter?.abort()
+    for (const aborter of this.#delegatedAborters) aborter.abort()
     if (!options?.keepInbox) this.inbox.clear()
   }
 
   /**
-   * Run one non-turn maintenance task from the true idle phase.
+   * Run one non-turn maintenance task from the true idle phase. The task
+   * is an owned activity of the coordinator: cancellation aborts it,
+   * disposal drains it, wakes queue behind it, and overlapping maintenance
+   * is rejected.
    * @param task - the maintenance work; its rejection is preserved.
    * @returns the task promise.
-   * @throws when a driver turn is active or the coordinator is disposed.
+   * @throws when a driver turn or another maintenance task is active, or
+   * the coordinator is disposed.
    */
   runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (this.#disposed) throw new Error(`System1CoordinatorAgent(${this.id}) is disposed`)
     if (this.#currentRun !== undefined) {
       throw new Error(`System1CoordinatorAgent(${this.id}) cannot run maintenance during an active turn`)
     }
+    if (this.#maintenanceRun !== undefined) {
+      throw new Error(
+        `System1CoordinatorAgent(${this.id}) cannot run maintenance while another maintenance task is active`,
+      )
+    }
     const aborter = new AbortController()
     this.#maintenanceAborter = aborter
-    const pending = task(aborter.signal)
-    const clear = (): void => {
-      if (this.#maintenanceAborter === aborter) this.#maintenanceAborter = undefined
-    }
-    pending.then(clear, clear)
-    return pending
+    const tracked = task(aborter.signal).then(
+      (value) => {
+        this.#settleMaintenance(aborter)
+        return value
+      },
+      (error: unknown) => {
+        this.#settleMaintenance(aborter)
+        throw error
+      },
+    )
+    this.#maintenanceRun = tracked
+    return tracked
   }
 
   /**
-   * Resolve when the coordinator returns to idle. Driver failures settle
-   * the turn without throwing; inspect {@link lastError} for the cause.
-   * @returns resolves once no turn is running.
+   * Release maintenance ownership and start a latched wake, if any, now
+   * that the lifecycle is free.
+   */
+  #settleMaintenance(aborter: AbortController): void {
+    if (this.#maintenanceAborter === aborter) this.#maintenanceAborter = undefined
+    this.#maintenanceRun = undefined
+    if (this.#wakeLatch && !this.#disposed) this.#wakeDriver()
+  }
+
+  /**
+   * Resolve when the coordinator returns to idle. Every owned activity —
+   * the driver turn, a maintenance task, and delegated work — must settle.
+   * Driver failures settle the turn without throwing; inspect
+   * {@link lastError} for the cause.
+   * @returns resolves once no owned activity is running.
    */
   async whenIdle(): Promise<void> {
-    while (this.#currentRun) await this.#currentRun
+    for (;;) {
+      const activities: Array<Promise<unknown>> = []
+      if (this.#currentRun !== undefined) activities.push(this.#currentRun)
+      if (this.#maintenanceRun !== undefined) activities.push(this.#maintenanceRun)
+      for (const activity of this.#delegatedActivities) activities.push(activity)
+      if (activities.length === 0) return
+      await Promise.allSettled(activities)
+    }
   }
 
   /**
@@ -345,6 +425,10 @@ export class System1CoordinatorAgent implements Agent {
     this.#wakeLatch = false
     this.#aborter?.abort()
     this.#maintenanceAborter?.abort()
+    for (const aborter of this.#delegatedAborters) aborter.abort()
+    // Drain every owned activity — driver, maintenance, delegated work —
+    // before unwinding effects, so disposal never resolves while owned
+    // work is still running.
     await this.whenIdle()
     const disposers = this.#effectDisposers.splice(0).reverse()
     for (const disposeEffect of disposers) await disposeEffect()
@@ -352,13 +436,13 @@ export class System1CoordinatorAgent implements Agent {
   }
 
   /**
-   * Capture the initiator — defaulting to the coordinator itself when
-   * woken outside an agent chain — and start the driver unless one is
-   * running. A wake during an active turn sets a latch so the queued
-   * follow-up work runs once the turn settles.
+   * Capture the causal waker — the agent whose context issued the wake,
+   * if any — and start the driver unless a turn is running or maintenance
+   * owns the lifecycle. A wake during an active turn or maintenance sets a
+   * latch so the queued follow-up work runs once the owner settles.
    */
   private wake(): void {
-    this.#initiator = this.ctx.agents.currentInitiator() ?? this
+    this.#causalInitiator = this.ctx.agents.currentInitiator()
     this.#wakeLatch = true
     this.#wakeDriver()
   }
@@ -369,15 +453,21 @@ export class System1CoordinatorAgent implements Agent {
     this.#dispatch.emit('agent/status', { status })
   }
 
-  /** Start the driver unless a turn is already running or disposed. */
+  /** Start the driver unless a turn is running, maintenance is active, or disposed. */
   #wakeDriver(): void {
-    if (this.#disposed || this.#currentRun) return
+    if (this.#disposed || this.#currentRun || this.#maintenanceRun) return
     this.#wakeLatch = false
     this.#setStatus('running')
     const aborter = new AbortController()
     this.#aborter = aborter
-    const initiator = this.#initiator ?? this
-    this.#initiator = undefined
+    // The executing coordinator owns its orchestration chain: like the
+    // ordinary agent loop, it establishes itself as the initiator. A wake
+    // issued from another coordinator therefore re-roots the chain here,
+    // while a non-coordinator initiator is preserved; the causal waker is
+    // kept separately for the turn instead of being attributed the work.
+    const causal = this.#causalInitiator
+    this.#causalInitiator = undefined
+    const initiator = causal instanceof System1CoordinatorAgent ? this : (causal ?? this)
     const run = (async (): Promise<void> => {
       try {
         await this.ctx.agents.withInitiator(initiator, () => this.#driver.run(this, aborter.signal))

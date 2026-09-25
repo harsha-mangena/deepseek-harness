@@ -3,7 +3,9 @@
  * R19: inbox appends are written to the durable session log as
  * `system1/inbox` events, and a restarted coordinator rebuilds its
  * pending work by replaying them. Delegation binds a fencing token and
- * enforces a depth limit fail-closed. Verification evidence is stored
+ * enforces a depth limit fail-closed; a bound lease authority additionally
+ * rejects stale tokens, and delegated work is aborted on coordinator
+ * cancel. Verification evidence is stored
  * durably as `system1/verification` events and retrievable by request id.
  */
 import { describe, expect, it } from 'vitest'
@@ -142,6 +144,71 @@ describe('delegation safety', () => {
         await expect(
           handle.coordinator.delegate(7, 5, () => Promise.resolve()),
         ).rejects.toThrow(/depth 5/)
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('aborts delegated work when the coordinator is cancelled (N07)', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(
+        Session.create(SessionId('s-delegate-cancel')),
+        idleDriver,
+      )
+      try {
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => {
+          release = resolve
+        })
+        let delegatedSignal: AbortSignal | undefined
+        const pending = handle.coordinator.delegate(1, 0, async (signal) => {
+          delegatedSignal = signal
+          await gate
+        })
+        handle.coordinator.cancel()
+        expect(delegatedSignal?.aborted).toBe(true)
+        release()
+        await pending
+        await handle.coordinator.whenIdle()
+      } finally {
+        await handle.dispose()
+      }
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects stale fencing tokens against a bound lease authority (N07)', async () => {
+    const ctx = await boot()
+    try {
+      const handle = await ctx.system1Workflows.create(
+        Session.create(SessionId('s-delegate-lease')),
+        idleDriver,
+      )
+      try {
+        handle.coordinator.bindLeaseAuthority({
+          checkFencingToken(token: number) {
+            if (token !== 7) throw new Error(`stale fencing token ${token}`)
+          },
+        })
+        await expect(
+          handle.coordinator.delegate(6, 0, () => Promise.resolve()),
+        ).rejects.toThrow('stale fencing token 6')
+        let ran = false
+        await handle.coordinator.delegate(7, 0, async () => {
+          ran = true
+        })
+        expect(ran).toBe(true)
+        // Without a bound authority only the token format is checked.
+        handle.coordinator.bindLeaseAuthority(undefined)
+        await handle.coordinator.delegate(6, 0, async () => {
+          ran = true
+        })
+        expect(ran).toBe(true)
       } finally {
         await handle.dispose()
       }

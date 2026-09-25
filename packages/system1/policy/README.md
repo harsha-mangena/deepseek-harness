@@ -12,6 +12,7 @@ Policy engine for System 1: capability profiles, effect policies, and required-g
 ## Enforcement rules
 
 - A `false`, missing, or `unknown` required guard blocks dispatch.
+- The capability profile is bound to its tenant: `evaluate()` denies a request whose tenant differs from the profile's tenant (`TENANT_MISMATCH`) before effects, routes, or guards are consulted, so no caller can bypass the binding by swapping profiles or skipping guard registration.
 - Guards are registered dynamically; the engine never hardcodes a fixed gate list. Newly registered guards participate immediately.
 - A throwing guard is treated as `unknown` (blocks).
 - Policy is independent of model output: the model proposes candidates; policy decides admissibility.

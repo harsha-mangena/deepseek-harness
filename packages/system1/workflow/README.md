@@ -50,7 +50,7 @@ Creating while `mode` is `off` throws. Creating for a session that already has a
 
 ### Rolling back to the baseline
 
-Call `ctx.system1Workflows.rollbackToBaseline()` to remove the integration from the serving path immediately. Every live coordinator is drained and unregistered (in-flight turns cancelled, driver settled, owned effects unwound) — the same teardown as the handle's `dispose()`. Nothing is deleted: session events, receipts, verification evidence, unknown outcomes, budgets, and fencing epochs are preserved for replay. The mode is then latched one-way to `'off'`, so new coordinator creation is refused and new work takes the standard DeepSeek path. Re-enabling requires reloading the plugin with new configuration. See the [operations runbook](../../../docs/system1/operations-runbook.md) for the full procedure.
+Call `ctx.system1Workflows.rollbackToBaseline()` to remove the integration from the serving path immediately. Every live coordinator is drained and unregistered (in-flight turns cancelled, driver settled, owned effects unwound) — the same teardown as the handle's `dispose()`. Creation is refused while the drain is in flight, and simultaneous rollbacks share one memoized drain; teardown failures are reported, not swallowed. Nothing is deleted: session events, receipts, verification evidence, unknown outcomes, budgets, and fencing epochs are preserved for replay. The mode is then latched one-way to `'off'`, so new coordinator creation is refused and new work takes the standard DeepSeek path. Re-enabling requires reloading the plugin with new configuration. See the [operations runbook](../../../docs/system1/operations-runbook.md) for the full procedure.
 
 ### Finalizing a request
 
@@ -60,7 +60,7 @@ Record the terminal outcome with `finalizeTerminal({ session, requestId, outcome
 
 ### Design decisions
 
-The coordinator is a custom runtime root, not a factory product: `AgentRegistry` has one factory slot and System 1 never takes it. Registrations are effects — the coordinator registers through the plugin Cordis context and the plugin owns every disposer's unwind. Each coordinator gets a private Cordis scope (via `createScope`) so its tool registrations are isolated from other coordinators and the application root. The plugin declares `tools` as an injected dependency because scoped tool registration must resolve through the coordinator's scope. Lifecycle events dispatch through the sanctioned `agentEvents(ctx, agent)` seam on the plugin context, so they stay visible at the application root. The initiator is captured when the coordinator wakes and restored for the driver's lifetime, so guarded tools and delegated work see the coordinator as the initiator. Session event payloads are JSON-serializable with no explicit `undefined`, and `system1/terminal` success requires `verifiedBy` evidence at the type level.
+The coordinator is a custom runtime root, not a factory product: `AgentRegistry` has one factory slot and System 1 never takes it. Registrations are effects — the coordinator registers through the plugin Cordis context and the plugin owns every disposer's unwind. Each coordinator gets a private Cordis scope (via `createScope`) so its tool registrations are isolated from other coordinators and the application root. The plugin declares `tools` as an injected dependency because scoped tool registration must resolve through the coordinator's scope. Lifecycle events dispatch through the sanctioned `agentEvents(ctx, agent)` seam on the plugin context, so they stay visible at the application root. The executing coordinator owns the initiator at each orchestration entry and restores it for the driver's lifetime, so guarded tools and delegated work see the coordinator as the initiator; the causal waker is recorded separately. Session event payloads are JSON-serializable with no explicit `undefined`, and `system1/terminal` success requires `verifiedBy` evidence at the type level.
 
 ### Recovery
 
@@ -68,7 +68,7 @@ Inbox appends (`send`, `followup`, `steer`) are written to the durable session l
 
 ### Delegation
 
-`delegate(fencingToken, depth, work)` binds delegated work to the coordinator's fencing token and enforces a maximum delegation depth of 5. Invalid tokens or excessive depth fail closed. The token must come from a lease acquired via the coordination package; the coordinator never invents one.
+`delegate(fencingToken, depth, work)` binds delegated work to the coordinator's fencing token and enforces a maximum delegation depth of 5. Malformed tokens or excessive depth fail closed. Delegated work is owned by the coordinator: it is aborted on `cancel()`/`dispose()` and awaited by `whenIdle()`. Stale fencing tokens fail closed only against a lease authority bound with `bindLeaseAuthority` (the coordinator never invents a token); without one, only the token format is checked.
 
 ### DeepSeek handoff
 
