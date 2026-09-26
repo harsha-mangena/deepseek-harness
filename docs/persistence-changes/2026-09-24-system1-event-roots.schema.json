@@ -1,0 +1,1248 @@
+{
+  "formatVersion": 2,
+  "roots": [
+    {
+      "key": "event:system1/admission",
+      "kind": "event",
+      "event": "system1/admission",
+      "surface": false,
+      "digest": "d421fdfbbdb19bc6aad5751c6715a9f2a15dc5d4a4e256b3ba8a995c390815f9",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 6,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 7,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "limits",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "objective",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 5,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "steps",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "tokens",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "wallClockMs",
+                "type": 3,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "system1/admission"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/budget-reservation",
+      "kind": "event",
+      "event": "system1/budget-reservation",
+      "surface": false,
+      "digest": "44ea7df5490e9b89cd53bd4bdd04af895816ecffd75548b0db3937fe7cf67338",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 5,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 6,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "expiresAtMs",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "steps",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "tokens",
+                "type": 2,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "system1/budget-reservation"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/candidates",
+      "kind": "event",
+      "event": "system1/candidates",
+      "surface": false,
+      "digest": "3c8a66163bb8e1131eb66c3669c86d22c552829089c6404c530db56632aaea14",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 8,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 9,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "candidates",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 5,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 7,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "array",
+            "element": 3
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "estimatedCost",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "id",
+                "type": 5,
+                "optional": false
+              },
+              {
+                "name": "reversible",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "summary",
+                "type": 5,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "primitive",
+            "type": "boolean"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "system1/candidates"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/context-selection",
+      "kind": "event",
+      "event": "system1/context-selection",
+      "surface": false,
+      "digest": "6190cd91b9649914c3944f7e361ef17255a13f84f34ad069ee080b2e54d28b99",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 6,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 7,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "droppedBytes",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "retainedBytes",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "selectors",
+                "type": 5,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "array",
+            "element": 3
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "system1/context-selection"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/decision",
+      "kind": "event",
+      "event": "system1/decision",
+      "surface": false,
+      "digest": "1c3ed3ec2eca299eda3eb5250c09d2534e3654d9e6860cf8bb6115b7a409a54c",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 9,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 10,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "candidateId",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "confidence",
+                "type": 3,
+                "optional": true
+              },
+              {
+                "name": "model",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "noulReason",
+                "type": 2,
+                "optional": true
+              },
+              {
+                "name": "primitive",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 8,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "union",
+            "types": [
+              5,
+              6,
+              7
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "choice"
+          },
+          {
+            "kind": "literal",
+            "value": "noul"
+          },
+          {
+            "kind": "literal",
+            "value": "score"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "literal",
+            "value": "system1/decision"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/execution-intent",
+      "kind": "event",
+      "event": "system1/execution-intent",
+      "surface": false,
+      "digest": "dffffbc13f1766ad939d83aeabd6a11fcf8f77f5999033394a66012fe7f2173e",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 7,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 9,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "requestId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "steps",
+                "type": 4,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "array",
+            "element": 5
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "argsSummary",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "id",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "reversible",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "tool",
+                "type": 2,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "boolean"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": "system1/execution-intent"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/execution-settlement",
+      "kind": "event",
+      "event": "system1/execution-settlement",
+      "surface": false,
+      "digest": "be723df9bd03134dbc369651f5ed47fadb776916f41b57b4dd34642c84ea8cb5",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 8,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 9,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 9,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 10,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "detail",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "outcome",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 7,
+                "optional": false
+              },
+              {
+                "name": "stepId",
+                "type": 2,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "union",
+            "types": [
+              4,
+              5,
+              6
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "cancelled"
+          },
+          {
+            "kind": "literal",
+            "value": "failed"
+          },
+          {
+            "kind": "literal",
+            "value": "ok"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": "system1/execution-settlement"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/handoff",
+      "kind": "event",
+      "event": "system1/handoff",
+      "surface": false,
+      "digest": "35485b6fc535a6b5cbb1acbe13f38250bc2179209533dc87cf17b0c2b8059d30",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 7,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 9,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "requestId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "summary",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "to",
+                "type": 4,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "union",
+            "types": [
+              5,
+              6
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "deepseek"
+          },
+          {
+            "kind": "literal",
+            "value": "system1"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": "system1/handoff"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/route",
+      "kind": "event",
+      "event": "system1/route",
+      "surface": false,
+      "digest": "e77827dc478858ee0b1e2c5af78368a66c748b68b2daf95b1f1c6fe6edc9a4e7",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 8,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 9,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 9,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 10,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "reason",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "strategy",
+                "type": 4,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "union",
+            "types": [
+              5,
+              6,
+              7
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "deepseek"
+          },
+          {
+            "kind": "literal",
+            "value": "mixed"
+          },
+          {
+            "kind": "literal",
+            "value": "system1"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": "system1/route"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/terminal",
+      "kind": "event",
+      "event": "system1/terminal",
+      "surface": false,
+      "digest": "8f9af3d7969d7982731a13cb4f49115a52b1597e1b72494eed8725cdafb0c26d",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 12,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 13,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 13,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 14,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "union",
+            "types": [
+              2,
+              7
+            ]
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "outcome",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 5,
+                "optional": false
+              },
+              {
+                "name": "summary",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "verifiedBy",
+                "type": 6,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "literal",
+            "value": "success"
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "array",
+            "element": 4
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "outcome",
+                "type": 8,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 4,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 5,
+                "optional": false
+              },
+              {
+                "name": "summary",
+                "type": 4,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "union",
+            "types": [
+              9,
+              10,
+              11
+            ]
+          },
+          {
+            "kind": "literal",
+            "value": "cancelled"
+          },
+          {
+            "kind": "literal",
+            "value": "escalated"
+          },
+          {
+            "kind": "literal",
+            "value": "failure"
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": "system1/terminal"
+          }
+        ]
+      }
+    },
+    {
+      "key": "event:system1/verification",
+      "kind": "event",
+      "event": "system1/verification",
+      "surface": false,
+      "digest": "0930d5b4a051b1c3ce2757b9a4ae7f447a5f8a8b93e5da055ec9c9bbb0515a85",
+      "schema": {
+        "root": 0,
+        "nodes": [
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "data",
+                "type": 1,
+                "optional": false
+              },
+              {
+                "name": "ignorable",
+                "type": 5,
+                "optional": true
+              },
+              {
+                "name": "seq",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "time",
+                "type": 6,
+                "optional": false
+              },
+              {
+                "name": "type",
+                "type": 7,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "object",
+            "properties": [
+              {
+                "name": "checkId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "evidence",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "passed",
+                "type": 3,
+                "optional": false
+              },
+              {
+                "name": "requestId",
+                "type": 2,
+                "optional": false
+              },
+              {
+                "name": "schemaVersion",
+                "type": 4,
+                "optional": false
+              }
+            ],
+            "indices": []
+          },
+          {
+            "kind": "primitive",
+            "type": "string"
+          },
+          {
+            "kind": "primitive",
+            "type": "boolean"
+          },
+          {
+            "kind": "literal",
+            "value": 1
+          },
+          {
+            "kind": "literal",
+            "value": true
+          },
+          {
+            "kind": "primitive",
+            "type": "number"
+          },
+          {
+            "kind": "literal",
+            "value": "system1/verification"
+          }
+        ]
+      }
+    }
+  ],
+  "types": []
+}

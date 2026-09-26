@@ -1,0 +1,16 @@
+# The ONE supported System 1 production composition for `dsh --profile system1`.
+#
+# This patch layer inserts the System 1 coordinator plugin in enforce mode
+# with the Jev provider — the composition documented as supported in
+# packages/system1/workflow/README.md ("Supported production composition").
+#
+# Anything outside this composition stays disabled until independently
+# certified: mutation tools, multi-process execution, distributed or
+# multi-node routes, browser automation, the Laya backend, and any local
+# backend. Do not add entries for those here.
+- insert:
+    - id: system1-workflow
+      name: '@deepseek-ai/dsh-system1-workflow'
+      config:
+        mode: enforce
+        provider: jev

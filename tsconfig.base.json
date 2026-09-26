@@ -325,6 +325,33 @@
       "@deepseek-ai/dsh-compaction-image-offload/projection": ["./packages/compaction/compaction-image-offload/src/projection.ts"],
       "@deepseek-ai/dsh-session-format-catalog/message-projections": ["./packages/session/session-format-catalog/src/message-projections.ts"],
       "@deepseek-ai/dsh-native-command/types": ["./packages/util/native-command/src/types.ts"],
+      // dsh-system1-workflow lives under system1/workflow/, so the generator cannot map
+      // its name to its directory; this alias stays hand-written.
+      "@deepseek-ai/dsh-system1-workflow": ["./packages/system1/workflow/src"],
+      // dsh-system1-contracts lives under system1/contracts/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-contracts": ["./packages/system1/contracts/src"],
+      // dsh-system1-policy lives under system1/policy/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-policy": ["./packages/system1/policy/src"],
+      // dsh-system1-coordination lives under system1/coordination/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-coordination": ["./packages/system1/coordination/src"],
+      // dsh-system1-observations lives under system1/observations/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-observations": ["./packages/system1/observations/src"],
+      // dsh-system1-jev lives under system1/jev/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-jev": ["./packages/system1/jev/src"],
+      // dsh-system1-calibration lives under system1/calibration/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-calibration": ["./packages/system1/calibration/src"],
+      // dsh-system1-integration lives under system1/integration/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-integration": ["./packages/system1/integration/src"],
+      // dsh-system1-delegation lives under system1/delegation/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-delegation": ["./packages/system1/delegation/src"],
+      // dsh-system1-mcp lives under system1/mcp/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-mcp": ["./packages/system1/mcp/src"],
+      // dsh-system1-memory lives under system1/memory/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-memory": ["./packages/system1/memory/src"],
+      // dsh-system1-observability lives under system1/observability/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-observability": ["./packages/system1/observability/src"],
+      // dsh-system1-distributed lives under system1/distributed/; same hand-written alias.
+      "@deepseek-ai/dsh-system1-distributed": ["./packages/system1/distributed/src"],
       // BEGIN generated package aliases — pnpm run gen-tsconfig-paths
       "@deepseek-ai/dsh-acp": ["./packages/acp/acp/src"],
       "@deepseek-ai/dsh-acp-app": ["./packages/bundle/acp-app/src"],

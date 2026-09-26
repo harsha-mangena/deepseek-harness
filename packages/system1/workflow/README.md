@@ -1,0 +1,157 @@
+---
+description: "System 1 coordinator: custom AgentRegistry runtime root with a kill-switched Cordis plugin (Jev-only), for users and maintainers choosing or debugging the System 1 integration."
+kind: "package-reference"
+---
+
+# @deepseek-ai/dsh-system1-workflow
+
+English | [中文](README.zh.md)
+
+## Summary
+
+This package hosts the System 1 coordinator inside DeepSeek Harness. It registers already-constructed coordinator agents as custom `AgentRegistry` runtime roots and never replaces the standard DeepSeek agent factory, so the two paths share one registry and one session event log. The plugin runs under a kill switch (`off` by default): while off, coordinator creation is refused and the standard path is untouched. All System 1 state changes append typed `system1/*` session events, and every tool call the coordinator makes enters through the public guarded `ToolRuntime.execute` entry point.
+
+## Table of Contents
+
+- [Use this package](#use-this-package)
+- [Understand the implementation](#understand-the-implementation)
+- [Further Exploration](#further-exploration)
+- [Model Experience](#model-experience)
+- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+- [Dev Note](#dev-note)
+
+-----
+
+<a id="use-this-package"></a>
+## Use this package
+
+Mount the plugin in `cordis.yml` to enable coordinator creation. The defaults below define the operating posture; the generated configuration catalog is the exhaustive source for every field.
+
+```yaml
+- name: '@deepseek-ai/dsh-system1-workflow'
+  config:
+    mode: 'off'
+    provider: 'jev'
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `'off'` | Operating posture: `off` refuses coordinator creation, `shadow` evaluates without acting, `enforce` acts on decisions |
+| `provider` | `'jev'` | Decision provider; only `jev` (TypeSafe hosted API) is supported |
+| `model` | — | Jev model name; omitted lets Jev resolve its pinned default at call time |
+
+### Creating a coordinator
+
+Call `ctx.system1Workflows.create(session, driver)` with a session and a driver. The coordinator id equals the session id, so the registry's collision checks keep one coordinator per session. The returned handle is handed out only after `agent/created` has been delivered; a veto or collision rejects there and unwinds everything created so far. Full teardown (`handle.dispose()`) cancels and drains the driver, unwinds the coordinator's owned Cordis effects in reverse order, then unregisters the agent.
+
+### What can go wrong
+
+Creating while `mode` is `off` throws. Creating for a session that already has a coordinator throws a collision error. A driver that rejects on abort is contained; a driver that rejects for any other reason is recorded on the coordinator and does not take down the plugin.
+
+### Rolling back to the baseline
+
+Call `ctx.system1Workflows.rollbackToBaseline()` to remove the integration from the serving path immediately. Every live coordinator is drained and unregistered (in-flight turns cancelled, driver settled, owned effects unwound) — the same teardown as the handle's `dispose()`. Creation is refused while the drain is in flight, and simultaneous rollbacks share one memoized drain; teardown failures are reported, not swallowed. Nothing is deleted: session events, receipts, verification evidence, unknown outcomes, budgets, and fencing epochs are preserved for replay. The mode is then latched one-way to `'off'`, so new coordinator creation is refused and new work takes the standard DeepSeek path. Re-enabling requires reloading the plugin with new configuration. See the [operations runbook](../../../docs/system1/operations-runbook.md) for the full procedure.
+
+### Finalizing a request
+
+Record the terminal outcome with `finalizeTerminal({ session, requestId, outcome, summary, verifiedBy, verifications })`. It is the only supported way to append `system1/terminal`: success requires a non-empty `verifiedBy` list where every cited check has a passing verification record, and throws `TerminalInvariantError` otherwise. Other outcomes record without evidence. Appending `system1/terminal` directly bypasses this check and is unsupported.
+
+## Understand the implementation
+
+### Design decisions
+
+The coordinator is a custom runtime root, not a factory product: `AgentRegistry` has one factory slot and System 1 never takes it. Registrations are effects — the coordinator registers through the plugin Cordis context and the plugin owns every disposer's unwind. Each coordinator gets a private Cordis scope (via `createScope`) so its tool registrations are isolated from other coordinators and the application root. The plugin declares `tools` as an injected dependency because scoped tool registration must resolve through the coordinator's scope. Lifecycle events dispatch through the sanctioned `agentEvents(ctx, agent)` seam on the plugin context, so they stay visible at the application root. The executing coordinator owns the initiator at each orchestration entry and restores it for the driver's lifetime, so guarded tools and delegated work see the coordinator as the initiator; the causal waker is recorded separately. Session event payloads are JSON-serializable with no explicit `undefined`, and `system1/terminal` success requires `verifiedBy` evidence at the type level.
+
+### Recovery
+
+Inbox appends (`send`, `followup`, `steer`) are written to the durable session log as `system1/inbox` events. A restarted coordinator rebuilds its pending work by calling `recover()`, which replays those events in log order. The in-memory inbox is cleared first, so recovery is idempotent.
+
+### Delegation
+
+`delegate(fencingToken, depth, work)` binds delegated work to the coordinator's fencing token and enforces a maximum delegation depth of 5. Malformed tokens or excessive depth fail closed. Delegated work is owned by the coordinator: it is aborted on `cancel()`/`dispose()` and awaited by `whenIdle()`. Stale fencing tokens fail closed only against a lease authority bound with `bindLeaseAuthority` (the coordinator never invents a token); without one, only the token format is checked.
+
+### DeepSeek handoff
+
+`handoffToDeepSeek(coordinator, bundle, signal, options)` transfers a bounded task to a real DeepSeek child agent created through the coordinator's own agent registry — the standard DeepSeek factory is never modified or replaced. The `HandoffBundle` is runtime-validated at the trust boundary; the child's budget is reserved from the parent pool before creation, settled against measured usage on success, and released on failure or cancellation. The child is created with explicit `parentAgent` lineage, `meta.delegationDepth`, `meta.parentSession`, and `origin: 'subagent'`; its initial context is seeded with the bundle through its scoped system prompt, and it is driven through its real inbox. The seeded prompt states the full return obligation: pinned resource versions, the budget envelope (pool, reserved units, reservation id, overrun policy), verifier requirements, and the return contract with the usage-report schema — the child's `actualUnits` is validated but never trusted for settlement, which meters host-observed provider telemetry instead. Parent cancellation propagates via `agent.cancel()`; the child's final assistant message is parsed, checked against the bundle's return contract, and every evidence reference is resolved against stored records (`findUnresolvableEvidence`; the `resolveEvidence` option checks references against the caller's store) — invalid returns and unresolvable references fail closed after settlement. The owned child handle is always disposed. A durable `system1/handoff` event keeps the transfer reconstructable from the parent session log.
+
+### Supported production composition
+
+One composition is supported for production use. Anything outside it — mutation tools, multi-process execution, distributed or multi-node routes, browser automation, the Laya backend or any local backend — is not supported and stays disabled until independently certified.
+
+- **Packages** — `@deepseek-ai/dsh-system1-workflow` (coordinator, handoff), `@deepseek-ai/dsh-system1-integration` (`ReadOnlyProductionDriver`), `@deepseek-ai/dsh-system1-coordination` (`CoordinationStore` budget ledger), `@deepseek-ai/dsh-system1-policy` (capability profiles with tenant binding), `@deepseek-ai/dsh-system1-mcp` (tool registry with schema validation), plus the Cordis core packages the coordinator boots (agent, session, llm, tools, system-prompt).
+- **Mode** — `enforce`. The production driver requires an explicit mode; `off` refuses coordinator creation and `shadow` is advisory-only (it never dispatches).
+- **Admission** — requests enter through the tenant-authenticated admission path; `PolicyEngine.evaluate()` denies `TENANT_MISMATCH` before effects, routes, or guards are consulted.
+- **Ledger** — the coordination store's budget pools: reserve before each accounted external operation, settle from host-observed usage, retain reconciliation holds on uncertain spend. The pool's overrun policy (`maxOverrunUnits`, `onOverrun`) is configured per pool and rendered into the handoff prompt when the ledger describes it.
+- **Spill store** — large tool evidence spills through the `spillStore` seam; the session log keeps a bounded, SHA-256-hashed pointer and resolution rejects cross-tenant references.
+- **DeepSeek fallback wiring** — `handoffToDeepSeek` as the driver's `HandoffHandler` with an explicit `handoffBudget`, enforceable child limits (`maxTokens`, `deadlineAt`, `maxSteps`), `measureChildUsage` from provider telemetry, and `resolveEvidence` checking every returned evidence reference against stored records.
+- **Provider** — Jev only, through the TypeSafe hosted API. Browser and Laya phases stay disabled unless independently certified.
+
+### Scoped workers
+
+`spawnWorker(coordinator, spec, signal, options)` builds on the handoff machinery and the existing `DelegationManager` (depth tracking and budget pre-checks). The worker's tool capabilities are restricted to exactly the spec's allow-list via `tools.restrict()` inside the child's unpublished setup scope; unknown capability names fail loudly at setup. Workers share the parent's budget pool and cancellation signal.
+
+### Evidence
+
+Verification results are stored durably as `system1/verification` session events. `getEvidence(requestId)` retrieves them in log order for audit or recovery. The production driver emits these events before finalizing, so a success terminal's `verifiedBy` checks always have retrievable backing evidence.
+
+### Source map
+
+- `src/types.ts` — public config and coordinator contracts (types only).
+- `src/events.ts` — the `system1/*` session event vocabulary and `SessionEventMap` augmentation.
+- `src/inbox.ts` — the coordinator's real `Inbox` implementation.
+- `src/coordinator-agent.ts` — `System1CoordinatorAgent`, the custom runtime root.
+- `src/finalizer.ts` — `finalizeTerminal`: the supported terminal-event writer and its invariant.
+- `src/handoff.ts` — `handoffToDeepSeek`: real DeepSeek child handoff with budget, lineage, cancellation, and return validation.
+- `src/workers.ts` — `spawnWorker`: scoped workers with restricted tool capabilities on the handoff machinery.
+- `src/index.ts` — `System1Workflows` service: kill-switched creation, lifecycle ownership, lookup, and `rollbackToBaseline`.
+- `src/index.ts` — public surface.
+
+## Further Exploration
+
+- [System 1 runtime integration ADR](../../../docs/system1/adr-runtime-integration.md) — the integration decisions: coexistence, lifecycle ownership, initiator propagation, guarded tools, session event invariants, MCP findings.
+- [System 1 Phase 0 baseline](../../../docs/system1/baseline.md) — the frozen Phase 0 evidence: lifecycle probes, guarded-tool probes, hazard fixtures.
+- [Generated configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-system1-workflow) — every accepted config field and its source declaration.
+- [Generated persistence catalog](../../../docs/persistence-catalog.md) — the persisted `system1/*` session event types.
+
+-----
+
+<a id="model-experience"></a>
+## Model Experience
+
+### Coordinator lifecycle (no model-visible contribution)
+
+#### What the model sees
+
+Nothing. The coordinator's session events (`system1/admission` through `system1/terminal`) are log-only audit records, excluded from derived message history like other lifecycle boundaries. No prompt section, tool schema, or message content comes from this package.
+
+#### Token effect
+
+No tokens are added to model requests.
+
+#### KV Cache effect
+
+No request bytes change, so cached prefixes are unaffected.
+
+## Known Limitations and Deferred Work
+
+<a id="known-limitations-and-deferred-work"></a>
+
+These limits describe what this package can and cannot do; they are current package constraints.
+
+- **No decision provider** — the coordinator exposes a driver slot; with nothing behind it deciding, `shadow` and `enforce` postures currently have no routing effect.
+- **Off by default** — `mode: 'off'` refuses coordinator creation; the plugin is inert until configured otherwise.
+- **Jev only** — the provider union admits `jev` alone; browser and local backends are out of scope by design.
+- **One coordinator per session** — the coordinator id equals the session id and the registry rejects a second registration for the same session.
+
+<a id="dev-note"></a>
+### Dev Note
+
+<details>
+<summary>Working context for maintainers — click to expand</summary>
+
+This Dev Note is working context for maintainers: undecided directions and open questions. It is explicitly non-authoritative — shipped behavior and limits live in the sections above and the package code.
+
+#### Driver slot and provider boundary
+
+The coordinator's driver slot is an explicit contract (run to completion, honor abort). The provider boundary is Jev-only by design: browser and local backends are out of scope. These two decisions keep the Model Experience section above accurate — the coordinator contributes no model-visible content — and keep the no-contribution posture verifiable.
+</details>
